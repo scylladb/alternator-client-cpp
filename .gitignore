@@ -1,0 +1,11 @@
+build/
+build-*/
+cmake-build-*/
+test/scylla/db.crt
+test/scylla/db.key
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe

@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Threads)
+
+if(@CURL_FOUND@)
+    find_dependency(CURL)
+endif()
+
+if(@ALTERNATOR_CLIENT_CPP_AWS_TARGET_BUILT@)
+    find_dependency(ZLIB)
+    find_dependency(AWSSDK COMPONENTS dynamodb)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/scylladb-alternator-client-cpp-targets.cmake")
