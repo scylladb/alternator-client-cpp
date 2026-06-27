@@ -368,3 +368,32 @@ TEST(AlternatorLiveNodes, BackgroundProbesDownNodesPeriodically) {
     EXPECT_GT(probes.load(), 0);
     EXPECT_EQ(nodes.GetQuarantinedNodes(), std::vector<Url>({recovering}));
 }
+
+TEST(AlternatorLiveNodes, BackgroundRefreshUsesActivePeriodOnlyAfterActivity) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{10};
+    cfg.idle_nodes_list_update_period = std::chrono::hours{1};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::atomic<int> requests{0};
+    auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
+        EXPECT_EQ(url.path, "/localnodes");
+        ++requests;
+        return HttpResponse{200, "[\"node2.local\"]"};
+    });
+
+    AlternatorLiveNodes nodes({"node1.local"}, cfg, http);
+    nodes.Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds{30});
+    EXPECT_EQ(requests.load(), 0);
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"node1.local"}));
+
+    EXPECT_EQ(nodes.NextNode().host, "node1.local");
+    for (int i = 0; i < 50 && requests.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    nodes.Stop();
+
+    EXPECT_GT(requests.load(), 0);
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"node2.local"}));
+}

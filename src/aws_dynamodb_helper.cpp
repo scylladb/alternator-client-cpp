@@ -296,7 +296,13 @@ DynamoDBHelper::DynamoDBHelper(std::vector<std::string> initial_nodes,
                                                    config,
                                                    std::move(discovery_http_client)))
     , config_(std::move(config))
-    , partition_keys_(config_.key_route_affinity.partition_key_by_table) {}
+    , partition_keys_(config_.key_route_affinity.partition_key_by_table) {
+    nodes_->Start();
+}
+
+DynamoDBHelper::~DynamoDBHelper() {
+    Stop();
+}
 
 std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDB() const {
     auto client_config = NewClientConfiguration();

@@ -22,8 +22,8 @@ struct Config {
     std::string aws_region = "default-alb-region";
     Credentials credentials;
 
-    std::chrono::milliseconds nodes_list_update_period{std::chrono::minutes(5)};
-    std::chrono::milliseconds idle_nodes_list_update_period{std::chrono::hours(2)};
+    std::chrono::milliseconds nodes_list_update_period{std::chrono::seconds(1)};
+    std::chrono::milliseconds idle_nodes_list_update_period{std::chrono::minutes(1)};
     std::chrono::milliseconds http_client_timeout{0};
     std::chrono::milliseconds connect_timeout{1000};
 
