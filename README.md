@@ -92,6 +92,20 @@ cfg.node_health.quarantine_traffic_interval = 20;
 cfg.node_health.quarantine_success_threshold = 3;
 ```
 
+### Discovery Refresh
+
+`AlternatorLiveNodes::Start()` runs background `/localnodes` refreshes. Recent request activity uses
+`nodes_list_update_period`, while idle clients use `idle_nodes_list_update_period`:
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.nodes_list_update_period = std::chrono::seconds(1);
+cfg.idle_nodes_list_update_period = std::chrono::minutes(1);
+```
+
+The AWS helper starts and stops this background refresh automatically. The core `AlternatorLiveNodes`
+type leaves lifecycle control to the caller.
+
 The endpoint provider itself chooses nodes, but AWS SDK for C++ does not expose a public per-attempt hook equivalent to
 the Go SDK v2 middleware used by `alternator-client-golang`.
 
@@ -137,6 +151,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - `/localnodes` discovery with cluster, datacenter, and rack scopes.
 - Scope fallback chains such as rack -> datacenter -> cluster.
 - Cluster scope merge across seed nodes.
+- Active and idle `/localnodes` refresh cadence.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
 - Round-robin `NextNode()` and flat per-request query plans, including Go-compatible seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.

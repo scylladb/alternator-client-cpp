@@ -55,7 +55,9 @@ private:
     [[nodiscard]] Url NextQuarantinedNode() const;
     [[nodiscard]] Url StickyQuarantinedNodeForHash(std::int64_t hash, const std::vector<Url>& active_nodes) const;
     void RemoveQuarantineHashAssignmentsForNode(const Url& node);
-    void MaybeRefresh();
+    void MarkActivity();
+    [[nodiscard]] std::chrono::milliseconds RefreshIntervalForNow(std::chrono::steady_clock::time_point now) const;
+    void ScheduleNextRefresh(std::chrono::steady_clock::time_point now);
     void BackgroundLoop();
 
     Config config_;
@@ -70,6 +72,7 @@ private:
     mutable std::atomic<std::uint64_t> quarantine_plan_index_{0};
     mutable std::atomic<std::uint64_t> quarantine_node_index_{0};
     std::chrono::steady_clock::time_point next_update_;
+    std::chrono::steady_clock::time_point last_activity_;
 
     std::mutex background_mutex_;
     std::condition_variable background_cv_;

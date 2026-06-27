@@ -94,6 +94,7 @@ public:
     DynamoDBHelper(std::vector<std::string> initial_nodes,
                    Config config = {},
                    std::shared_ptr<HttpClient> discovery_http_client = nullptr);
+    ~DynamoDBHelper();
 
     [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDB() const;
     [[nodiscard]] Aws::DynamoDB::DynamoDBClientConfiguration NewClientConfiguration() const;

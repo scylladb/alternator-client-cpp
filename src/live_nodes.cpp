@@ -160,7 +160,13 @@ AlternatorLiveNodes::AlternatorLiveNodes(std::vector<std::string> initial_nodes,
     initial_nodes_ = SortAndDedupeNodes(std::move(initial_nodes_));
     live_nodes_ = initial_nodes_;
     health_store_ = std::make_unique<NodeHealthStore>(config_.node_health, initial_nodes_);
-    next_update_ = std::chrono::steady_clock::now() + config_.nodes_list_update_period;
+    const auto now = std::chrono::steady_clock::now();
+    last_activity_ = std::chrono::steady_clock::time_point::min();
+    if (config_.idle_nodes_list_update_period > std::chrono::milliseconds::zero()) {
+        next_update_ = now + config_.idle_nodes_list_update_period;
+    } else {
+        next_update_ = std::chrono::steady_clock::time_point::max();
+    }
 }
 
 AlternatorLiveNodes::~AlternatorLiveNodes() {
@@ -168,7 +174,7 @@ AlternatorLiveNodes::~AlternatorLiveNodes() {
 }
 
 Url AlternatorLiveNodes::NextNode() {
-    MaybeRefresh();
+    MarkActivity();
 
     auto candidates = GetActiveNodes();
     if (candidates.empty()) {
@@ -289,6 +295,7 @@ void AlternatorLiveNodes::Stop() {
 }
 
 void AlternatorLiveNodes::ReportNodeResult(const Url& node, NodeHealthObservation observation) {
+    MarkActivity();
     health_store_->ReportNodeResult(node, observation);
     auto status = health_store_->GetNodeStatus(node);
     if (!status || status->state != NodeHealthState::Quarantined) {
@@ -501,59 +508,96 @@ void AlternatorLiveNodes::RemoveQuarantineHashAssignmentsForNode(const Url& node
     }
 }
 
-void AlternatorLiveNodes::MaybeRefresh() {
-    if (config_.nodes_list_update_period <= std::chrono::milliseconds::zero()) {
-        return;
-    }
-
+void AlternatorLiveNodes::MarkActivity() {
     const auto now = std::chrono::steady_clock::now();
-    bool should_update = false;
+    bool notify = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (now >= next_update_) {
-            next_update_ = now + config_.nodes_list_update_period;
-            should_update = true;
+        last_activity_ = now;
+        if (config_.nodes_list_update_period > std::chrono::milliseconds::zero()) {
+            const auto active_due = now + config_.nodes_list_update_period;
+            if (next_update_ > active_due) {
+                next_update_ = active_due;
+                notify = true;
+            } else if (now >= next_update_) {
+                notify = true;
+            }
         }
     }
-    if (should_update) {
-        try {
-            UpdateLiveNodes();
-        } catch (...) {
-            // Keep current node list when refresh fails.
-        }
+    if (notify) {
+        background_cv_.notify_all();
     }
+}
+
+std::chrono::milliseconds AlternatorLiveNodes::RefreshIntervalForNow(
+    std::chrono::steady_clock::time_point now) const {
+    const bool has_activity = last_activity_ != std::chrono::steady_clock::time_point::min();
+    const bool active_enabled = config_.nodes_list_update_period > std::chrono::milliseconds::zero();
+    const bool idle_enabled = config_.idle_nodes_list_update_period > std::chrono::milliseconds::zero();
+    const bool recently_active =
+        has_activity &&
+        (!idle_enabled || now - last_activity_ < config_.idle_nodes_list_update_period);
+
+    if (recently_active && active_enabled) {
+        return config_.nodes_list_update_period;
+    }
+    if (idle_enabled) {
+        return config_.idle_nodes_list_update_period;
+    }
+    return std::chrono::milliseconds::zero();
+}
+
+void AlternatorLiveNodes::ScheduleNextRefresh(std::chrono::steady_clock::time_point now) {
+    const auto interval = RefreshIntervalForNow(now);
+    if (interval <= std::chrono::milliseconds::zero()) {
+        next_update_ = std::chrono::steady_clock::time_point::max();
+        return;
+    }
+    next_update_ = now + interval;
 }
 
 void AlternatorLiveNodes::BackgroundLoop() {
     std::unique_lock<std::mutex> lock(background_mutex_);
-    const auto idle_period = config_.idle_nodes_list_update_period;
     const auto probe_period = config_.node_health.down_node_probe_period;
-    auto next_idle_update = std::chrono::steady_clock::now() + idle_period;
     auto next_down_probe = std::chrono::steady_clock::now() + probe_period;
 
     while (!stopping_) {
-        const bool idle_enabled = idle_period > std::chrono::milliseconds::zero();
         const bool probe_enabled = probe_period > std::chrono::milliseconds::zero();
-        if (!idle_enabled && !probe_enabled) {
+        std::chrono::steady_clock::time_point next_update;
+        {
+            std::lock_guard<std::mutex> state_lock(mutex_);
+            next_update = next_update_;
+        }
+        const bool refresh_enabled = next_update != std::chrono::steady_clock::time_point::max();
+
+        if (!refresh_enabled && !probe_enabled) {
             background_cv_.wait(lock, [this] { return stopping_; });
             continue;
         }
 
-        auto wake_at = idle_enabled ? next_idle_update : next_down_probe;
-        if (probe_enabled && (!idle_enabled || next_down_probe < wake_at)) {
+        auto wake_at = refresh_enabled ? next_update : next_down_probe;
+        if (probe_enabled && (!refresh_enabled || next_down_probe < wake_at)) {
             wake_at = next_down_probe;
         }
 
-        if (background_cv_.wait_until(lock, wake_at, [this] { return stopping_; })) {
+        const auto wait_result = background_cv_.wait_until(lock, wake_at);
+        if (stopping_) {
+            continue;
+        }
+        if (wait_result == std::cv_status::no_timeout) {
             continue;
         }
 
         const auto now = std::chrono::steady_clock::now();
-        const bool should_update = idle_enabled && now >= next_idle_update;
-        const bool should_probe_down = probe_enabled && now >= next_down_probe;
-        if (should_update) {
-            next_idle_update = now + idle_period;
+        bool should_update = false;
+        {
+            std::lock_guard<std::mutex> state_lock(mutex_);
+            should_update = next_update_ != std::chrono::steady_clock::time_point::max() && now >= next_update_;
+            if (should_update) {
+                ScheduleNextRefresh(now);
+            }
         }
+        const bool should_probe_down = probe_enabled && now >= next_down_probe;
         if (should_probe_down) {
             next_down_probe = now + probe_period;
         }
