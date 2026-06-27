@@ -106,6 +106,18 @@ cfg.idle_nodes_list_update_period = std::chrono::minutes(1);
 The AWS helper starts and stops this background refresh automatically. The core `AlternatorLiveNodes`
 type leaves lifecycle control to the caller.
 
+When libcurl is available, the default discovery client reuses HTTP connections by default. It keeps
+a libcurl connection cache bounded by `max_connections` and can be disabled for debugging or
+compatibility:
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.max_connections = 100;
+cfg.reuse_discovery_connections = false;
+```
+
+The POSIX fallback discovery client supports plain HTTP only and closes each request.
+
 The endpoint provider itself chooses nodes, but AWS SDK for C++ does not expose a public per-attempt hook equivalent to
 the Go SDK v2 middleware used by `alternator-client-golang`.
 
@@ -152,6 +164,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - Scope fallback chains such as rack -> datacenter -> cluster.
 - Cluster scope merge across seed nodes.
 - Active and idle `/localnodes` refresh cadence.
+- Reused libcurl discovery HTTP connections with an opt-out switch.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
 - Round-robin `NextNode()` and flat per-request query plans, including Go-compatible seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.

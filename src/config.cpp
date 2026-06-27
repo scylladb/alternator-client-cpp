@@ -14,6 +14,9 @@ void ValidateConfig(const Config& config) {
     if (!config.routing_scope) {
         throw std::invalid_argument("routing_scope must not be null");
     }
+    if (config.max_connections == 0) {
+        throw std::invalid_argument("max_connections must be > 0");
+    }
 }
 
 } // namespace scylladb::alternator

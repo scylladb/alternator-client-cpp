@@ -33,6 +33,7 @@ struct Config {
     std::string client_private_key_file;
 
     unsigned max_connections = 100;
+    bool reuse_discovery_connections = true;
     std::string user_agent = "scylladb-alternator-client-cpp/devel";
 
     NodeHealthStoreConfig node_health;

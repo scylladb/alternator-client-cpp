@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <scylladb/alternator/config.h>
@@ -23,11 +24,14 @@ public:
 class CurlHttpClient final : public HttpClient {
 public:
     explicit CurlHttpClient(Config config);
+    ~CurlHttpClient() override;
 
     [[nodiscard]] HttpResponse Get(const Url& url) const override;
 
 private:
     Config config_;
+    mutable std::mutex mutex_;
+    mutable void* reusable_handle_ = nullptr;
 };
 
 std::shared_ptr<HttpClient> NewDefaultHttpClient(const Config& config);
