@@ -183,6 +183,8 @@ public:
 
     std::shared_ptr<Aws::Http::HttpClient> CreateHttpClient(
         const Aws::Client::ClientConfiguration& client_configuration) const override {
+        // Keep one SDK platform client behind each wrapper so the SDK-owned
+        // connection pool can persist across DynamoDB requests.
         auto delegate = Aws::MakeShared<Aws::Http::PlatformHttpClient>(
             kAllocationTag,
             client_configuration);
