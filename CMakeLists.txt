@@ -12,6 +12,7 @@ option(ALTERNATOR_CLIENT_CPP_BUILD_TESTS "Build unit tests" ON)
 option(ALTERNATOR_CLIENT_CPP_ENABLE_AWS "Build AWS SDK for C++ DynamoDB adapter when AWSSDK is available" ON)
 
 find_package(CURL QUIET)
+find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
 
 add_library(alternator_client_cpp
@@ -41,6 +42,10 @@ target_link_libraries(alternator_client_cpp
 if(CURL_FOUND)
     target_link_libraries(alternator_client_cpp PUBLIC CURL::libcurl)
     target_compile_definitions(alternator_client_cpp PUBLIC SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL=1)
+    if(OpenSSL_FOUND)
+        target_link_libraries(alternator_client_cpp PUBLIC OpenSSL::SSL)
+        target_compile_definitions(alternator_client_cpp PUBLIC SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_OPENSSL=1)
+    endif()
 else()
     message(STATUS "libcurl development package not found; default discovery client supports plain HTTP only")
 endif()

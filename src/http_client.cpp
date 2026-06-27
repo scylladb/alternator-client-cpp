@@ -2,6 +2,9 @@
 
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
 #include <curl/curl.h>
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_OPENSSL
+#include <openssl/ssl.h>
+#endif
 #else
 #include <netdb.h>
 #include <sys/socket.h>
@@ -42,6 +45,37 @@ void SetDuration(CURL* curl, CURLoption option, std::chrono::milliseconds value)
     }
 }
 
+bool CurlUsesOpenSslBackend() {
+    const auto* info = curl_version_info(CURLVERSION_NOW);
+    if (info == nullptr || info->ssl_version == nullptr) {
+        return false;
+    }
+    const std::string ssl_version = info->ssl_version;
+    return ssl_version.find("OpenSSL") != std::string::npos ||
+           ssl_version.find("LibreSSL") != std::string::npos ||
+           ssl_version.find("BoringSSL") != std::string::npos;
+}
+
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_OPENSSL
+CURLcode ConfigureSslContext(CURL*, void* ssl_context, void* userdata) {
+    const auto* config = static_cast<const Config*>(userdata);
+    if (config == nullptr || ssl_context == nullptr) {
+        return CURLE_OK;
+    }
+
+    auto* ctx = static_cast<SSL_CTX*>(ssl_context);
+    if (!config->tls_session_cache_enabled) {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+        return CURLE_OK;
+    }
+
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
+    SSL_CTX_sess_set_cache_size(ctx, static_cast<long>(config->tls_session_cache_size));
+    SSL_CTX_set_timeout(ctx, static_cast<long>(config->tls_session_timeout.count()));
+    return CURLE_OK;
+}
+#endif
+
 void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::string& body) {
     curl_easy_reset(curl);
 
@@ -52,6 +86,7 @@ void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_SESSIONID_CACHE, config.tls_session_cache_enabled ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, static_cast<long>(config.max_connections));
     curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, config.reuse_discovery_connections ? 0L : 1L);
     curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, config.reuse_discovery_connections ? 0L : 1L);
@@ -76,6 +111,13 @@ void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::
     if (!config.client_private_key_file.empty()) {
         curl_easy_setopt(curl, CURLOPT_SSLKEY, config.client_private_key_file.c_str());
     }
+
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_OPENSSL
+    if (CurlUsesOpenSslBackend()) {
+        curl_easy_setopt(curl, CURLOPT_SSL_CTX_FUNCTION, &ConfigureSslContext);
+        curl_easy_setopt(curl, CURLOPT_SSL_CTX_DATA, &config);
+    }
+#endif
 }
 
 HttpResponse PerformCurlGet(CURL* curl, const Url& url, const Config& config) {

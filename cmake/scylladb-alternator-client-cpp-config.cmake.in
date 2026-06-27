@@ -8,6 +8,10 @@ if(@CURL_FOUND@)
     find_dependency(CURL)
 endif()
 
+if(@OpenSSL_FOUND@)
+    find_dependency(OpenSSL)
+endif()
+
 if(@ALTERNATOR_CLIENT_CPP_AWS_TARGET_BUILT@)
     find_dependency(ZLIB)
     find_dependency(AWSSDK COMPONENTS dynamodb)
