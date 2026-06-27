@@ -42,6 +42,66 @@ void SetDuration(CURL* curl, CURLoption option, std::chrono::milliseconds value)
     }
 }
 
+void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::string& body) {
+    curl_easy_reset(curl);
+
+    const auto url_string = url.ToString();
+    curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, static_cast<long>(config.max_connections));
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, config.reuse_discovery_connections ? 0L : 1L);
+    curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, config.reuse_discovery_connections ? 0L : 1L);
+
+    SetDuration(curl, CURLOPT_TIMEOUT_MS, config.http_client_timeout);
+    SetDuration(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout);
+
+    if (!config.user_agent.empty()) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, config.user_agent.c_str());
+    }
+
+    if (!config.verify_ssl) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+    if (!config.ca_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, config.ca_file.c_str());
+    }
+    if (!config.client_certificate_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_SSLCERT, config.client_certificate_file.c_str());
+    }
+    if (!config.client_private_key_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_SSLKEY, config.client_private_key_file.c_str());
+    }
+}
+
+HttpResponse PerformCurlGet(CURL* curl, const Url& url, const Config& config) {
+    std::string body;
+    ConfigureCurlForGet(curl, url, config, body);
+
+    curl_slist* headers = nullptr;
+    headers = curl_slist_append(
+        headers,
+        config.reuse_discovery_connections ? "Connection: keep-alive" : "Connection: close");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    const auto code = curl_easy_perform(curl);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, nullptr);
+    if (headers != nullptr) {
+        curl_slist_free_all(headers);
+    }
+    if (code != CURLE_OK) {
+        throw std::runtime_error(curl_easy_strerror(code));
+    }
+
+    long status_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    return HttpResponse{status_code, std::move(body)};
+}
+
 } // namespace
 
 CurlHttpClient::CurlHttpClient(Config config)
@@ -49,53 +109,34 @@ CurlHttpClient::CurlHttpClient(Config config)
     EnsureCurlInitialized();
 }
 
+CurlHttpClient::~CurlHttpClient() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (reusable_handle_ != nullptr) {
+        curl_easy_cleanup(static_cast<CURL*>(reusable_handle_));
+        reusable_handle_ = nullptr;
+    }
+}
+
 HttpResponse CurlHttpClient::Get(const Url& url) const {
     EnsureCurlInitialized();
+
+    if (config_.reuse_discovery_connections) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reusable_handle_ == nullptr) {
+            reusable_handle_ = curl_easy_init();
+            if (reusable_handle_ == nullptr) {
+                throw std::runtime_error("curl_easy_init failed");
+            }
+        }
+        return PerformCurlGet(static_cast<CURL*>(reusable_handle_), url, config_);
+    }
 
     CURL* raw = curl_easy_init();
     if (raw == nullptr) {
         throw std::runtime_error("curl_easy_init failed");
     }
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
-
-    std::string body;
-    const auto url_string = url.ToString();
-    curl_easy_setopt(curl.get(), CURLOPT_URL, url_string.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_HTTPGET, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, &WriteBody);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPALIVE, 1L);
-
-    SetDuration(curl.get(), CURLOPT_TIMEOUT_MS, config_.http_client_timeout);
-    SetDuration(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, config_.connect_timeout);
-
-    if (!config_.user_agent.empty()) {
-        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, config_.user_agent.c_str());
-    }
-
-    if (!config_.verify_ssl) {
-        curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 0L);
-    }
-    if (!config_.ca_file.empty()) {
-        curl_easy_setopt(curl.get(), CURLOPT_CAINFO, config_.ca_file.c_str());
-    }
-    if (!config_.client_certificate_file.empty()) {
-        curl_easy_setopt(curl.get(), CURLOPT_SSLCERT, config_.client_certificate_file.c_str());
-    }
-    if (!config_.client_private_key_file.empty()) {
-        curl_easy_setopt(curl.get(), CURLOPT_SSLKEY, config_.client_private_key_file.c_str());
-    }
-
-    const auto code = curl_easy_perform(curl.get());
-    if (code != CURLE_OK) {
-        throw std::runtime_error(curl_easy_strerror(code));
-    }
-
-    long status_code = 0;
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status_code);
-    return HttpResponse{status_code, std::move(body)};
+    return PerformCurlGet(curl.get(), url, config_);
 }
 
 #else
@@ -221,6 +262,8 @@ HttpResponse ParseHttpResponse(const std::string& raw) {
 
 CurlHttpClient::CurlHttpClient(Config config)
     : config_(std::move(config)) {}
+
+CurlHttpClient::~CurlHttpClient() = default;
 
 HttpResponse CurlHttpClient::Get(const Url& url) const {
     if (url.scheme != "http") {
