@@ -61,6 +61,25 @@ The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by
 
 The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook to Go SDK v2's post-retry, pre-signing middleware, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic middleware features such as transparent header optimization and request-content-based endpoint rewriting are not available in the same form. The core library does provide the deterministic key-route affinity primitives used by the Go client, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
 
+### DynamoDB HTTP Connections
+
+DynamoDB requests use the AWS SDK for C++ HTTP transport. The helper passes
+`Config::max_connections` to the SDK client configuration, so persistent HTTP/HTTPS
+connection pooling is enabled by default and bounded at 100 connections per DynamoDB
+client.
+
+Increase the reusable connection pool before constructing the helper or DynamoDB client:
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.max_connections = 400;
+```
+
+When `DynamoDBHelper::ApplyToSDKOptions()` installs the retry-aware HTTP client factory,
+the Alternator wrapper still delegates requests to the SDK platform HTTP client. The SDK
+transport owns the underlying connection pool and continues to reuse connections while
+the wrapper rotates Alternator endpoints.
+
 When integrating custom retry or logging code around AWS SDK outcomes, call `helper.ReportNodeResult(node, observation)`
 or `helper.Nodes()->ReportNodeResult(node, observation)`. The node-health layer translates observations into rigid
 active/quarantined/down state:
@@ -176,6 +195,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - Active and idle `/localnodes` refresh cadence.
 - Reused libcurl discovery HTTP connections with an opt-out switch.
 - TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
+- Persistent AWS SDK DynamoDB HTTP connection pooling via `max_connections`.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
 - Round-robin `NextNode()` and flat per-request query plans, including Go-compatible seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.

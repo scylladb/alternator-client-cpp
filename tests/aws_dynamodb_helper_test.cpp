@@ -201,6 +201,18 @@ TEST(AwsDynamoDBHelper, PropagatesTransportConfigurationToAwsClientConfig) {
     EXPECT_EQ(client_config.userAgent, "transport-test/1.0");
 }
 
+TEST(AwsDynamoDBHelper, DefaultsToConfiguredSdkConnectionPoolLimit) {
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    Config cfg;
+    aws::DynamoDBHelper helper({"node1.example.com"}, cfg);
+
+    auto client_config = helper.NewClientConfiguration();
+    EXPECT_EQ(client_config.maxConnections, cfg.max_connections);
+    EXPECT_EQ(client_config.maxConnections, 100U);
+}
+
 TEST(AwsDynamoDBHelper, HttpClientFactoryRotatesNodesAcrossRetries) {
     RetryingHttpServer server(2);
 
