@@ -118,6 +118,16 @@ cfg.reuse_discovery_connections = false;
 
 The POSIX fallback discovery client supports plain HTTP only and closes each request.
 
+TLS session caching is enabled by default for HTTPS discovery. The libcurl session cache can be
+disabled, and OpenSSL-backed libcurl builds also honor the configured cache size and timeout:
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.tls_session_cache_enabled = true;
+cfg.tls_session_cache_size = 1024;
+cfg.tls_session_timeout = std::chrono::hours(24);
+```
+
 The endpoint provider itself chooses nodes, but AWS SDK for C++ does not expose a public per-attempt hook equivalent to
 the Go SDK v2 middleware used by `alternator-client-golang`.
 
@@ -165,6 +175,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - Cluster scope merge across seed nodes.
 - Active and idle `/localnodes` refresh cadence.
 - Reused libcurl discovery HTTP connections with an opt-out switch.
+- TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
 - Round-robin `NextNode()` and flat per-request query plans, including Go-compatible seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.

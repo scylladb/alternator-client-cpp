@@ -397,3 +397,14 @@ TEST(AlternatorLiveNodes, BackgroundRefreshUsesActivePeriodOnlyAfterActivity) {
     EXPECT_GT(requests.load(), 0);
     EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"node2.local"}));
 }
+
+TEST(AlternatorLiveNodes, RejectsInvalidTlsSessionCacheConfig) {
+    Config cfg;
+    cfg.tls_session_cache_size = 0;
+
+    auto http = std::make_shared<FakeHttpClient>([](const Url&) {
+        return HttpResponse{200, "[]"};
+    });
+
+    EXPECT_THROW(AlternatorLiveNodes({"node1.local"}, cfg, http), std::invalid_argument);
+}

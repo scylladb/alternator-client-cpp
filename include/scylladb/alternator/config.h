@@ -31,6 +31,9 @@ struct Config {
     std::string ca_file;
     std::string client_certificate_file;
     std::string client_private_key_file;
+    bool tls_session_cache_enabled = true;
+    std::uint32_t tls_session_cache_size = 1024;
+    std::chrono::seconds tls_session_timeout{86400};
 
     unsigned max_connections = 100;
     bool reuse_discovery_connections = true;
