@@ -1,6 +1,6 @@
 # C++ Alternator client
 
-This repository provides a C++ analogue of `alternator-client-golang` for ScyllaDB Alternator deployments that expose the DynamoDB API across multiple nodes.
+This repository provides a C++ Alternator client for ScyllaDB deployments that expose the DynamoDB API across multiple nodes.
 
 The core library discovers Alternator nodes through `/localnodes`, keeps a live node set, supports rack/datacenter routing scopes with fallbacks, tracks active/quarantined/down node state, and feeds query plans from one candidate list. Quarantine sampling is handled by the live-node source before a query plan is built. An optional AWS SDK for C++ adapter creates a DynamoDB client with a dynamic endpoint provider.
 
@@ -59,7 +59,7 @@ int main() {
 
 The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by default. AWS SDK for C++ resolves that endpoint once for a retried operation, so `DynamoDBHelper::ApplyToSDKOptions()` can also install a process-wide HTTP client factory before `Aws::InitAPI()`. That factory delegates to the SDK HTTP client and rotates only requests already aimed at the helper's Alternator endpoints.
 
-The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook to Go SDK v2's post-retry, pre-signing middleware, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic middleware features such as transparent header optimization and request-content-based endpoint rewriting are not available in the same form. The core library does provide the deterministic key-route affinity primitives used by the Go client, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
+The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook for retry-aware endpoint rewriting, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic middleware features such as transparent header optimization and request-content-based endpoint rewriting are not available in the same form. The core library does provide deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
 
 ### DynamoDB HTTP Connections
 
@@ -147,8 +147,8 @@ cfg.tls_session_cache_size = 1024;
 cfg.tls_session_timeout = std::chrono::hours(24);
 ```
 
-The endpoint provider itself chooses nodes, but AWS SDK for C++ does not expose a public per-attempt hook equivalent to
-the Go SDK v2 middleware used by `alternator-client-golang`.
+The endpoint provider itself chooses nodes, but AWS SDK for C++ does not expose a public per-attempt hook before request
+signing.
 
 For individual requests, the helper can attach AWS SDK retry hooks that report the signed endpoint when the SDK retries:
 
@@ -160,7 +160,7 @@ auto outcome = ddb->PutItem(request);
 
 ### Key Route Affinity
 
-Key-route affinity makes write operations with the same partition key prefer the same coordinator. This can improve read-before-write paths such as conditional writes. The C++ core mirrors the Go client's Murmur3/AttributeValue hashing and seeded query-plan selection:
+Key-route affinity makes write operations with the same partition key prefer the same coordinator. This can improve read-before-write paths such as conditional writes. The C++ core uses deterministic Murmur3/AttributeValue hashing and seeded query-plan selection:
 
 ```cpp
 using namespace scylladb::alternator;
@@ -178,7 +178,7 @@ auto plan = helper.NewPartitionKeyQueryPlan(
 auto preferred = plan.Next();
 ```
 
-For `BatchWriteItem`-style operations, pass the put/delete candidates and the helper will vote for preferred nodes using the same deterministic ordering as the Go SDK v2 helper:
+For `BatchWriteItem`-style operations, pass the put/delete candidates and the helper will vote for preferred nodes. Voted nodes are tried first by descending vote count, with deterministic node-order tie breaking:
 
 ```cpp
 auto batch_plan = helper.NewBatchWriteQueryPlan({
@@ -197,10 +197,10 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
 - Persistent AWS SDK DynamoDB HTTP connection pooling via `max_connections`.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
-- Round-robin `NextNode()` and flat per-request query plans, including Go-compatible seeded plans for affinity callers.
+- Round-robin `NextNode()` and flat per-request query plans, including deterministic seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.
 - TLS verification toggle, CA file, client certificate/key file, and HTTP timeouts for libcurl discovery.
-- Cross-language Murmur3/AttributeValue hashing helpers for string, number, and binary partition key values.
+- Murmur3/AttributeValue hashing helpers for string, number, and binary partition key values.
 - Optional AWS SDK for C++ DynamoDB helper and endpoint provider.
 
 ## Targets
