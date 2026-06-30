@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace scylladb::alternator;
@@ -97,8 +98,12 @@ private:
 class CountingHttpServer {
 public:
     CountingHttpServer(int expected_requests, bool keep_alive)
-        : expected_requests_(expected_requests)
+        : CountingHttpServer(std::vector<int>(static_cast<std::size_t>(expected_requests), 200), keep_alive) {}
+
+    CountingHttpServer(std::vector<int> response_statuses, bool keep_alive)
+        : expected_requests_(static_cast<int>(response_statuses.size()))
         , keep_alive_(keep_alive) {
+        response_statuses_ = std::move(response_statuses);
         fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) {
             throw std::runtime_error("socket failed");
@@ -138,13 +143,14 @@ public:
                         break;
                     }
                     requests_.push_back(std::move(request));
-                    ++request_count_;
+                    const auto response_index = request_count_.fetch_add(1);
 
                     const std::string body = "[\"node1.local\"]";
                     const bool keep_connection =
                         keep_alive_ && request_count_.load() < expected_requests_;
+                    const auto status_code = response_statuses_.at(static_cast<std::size_t>(response_index));
                     std::ostringstream response;
-                    response << "HTTP/1.1 200 OK\r\n"
+                    response << "HTTP/1.1 " << status_code << " " << ReasonPhrase(status_code) << "\r\n"
                              << "Content-Length: " << body.size() << "\r\n"
                              << "Connection: " << (keep_connection ? "keep-alive" : "close") << "\r\n"
                              << "\r\n"
@@ -186,6 +192,21 @@ public:
     }
 
 private:
+    static std::string ReasonPhrase(int status_code) {
+        switch (status_code) {
+        case 200:
+            return "OK";
+        case 400:
+            return "Bad Request";
+        case 500:
+            return "Internal Server Error";
+        case 503:
+            return "Service Unavailable";
+        default:
+            return "Status";
+        }
+    }
+
     static std::string ReadRequest(int client) {
         std::string request;
         char buffer[1024];
@@ -202,6 +223,7 @@ private:
     int fd_ = -1;
     int expected_requests_ = 0;
     bool keep_alive_ = false;
+    std::vector<int> response_statuses_;
     std::uint16_t port_ = 0;
     std::atomic<int> accept_count_{0};
     std::atomic<int> request_count_{0};
@@ -240,6 +262,28 @@ TEST(HttpClient, ReusesDiscoveryConnectionByDefaultWithCurl) {
     server.Wait();
 
     EXPECT_EQ(server.Requests().size(), 2U);
+    EXPECT_EQ(server.AcceptCount(), 1);
+#else
+    GTEST_SKIP() << "libcurl support is not enabled";
+#endif
+}
+
+TEST(HttpClient, ReusesDiscoveryConnectionAfterRepeatedNonSuccessResponsesWithCurl) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
+    CountingHttpServer server(std::vector<int>{500, 503, 200}, true);
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.reuse_discovery_connections = true;
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes");
+
+    EXPECT_EQ(client.Get(url).status_code, 500);
+    EXPECT_EQ(client.Get(url).status_code, 503);
+    EXPECT_EQ(client.Get(url).status_code, 200);
+    server.Wait();
+
+    EXPECT_EQ(server.Requests().size(), 3U);
     EXPECT_EQ(server.AcceptCount(), 1);
 #else
     GTEST_SKIP() << "libcurl support is not enabled";
