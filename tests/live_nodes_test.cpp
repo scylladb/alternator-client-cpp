@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -102,6 +103,41 @@ TEST(AlternatorLiveNodes, ClusterScopeMergesSeedNodes) {
               }));
     EXPECT_GT(dc1_requests.load(), 0);
     EXPECT_GT(dc2_requests.load(), 0);
+}
+
+TEST(AlternatorLiveNodes, ClusterScopeRefreshUsesConfiguredSeedNodes) {
+    Config cfg;
+    cfg.routing_scope = NewClusterScope();
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+
+    std::vector<std::string> requested_hosts;
+    auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
+        EXPECT_EQ(url.path, "/localnodes");
+        EXPECT_EQ(url.query, "");
+        requested_hosts.push_back(url.host);
+        if (url.host == "seed-dc1.local") {
+            return HttpResponse{200, "[\"dc1-node1.local\",\"dc1-node2.local\"]"};
+        }
+        if (url.host == "seed-dc2.local") {
+            return HttpResponse{200, "[\"dc2-node1.local\",\"dc2-node2.local\"]"};
+        }
+        return HttpResponse{500, ""};
+    });
+
+    AlternatorLiveNodes nodes({"seed-dc1.local", "seed-dc2.local"}, cfg, http);
+    nodes.UpdateLiveNodes();
+    nodes.UpdateLiveNodes();
+
+    EXPECT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({
+                  "dc1-node1.local",
+                  "dc1-node2.local",
+                  "dc2-node1.local",
+                  "dc2-node2.local",
+              }));
+    EXPECT_EQ(requested_hosts.size(), 4U);
+    EXPECT_EQ(std::count(requested_hosts.begin(), requested_hosts.end(), "seed-dc1.local"), 2);
+    EXPECT_EQ(std::count(requested_hosts.begin(), requested_hosts.end(), "seed-dc2.local"), 2);
 }
 
 TEST(AlternatorLiveNodes, CheckIfRackAndDatacenterSetCorrectlyRejectsWrongDatacenter) {
