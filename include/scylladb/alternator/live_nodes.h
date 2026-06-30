@@ -49,6 +49,7 @@ public:
 private:
     [[nodiscard]] std::vector<Url> FetchLiveNodes();
     [[nodiscard]] std::vector<Url> GetNodesForScope(const RoutingScope& scope);
+    [[nodiscard]] std::vector<Url> GetDiscoveryNodesForScope(const RoutingScope& scope) const;
     [[nodiscard]] std::vector<Url> GetNodesFromEndpoint(const Url& endpoint) const;
     [[nodiscard]] Url NextKnownNode();
     [[nodiscard]] bool ShouldTryQuarantinedNode(bool active_nodes_empty) const;
