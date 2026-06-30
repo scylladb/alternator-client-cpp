@@ -12,9 +12,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <cctype>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace scylladb::alternator;
 
@@ -120,6 +126,179 @@ private:
     int attempts_ = 0;
     std::uint16_t port_ = 0;
     std::vector<std::string> requests_;
+    std::thread worker_;
+};
+
+struct SequencedHttpResponse {
+    int status_code = 200;
+    std::string reason = "OK";
+    std::string body;
+};
+
+class KeepAliveSequenceHttpServer {
+public:
+    explicit KeepAliveSequenceHttpServer(std::vector<SequencedHttpResponse> responses)
+        : responses_(std::move(responses)) {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error("socket failed");
+        }
+
+        int yes = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            throw std::runtime_error("bind failed");
+        }
+        if (listen(fd_, static_cast<int>(responses_.size())) != 0) {
+            throw std::runtime_error("listen failed");
+        }
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            throw std::runtime_error("getsockname failed");
+        }
+        port_ = ntohs(addr.sin_port);
+
+        worker_ = std::thread([this] {
+            while (request_count_.load() < static_cast<int>(responses_.size())) {
+                int client = accept(fd_, nullptr, nullptr);
+                if (client < 0) {
+                    return;
+                }
+                ++accept_count_;
+
+                while (request_count_.load() < static_cast<int>(responses_.size())) {
+                    auto request = ReadRequest(client);
+                    if (request.empty()) {
+                        break;
+                    }
+                    requests_.push_back(std::move(request));
+                    const auto response_index = request_count_.fetch_add(1);
+                    const bool keep_connection = request_count_.load() < static_cast<int>(responses_.size());
+                    SendResponse(
+                        client,
+                        responses_.at(static_cast<std::size_t>(response_index)),
+                        keep_connection);
+                    if (!keep_connection) {
+                        break;
+                    }
+                }
+
+                close(client);
+            }
+        });
+    }
+
+    ~KeepAliveSequenceHttpServer() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+        Wait();
+    }
+
+    void Wait() {
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    [[nodiscard]] std::uint16_t Port() const {
+        return port_;
+    }
+
+    [[nodiscard]] int AcceptCount() const {
+        return accept_count_.load();
+    }
+
+    [[nodiscard]] const std::vector<std::string>& Requests() const {
+        return requests_;
+    }
+
+private:
+    static bool EqualsCaseInsensitive(const std::string& lhs, const std::string& rhs) {
+        if (lhs.size() != rhs.size()) {
+            return false;
+        }
+
+        for (std::size_t i = 0; i < lhs.size(); ++i) {
+            const auto left = static_cast<unsigned char>(lhs[i]);
+            const auto right = static_cast<unsigned char>(rhs[i]);
+            if (std::tolower(left) != std::tolower(right)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    static std::size_t ContentLength(const std::string& request, std::size_t header_end) {
+        std::istringstream lines(request.substr(0, header_end));
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            if (EqualsCaseInsensitive(line.substr(0, colon), "Content-Length")) {
+                return static_cast<std::size_t>(std::stoul(line.substr(colon + 1)));
+            }
+        }
+
+        return 0;
+    }
+
+    static std::string ReadRequest(int client) {
+        std::string request;
+        char buffer[4096];
+        auto header_end = std::string::npos;
+        while (header_end == std::string::npos) {
+            const auto n = recv(client, buffer, sizeof(buffer), 0);
+            if (n <= 0) {
+                return {};
+            }
+            request.append(buffer, static_cast<std::size_t>(n));
+            header_end = request.find("\r\n\r\n");
+        }
+
+        header_end += 4;
+        const auto content_length = ContentLength(request, header_end);
+        while (request.size() < header_end + content_length) {
+            const auto n = recv(client, buffer, sizeof(buffer), 0);
+            if (n <= 0) {
+                return {};
+            }
+            request.append(buffer, static_cast<std::size_t>(n));
+        }
+
+        return request;
+    }
+
+    static void SendResponse(int client, const SequencedHttpResponse& response, bool keep_connection) {
+        std::ostringstream text;
+        text << "HTTP/1.1 " << response.status_code << " " << response.reason << "\r\n"
+             << "Content-Type: application/x-amz-json-1.0\r\n"
+             << "Content-Length: " << response.body.size() << "\r\n"
+             << "Connection: " << (keep_connection ? "keep-alive" : "close") << "\r\n"
+             << "\r\n"
+             << response.body;
+        const auto response_text = text.str();
+        send(client, response_text.data(), response_text.size(), 0);
+    }
+
+    int fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::vector<SequencedHttpResponse> responses_;
+    std::vector<std::string> requests_;
+    std::atomic<int> accept_count_{0};
+    std::atomic<int> request_count_{0};
     std::thread worker_;
 };
 
@@ -253,4 +432,51 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryRotatesNodesAcrossRetries) {
     EXPECT_NE(first_host, "");
     EXPECT_NE(second_host, "");
     EXPECT_NE(first_host, second_host);
+}
+
+TEST(AwsDynamoDBHelper, ReusesConnectionAfterRepeatedNonSuccessDynamoDbResponses) {
+    KeepAliveSequenceHttpServer server({
+        {400, "Bad Request", R"({"__type":"ValidationException","message":"bad"})"},
+        {400, "Bad Request", R"({"__type":"ValidationException","message":"bad again"})"},
+        {200, "OK", R"({"TableNames":[]})"},
+    });
+
+    Config cfg;
+    cfg.port = server.Port();
+    cfg.scheme = "http";
+    cfg.aws_region = "us-east-1";
+    cfg.credentials = {"alternator", "secret"};
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.max_connections = 1;
+    cfg.http_client_timeout = std::chrono::milliseconds{2000};
+    cfg.connect_timeout = std::chrono::milliseconds{1000};
+
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppKeepAliveTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    auto list_tables = [&client] {
+        Aws::DynamoDB::Model::ListTablesRequest request;
+        return client.ListTables(request);
+    };
+    EXPECT_FALSE(list_tables().IsSuccess());
+    EXPECT_FALSE(list_tables().IsSuccess());
+    EXPECT_TRUE(list_tables().IsSuccess());
+
+    server.Wait();
+
+    EXPECT_EQ(server.Requests().size(), 3U);
+    EXPECT_EQ(server.AcceptCount(), 1);
 }
