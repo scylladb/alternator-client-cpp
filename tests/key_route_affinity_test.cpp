@@ -119,7 +119,7 @@ TEST(QueryPlan, PreferredNodesComeFirstThenSortedRemaining) {
     EXPECT_EQ(hosts, want);
 }
 
-TEST(KeyRouteAffinity, ReadBeforeWriteMatchesGoHeuristics) {
+TEST(KeyRouteAffinity, ReadBeforeWriteMatchesConditionalWriteHeuristics) {
     WriteOperationOptions no_options;
     EXPECT_FALSE(ShouldUseKeyRouteAffinity(KeyRouteAffinityMode::ReadBeforeWrite,
                                            WriteOperationKind::PutItem,
@@ -217,6 +217,35 @@ TEST(KeyRouteAffinity, BatchWriteVotingSelectsPreferredNode) {
     auto rest = SortedHostsExcept({target.host});
     want.insert(want.end(), rest.begin(), rest.end());
     EXPECT_EQ(hosts, want);
+}
+
+TEST(KeyRouteAffinity, BatchWriteVotingIsStableForEquivalentBatches) {
+    const auto sorted_nodes = BatchWriteSortedTestNodes();
+    const auto target = sorted_nodes[0];
+    const auto other = sorted_nodes[1];
+    const auto target_keys = StringKeysForNode(target, 2);
+    const auto other_key = StringKeysForNode(other, 1)[0];
+
+    StaticNodes nodes(BatchWriteTestNodes());
+    auto metadata = Metadata({{"audit", "id"}, {"orders", "id"}});
+    const std::vector<BatchWriteOperation> first{
+        BatchWriteOperation::Put("orders", ItemWithId(target_keys[0], "orders-payload")),
+        BatchWriteOperation::Delete("orders", KeyWithId(other_key)),
+        BatchWriteOperation::Put("audit", ItemWithId(target_keys[1], "audit-payload")),
+    };
+    const std::vector<BatchWriteOperation> second{
+        BatchWriteOperation::Put("audit", ItemWithId(target_keys[1], "changed-audit-payload")),
+        BatchWriteOperation::Delete("orders", KeyWithId(other_key)),
+        BatchWriteOperation::Put("orders", ItemWithId(target_keys[0], "changed-orders-payload")),
+    };
+
+    auto first_preferred = SelectBatchWritePreferredNodes(nodes, first, metadata);
+    auto second_preferred = SelectBatchWritePreferredNodes(nodes, second, metadata);
+
+    const std::vector<Url> want{target, other};
+    EXPECT_EQ(first_preferred, want);
+    EXPECT_EQ(second_preferred, want);
+    EXPECT_EQ(second_preferred, first_preferred);
 }
 
 TEST(KeyRouteAffinity, BatchWriteVotingKeepsQuarantineOutOfAffinityDomain) {
