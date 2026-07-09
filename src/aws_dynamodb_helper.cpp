@@ -9,9 +9,13 @@
 #include <aws/core/http/HttpTypes.h>
 #include <aws/core/http/curl/CurlHttpClient.h>
 #include <aws/core/http/standard/StandardHttpRequest.h>
+#include <aws/core/utils/logging/LogMacros.h>
+#include <aws/dynamodb/model/DescribeTableRequest.h>
+#include <aws/dynamodb/model/KeySchemaElement.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -298,11 +302,13 @@ DynamoDBHelper::DynamoDBHelper(std::vector<std::string> initial_nodes,
                                                    config,
                                                    std::move(discovery_http_client)))
     , config_(std::move(config))
-    , partition_keys_(config_.key_route_affinity.partition_key_by_table) {
+    , partition_keys_(std::make_shared<PartitionKeyMetadata>(config_.key_route_affinity.partition_key_by_table))
+    , partition_key_discovery_(std::make_shared<PartitionKeyDiscoveryState>()) {
     nodes_->Start();
 }
 
 DynamoDBHelper::~DynamoDBHelper() {
+    WaitForPartitionKeyDiscovery();
     Stop();
 }
 
@@ -386,11 +392,23 @@ void DynamoDBHelper::ReportNodeResult(const Url& node, NodeHealthObservation obs
 }
 
 void DynamoDBHelper::SetPartitionKeyName(const std::string& table_name, std::string partition_key_name) {
-    partition_keys_.SetPartitionKeyName(table_name, std::move(partition_key_name));
+    partition_keys_->SetPartitionKeyName(table_name, std::move(partition_key_name));
 }
 
 std::string DynamoDBHelper::GetPartitionKeyName(const std::string& table_name) const {
-    return partition_keys_.GetPartitionKeyName(table_name);
+    return partition_keys_->GetPartitionKeyName(table_name);
+}
+
+bool DynamoDBHelper::UpdatePartitionKeyName(const std::string& table_name) const {
+    if (table_name.empty()) {
+        return false;
+    }
+    const auto key_name = DiscoverPartitionKeyName(table_name);
+    if (key_name.empty()) {
+        return false;
+    }
+    partition_keys_->SetPartitionKeyName(table_name, key_name);
+    return true;
 }
 
 bool DynamoDBHelper::ShouldUseKeyRouteAffinityForWrite(WriteOperationKind kind,
@@ -400,11 +418,25 @@ bool DynamoDBHelper::ShouldUseKeyRouteAffinityForWrite(WriteOperationKind kind,
 
 QueryPlan DynamoDBHelper::NewPartitionKeyQueryPlan(const AttributeMap& values,
                                                    const std::string& table_name) const {
-    return QueryPlanForPartitionKey(*nodes_, values, table_name, partition_keys_);
+    if (partition_keys_->GetPartitionKeyName(table_name).empty()) {
+        TriggerPartitionKeyDiscovery(table_name);
+        return DefaultQueryPlan();
+    }
+
+    try {
+        return QueryPlanForPartitionKey(*nodes_, values, table_name, *partition_keys_);
+    } catch (const std::invalid_argument&) {
+        return DefaultQueryPlan();
+    }
 }
 
 QueryPlan DynamoDBHelper::NewBatchWriteQueryPlan(const std::vector<BatchWriteOperation>& operations) const {
-    return QueryPlanForBatchWrite(*nodes_, operations, partition_keys_);
+    TriggerPartitionKeyDiscoveryForMissingMetadata(operations);
+    try {
+        return QueryPlanForBatchWrite(*nodes_, operations, *partition_keys_);
+    } catch (const std::invalid_argument&) {
+        return DefaultQueryPlan();
+    }
 }
 
 void DynamoDBHelper::CheckIfRackAndDatacenterSetCorrectly() {
@@ -413,6 +445,98 @@ void DynamoDBHelper::CheckIfRackAndDatacenterSetCorrectly() {
 
 bool DynamoDBHelper::CheckIfRackDatacenterFeatureIsSupported() {
     return nodes_->CheckIfRackDatacenterFeatureIsSupported();
+}
+
+void DynamoDBHelper::TriggerPartitionKeyDiscovery(const std::string& table_name) const {
+    if (table_name.empty() || !partition_keys_->GetPartitionKeyName(table_name).empty()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(partition_key_discovery_->mutex);
+        if (!partition_key_discovery_->in_progress.insert(table_name).second) {
+            return;
+        }
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(partition_key_discovery_->mutex);
+        partition_key_discovery_->workers.emplace_back([this, table_name] {
+            try {
+                (void)UpdatePartitionKeyName(table_name);
+            } catch (const std::exception& error) {
+                AWS_LOGSTREAM_ERROR(
+                    kAllocationTag,
+                    "partition-key discovery failed for table " << table_name << ": " << error.what());
+            } catch (...) {
+                AWS_LOGSTREAM_ERROR(
+                    kAllocationTag,
+                    "partition-key discovery failed for table " << table_name << ": unknown error");
+            }
+
+            std::lock_guard<std::mutex> lock(partition_key_discovery_->mutex);
+            partition_key_discovery_->in_progress.erase(table_name);
+        });
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(partition_key_discovery_->mutex);
+        partition_key_discovery_->in_progress.erase(table_name);
+    }
+}
+
+void DynamoDBHelper::TriggerPartitionKeyDiscoveryForMissingMetadata(
+    const std::vector<BatchWriteOperation>& operations) const {
+    std::set<std::string> missing_tables;
+    for (const auto& operation : operations) {
+        if (partition_keys_->GetPartitionKeyName(operation.table_name).empty()) {
+            missing_tables.insert(operation.table_name);
+        }
+    }
+    for (const auto& table_name : missing_tables) {
+        TriggerPartitionKeyDiscovery(table_name);
+    }
+}
+
+void DynamoDBHelper::WaitForPartitionKeyDiscovery() const {
+    std::vector<std::thread> workers;
+    {
+        std::lock_guard<std::mutex> lock(partition_key_discovery_->mutex);
+        workers.swap(partition_key_discovery_->workers);
+    }
+
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+std::string DynamoDBHelper::DiscoverPartitionKeyName(const std::string& table_name) const {
+    auto client = NewDynamoDB();
+    Aws::DynamoDB::Model::DescribeTableRequest request;
+    request.SetTableName(Aws::String(table_name.c_str()));
+
+    const auto outcome = client->DescribeTable(request);
+    if (!outcome.IsSuccess()) {
+        AWS_LOGSTREAM_ERROR(
+            kAllocationTag,
+            "DescribeTable failed during partition-key discovery for table "
+                << table_name << ": " << outcome.GetError().GetMessage());
+        return {};
+    }
+
+    for (const auto& key_schema : outcome.GetResult().GetTable().GetKeySchema()) {
+        if (key_schema.GetKeyType() == Aws::DynamoDB::Model::KeyType::HASH) {
+            return std::string(key_schema.GetAttributeName().c_str());
+        }
+    }
+    AWS_LOGSTREAM_ERROR(
+        kAllocationTag,
+        "DescribeTable returned no HASH key during partition-key discovery for table " << table_name);
+    return {};
+}
+
+QueryPlan DynamoDBHelper::DefaultQueryPlan() const {
+    return QueryPlan::FromNodesSource(*nodes_);
 }
 
 } // namespace scylladb::alternator::aws

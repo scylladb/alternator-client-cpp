@@ -2,7 +2,9 @@
 
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <aws/core/AmazonWebServiceRequest.h>
@@ -96,6 +98,9 @@ public:
                    std::shared_ptr<HttpClient> discovery_http_client = nullptr);
     ~DynamoDBHelper();
 
+    DynamoDBHelper(const DynamoDBHelper&) = delete;
+    DynamoDBHelper& operator=(const DynamoDBHelper&) = delete;
+
     [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDB() const;
     [[nodiscard]] Aws::DynamoDB::DynamoDBClientConfiguration NewClientConfiguration() const;
     [[nodiscard]] std::shared_ptr<AlternatorEndpointProvider> NewEndpointProvider() const;
@@ -109,6 +114,7 @@ public:
     void ReportNodeResult(const Url& node, NodeHealthObservation observation);
     void SetPartitionKeyName(const std::string& table_name, std::string partition_key_name);
     [[nodiscard]] std::string GetPartitionKeyName(const std::string& table_name) const;
+    [[nodiscard]] bool UpdatePartitionKeyName(const std::string& table_name) const;
     [[nodiscard]] bool ShouldUseKeyRouteAffinityForWrite(WriteOperationKind kind,
                                                          const WriteOperationOptions& options) const;
     [[nodiscard]] QueryPlan NewPartitionKeyQueryPlan(const AttributeMap& values,
@@ -122,9 +128,22 @@ public:
     [[nodiscard]] bool CheckIfRackDatacenterFeatureIsSupported();
 
 private:
+    struct PartitionKeyDiscoveryState {
+        mutable std::mutex mutex;
+        std::set<std::string> in_progress;
+        std::vector<std::thread> workers;
+    };
+
+    void TriggerPartitionKeyDiscovery(const std::string& table_name) const;
+    void TriggerPartitionKeyDiscoveryForMissingMetadata(const std::vector<BatchWriteOperation>& operations) const;
+    void WaitForPartitionKeyDiscovery() const;
+    [[nodiscard]] std::string DiscoverPartitionKeyName(const std::string& table_name) const;
+    [[nodiscard]] QueryPlan DefaultQueryPlan() const;
+
     std::shared_ptr<AlternatorLiveNodes> nodes_;
     Config config_;
-    PartitionKeyMetadata partition_keys_;
+    std::shared_ptr<PartitionKeyMetadata> partition_keys_;
+    std::shared_ptr<PartitionKeyDiscoveryState> partition_key_discovery_;
 };
 
 } // namespace scylladb::alternator::aws

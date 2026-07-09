@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <sstream>
@@ -133,6 +134,7 @@ struct SequencedHttpResponse {
     int status_code = 200;
     std::string reason = "OK";
     std::string body;
+    std::chrono::milliseconds delay{0};
 };
 
 class KeepAliveSequenceHttpServer {
@@ -282,6 +284,9 @@ private:
     }
 
     static void SendResponse(int client, const SequencedHttpResponse& response, bool keep_connection) {
+        if (response.delay > std::chrono::milliseconds::zero()) {
+            std::this_thread::sleep_for(response.delay);
+        }
         std::ostringstream text;
         text << "HTTP/1.1 " << response.status_code << " " << response.reason << "\r\n"
              << "Content-Type: application/x-amz-json-1.0\r\n"
@@ -314,6 +319,40 @@ std::string HostHeader(const std::string& request) {
         return {};
     }
     return request.substr(start, end - start);
+}
+
+std::string DescribeTableResponse(const std::string& table_name,
+                                  const std::string& partition_key_name) {
+    return R"({"Table":{"TableName":")" + table_name + R"(","KeySchema":[{"AttributeName":")" +
+           partition_key_name + R"(","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}]}})";
+}
+
+bool WaitForPartitionKeyName(const aws::DynamoDBHelper& helper,
+                             const std::string& table_name,
+                             const std::string& partition_key_name) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (helper.GetPartitionKeyName(table_name) == partition_key_name) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+Config DiscoveryTestConfig(std::uint16_t port) {
+    Config cfg;
+    cfg.port = port;
+    cfg.scheme = "http";
+    cfg.aws_region = "us-east-1";
+    cfg.credentials = {"alternator", "secret"};
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+    cfg.http_client_timeout = std::chrono::milliseconds{2000};
+    cfg.connect_timeout = std::chrono::milliseconds{1000};
+    cfg.key_route_affinity.mode = KeyRouteAffinityMode::AnyWrite;
+    return cfg;
 }
 
 } // namespace
@@ -390,6 +429,93 @@ TEST(AwsDynamoDBHelper, DefaultsToConfiguredSdkConnectionPoolLimit) {
     auto client_config = helper.NewClientConfiguration();
     EXPECT_EQ(client_config.maxConnections, cfg.max_connections);
     EXPECT_EQ(client_config.maxConnections, 100U);
+}
+
+TEST(AwsDynamoDBHelper, AutoDiscoversPartitionKeyNameWithDescribeTable) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", DescribeTableResponse("orders", "id")},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    EXPECT_EQ(helper.GetPartitionKeyName("orders"), "");
+
+    auto plan = helper.NewPartitionKeyQueryPlan({{"id", AttributeValue::String("order-123")}}, "orders");
+    EXPECT_FALSE(plan.Next().Empty());
+
+    EXPECT_TRUE(WaitForPartitionKeyName(helper, "orders", "id"));
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    EXPECT_NE(server.Requests()[0].find("DescribeTable"), std::string::npos);
+}
+
+TEST(AwsDynamoDBHelper, UpdatesPartitionKeyNameOnDemand) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", DescribeTableResponse("orders", "id")},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    EXPECT_TRUE(helper.UpdatePartitionKeyName("orders"));
+    EXPECT_EQ(helper.GetPartitionKeyName("orders"), "id");
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    EXPECT_NE(server.Requests()[0].find("DescribeTable"), std::string::npos);
+}
+
+TEST(AwsDynamoDBHelper, SuppressesDuplicatePartitionKeyDiscoveryForTable) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", DescribeTableResponse("orders", "id"), std::chrono::milliseconds{200}},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    for (int i = 0; i < 3; ++i) {
+        auto plan = helper.NewPartitionKeyQueryPlan({{"id", AttributeValue::String("order-123")}}, "orders");
+        EXPECT_FALSE(plan.Next().Empty());
+    }
+
+    EXPECT_TRUE(WaitForPartitionKeyName(helper, "orders", "id"));
+    server.Wait();
+
+    EXPECT_EQ(server.Requests().size(), 1U);
+}
+
+TEST(AwsDynamoDBHelper, BatchWriteTriggersPartitionKeyDiscovery) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", DescribeTableResponse("orders", "id")},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    auto plan = helper.NewBatchWriteQueryPlan({
+        BatchWriteOperation::Put("orders", {{"id", AttributeValue::String("order-123")}}),
+    });
+    EXPECT_FALSE(plan.Next().Empty());
+
+    EXPECT_TRUE(WaitForPartitionKeyName(helper, "orders", "id"));
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    EXPECT_NE(server.Requests()[0].find("DescribeTable"), std::string::npos);
 }
 
 TEST(AwsDynamoDBHelper, HttpClientFactoryRotatesNodesAcrossRetries) {
