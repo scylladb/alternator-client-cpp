@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -12,6 +13,10 @@
 #include <aws/core/http/URI.h>
 #include <aws/dynamodb/DynamoDBClient.h>
 #include <aws/dynamodb/DynamoDBEndpointProvider.h>
+#include <aws/dynamodb/model/BatchWriteItemRequest.h>
+#include <aws/dynamodb/model/DeleteItemRequest.h>
+#include <aws/dynamodb/model/PutItemRequest.h>
+#include <aws/dynamodb/model/UpdateItemRequest.h>
 
 #include <scylladb/alternator/live_nodes.h>
 #include <scylladb/alternator/key_route_affinity.h>
@@ -102,6 +107,14 @@ public:
     DynamoDBHelper& operator=(const DynamoDBHelper&) = delete;
 
     [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDB() const;
+    [[nodiscard]] Aws::DynamoDB::Model::PutItemOutcome PutItem(
+        const Aws::DynamoDB::Model::PutItemRequest& request) const;
+    [[nodiscard]] Aws::DynamoDB::Model::UpdateItemOutcome UpdateItem(
+        const Aws::DynamoDB::Model::UpdateItemRequest& request) const;
+    [[nodiscard]] Aws::DynamoDB::Model::DeleteItemOutcome DeleteItem(
+        const Aws::DynamoDB::Model::DeleteItemRequest& request) const;
+    [[nodiscard]] Aws::DynamoDB::Model::BatchWriteItemOutcome BatchWriteItem(
+        const Aws::DynamoDB::Model::BatchWriteItemRequest& request) const;
     [[nodiscard]] Aws::DynamoDB::DynamoDBClientConfiguration NewClientConfiguration() const;
     [[nodiscard]] std::shared_ptr<AlternatorEndpointProvider> NewEndpointProvider() const;
     [[nodiscard]] std::shared_ptr<Aws::Http::HttpClientFactory> NewHttpClientFactory() const;
@@ -139,11 +152,17 @@ private:
     void WaitForPartitionKeyDiscovery() const;
     [[nodiscard]] std::string DiscoverPartitionKeyName(const std::string& table_name) const;
     [[nodiscard]] QueryPlan DefaultQueryPlan() const;
+    [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBForNode(const Url& node) const;
+    [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBForQueryPlan(QueryPlan plan) const;
+    [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBWithEndpointProvider(
+        std::shared_ptr<Aws::DynamoDB::Endpoint::DynamoDBEndpointProviderBase> endpoint_provider) const;
 
     std::shared_ptr<AlternatorLiveNodes> nodes_;
     Config config_;
     std::shared_ptr<PartitionKeyMetadata> partition_keys_;
     std::shared_ptr<PartitionKeyDiscoveryState> partition_key_discovery_;
+    mutable std::mutex fixed_clients_mutex_;
+    mutable std::map<Url, std::shared_ptr<Aws::DynamoDB::DynamoDBClient>> fixed_clients_;
 };
 
 } // namespace scylladb::alternator::aws

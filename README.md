@@ -214,6 +214,21 @@ cfg.key_route_affinity.partition_key_discovery_attempts = 3;
 cfg.key_route_affinity.partition_key_discovery_initial_backoff = std::chrono::milliseconds{100};
 ```
 
+The AWS helper also exposes typed write methods that inspect SDK request objects before sending them. These methods route
+`PutItem`, `UpdateItem`, and `DeleteItem` according to `KeyRouteAffinityMode::ReadBeforeWrite` or `AnyWrite`, and route
+`BatchWriteItem` in `AnyWrite` mode using batch-write voting. If metadata is missing or the partition key cannot be
+hashed, the current request uses the normal query plan and discovery is triggered for later requests:
+
+```cpp
+Aws::DynamoDB::Model::PutItemRequest put;
+put.SetTableName("orders");
+Aws::DynamoDB::Model::AttributeValue id;
+id.SetS("order-123");
+put.AddItem("id", id);
+
+auto outcome = helper.PutItem(put);
+```
+
 For `BatchWriteItem`-style operations, pass the put/delete candidates and the helper will vote for preferred nodes. Voted nodes are tried first by descending vote count, with deterministic node-order tie breaking:
 
 ```cpp
