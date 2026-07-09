@@ -373,7 +373,7 @@ std::vector<Url> AlternatorLiveNodes::FetchLiveNodes() {
 
 std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope) {
     const bool cluster_scope = scope.IsCluster();
-    QueryPlan plan(GetQueryPlanNodes());
+    QueryPlan plan(GetDiscoveryNodesForScope(scope));
     std::vector<Url> discovered;
     std::exception_ptr last_error;
 
@@ -409,6 +409,13 @@ std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope
         std::rethrow_exception(last_error);
     }
     return {};
+}
+
+std::vector<Url> AlternatorLiveNodes::GetDiscoveryNodesForScope(const RoutingScope& scope) const {
+    if (scope.IsCluster()) {
+        return initial_nodes_;
+    }
+    return GetQueryPlanNodes();
 }
 
 std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) const {

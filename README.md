@@ -31,6 +31,19 @@ nodes.UpdateLiveNodes();
 auto next = nodes.NextNode();
 ```
 
+For cluster-wide routing, the client queries bare `/localnodes` on every configured initial node and merges
+the returned node lists. Some ScyllaDB versions return only the contacted node's datacenter from
+`/localnodes`, even with cluster scope. In multi-datacenter deployments, configure at least one working
+initial node from every datacenter that should receive traffic:
+
+```cpp
+AlternatorLiveNodes nodes({
+    "dc1-node.example.com",
+    "dc2-node.example.com",
+    "dc3-node.example.com",
+}, cfg);
+```
+
 ## AWS SDK for C++ Usage
 
 ```cpp
@@ -191,7 +204,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 
 - `/localnodes` discovery with cluster, datacenter, and rack scopes.
 - Scope fallback chains such as rack -> datacenter -> cluster.
-- Cluster scope merge across seed nodes.
+- Cluster scope merge across configured initial nodes.
 - Active and idle `/localnodes` refresh cadence.
 - Reused libcurl discovery HTTP connections with an opt-out switch.
 - TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
