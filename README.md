@@ -180,7 +180,6 @@ using namespace scylladb::alternator;
 
 Config cfg;
 cfg.key_route_affinity.mode = KeyRouteAffinityMode::AnyWrite;
-cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
 
 scylladb::alternator::aws::DynamoDBHelper helper({"node1.example.com", "node2.example.com"}, cfg);
 
@@ -189,6 +188,22 @@ auto plan = helper.NewPartitionKeyQueryPlan(
     "orders");
 
 auto preferred = plan.Next();
+```
+
+The AWS helper can discover missing table partition-key names automatically. When an affinity plan needs metadata that is
+not cached yet, the helper starts one background `DescribeTable` lookup for that table and returns a normal non-affinity
+query plan for the current request. Later requests use the discovered HASH key name once the lookup completes. Configure
+`cfg.key_route_affinity.partition_key_by_table` when you already know the table metadata and do not want to wait for
+discovery:
+
+```cpp
+cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+```
+
+You can also refresh one table explicitly during startup:
+
+```cpp
+(void)helper.UpdatePartitionKeyName("orders");
 ```
 
 For `BatchWriteItem`-style operations, pass the put/delete candidates and the helper will vote for preferred nodes. Voted nodes are tried first by descending vote count, with deterministic node-order tie breaking:
