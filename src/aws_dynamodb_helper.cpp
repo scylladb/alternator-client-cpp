@@ -10,8 +10,18 @@
 #include <aws/core/http/curl/CurlHttpClient.h>
 #include <aws/core/http/standard/StandardHttpRequest.h>
 #include <aws/core/utils/logging/LogMacros.h>
+#include <aws/dynamodb/model/AttributeAction.h>
+#include <aws/dynamodb/model/AttributeValueUpdate.h>
+#include <aws/dynamodb/model/BatchWriteItemRequest.h>
+#include <aws/dynamodb/model/DeleteItemRequest.h>
+#include <aws/dynamodb/model/DeleteRequest.h>
 #include <aws/dynamodb/model/DescribeTableRequest.h>
 #include <aws/dynamodb/model/KeySchemaElement.h>
+#include <aws/dynamodb/model/PutItemRequest.h>
+#include <aws/dynamodb/model/PutRequest.h>
+#include <aws/dynamodb/model/ReturnValue.h>
+#include <aws/dynamodb/model/UpdateItemRequest.h>
+#include <aws/dynamodb/model/WriteRequest.h>
 
 #include <algorithm>
 #include <chrono>
@@ -246,6 +256,261 @@ std::shared_ptr<Aws::Http::HttpClientFactory> NewAlternatorHttpClientFactory(
         endpoint_override_port);
 }
 
+class FixedEndpointProvider final : public Aws::DynamoDB::Endpoint::DynamoDBEndpointProviderBase {
+public:
+    explicit FixedEndpointProvider(Url node)
+        : node_(std::move(node)) {}
+
+    void InitBuiltInParameters(const Aws::DynamoDB::Endpoint::DynamoDBClientConfiguration& config) override {
+        default_provider_.InitBuiltInParameters(config);
+    }
+
+    void InitBuiltInParameters(const Aws::DynamoDB::Endpoint::DynamoDBClientConfiguration& config,
+                               const Aws::String& service_name) override {
+        default_provider_.InitBuiltInParameters(config, service_name);
+    }
+
+    void OverrideEndpoint(const Aws::String& endpoint) override {
+        default_provider_.OverrideEndpoint(endpoint);
+    }
+
+    Aws::DynamoDB::Endpoint::DynamoDBClientContextParameters& AccessClientContextParameters() override {
+        return default_provider_.AccessClientContextParameters();
+    }
+
+    const Aws::DynamoDB::Endpoint::DynamoDBClientContextParameters& GetClientContextParameters() const override {
+        return default_provider_.GetClientContextParameters();
+    }
+
+    Aws::Endpoint::ResolveEndpointOutcome ResolveEndpoint(
+        const Aws::DynamoDB::Endpoint::EndpointParameters&) const override {
+        if (node_.Empty()) {
+            return Aws::Endpoint::ResolveEndpointOutcome(
+                Aws::Client::AWSError<Aws::Client::CoreErrors>(
+                    Aws::Client::CoreErrors::ENDPOINT_RESOLUTION_FAILURE,
+                    "NoAlternatorNodes",
+                    "no Alternator nodes are available",
+                    false));
+        }
+
+        Aws::Endpoint::AWSEndpoint endpoint;
+        endpoint.SetURL(Aws::String(node_.ToString().c_str()));
+        return Aws::Endpoint::ResolveEndpointOutcome(std::move(endpoint));
+    }
+
+private:
+    Url node_;
+    Aws::DynamoDB::Endpoint::DynamoDBEndpointProvider default_provider_;
+};
+
+ReturnValues ToReturnValues(Aws::DynamoDB::Model::ReturnValue value) {
+    switch (value) {
+    case Aws::DynamoDB::Model::ReturnValue::NONE:
+        return ReturnValues::None;
+    case Aws::DynamoDB::Model::ReturnValue::ALL_OLD:
+        return ReturnValues::AllOld;
+    case Aws::DynamoDB::Model::ReturnValue::UPDATED_OLD:
+        return ReturnValues::UpdatedOld;
+    case Aws::DynamoDB::Model::ReturnValue::ALL_NEW:
+        return ReturnValues::AllNew;
+    case Aws::DynamoDB::Model::ReturnValue::UPDATED_NEW:
+        return ReturnValues::UpdatedNew;
+    case Aws::DynamoDB::Model::ReturnValue::NOT_SET:
+        return ReturnValues::NotSet;
+    }
+    return ReturnValues::NotSet;
+}
+
+AttributeAction ToAttributeAction(Aws::DynamoDB::Model::AttributeAction action) {
+    switch (action) {
+    case Aws::DynamoDB::Model::AttributeAction::ADD:
+        return AttributeAction::Add;
+    case Aws::DynamoDB::Model::AttributeAction::DELETE_:
+        return AttributeAction::Delete;
+    case Aws::DynamoDB::Model::AttributeAction::PUT:
+    case Aws::DynamoDB::Model::AttributeAction::NOT_SET:
+        return AttributeAction::Put;
+    }
+    return AttributeAction::Put;
+}
+
+AttributeValue ToAttributeValue(const Aws::DynamoDB::Model::AttributeValue& value) {
+    switch (value.GetType()) {
+    case Aws::DynamoDB::Model::ValueType::STRING:
+        return AttributeValue::String(std::string(value.GetS().c_str()));
+    case Aws::DynamoDB::Model::ValueType::NUMBER:
+        return AttributeValue::Number(std::string(value.GetN().c_str()));
+    case Aws::DynamoDB::Model::ValueType::BYTEBUFFER: {
+        const auto& buffer = value.AccessB();
+        std::vector<std::uint8_t> bytes;
+        if (buffer.GetLength() > 0) {
+            const auto* data = buffer.GetUnderlyingData();
+            bytes.assign(data, data + buffer.GetLength());
+        }
+        return AttributeValue::Binary(std::move(bytes));
+    }
+    case Aws::DynamoDB::Model::ValueType::STRING_SET:
+    case Aws::DynamoDB::Model::ValueType::NUMBER_SET:
+    case Aws::DynamoDB::Model::ValueType::BYTEBUFFER_SET:
+    case Aws::DynamoDB::Model::ValueType::ATTRIBUTE_MAP:
+    case Aws::DynamoDB::Model::ValueType::ATTRIBUTE_LIST:
+    case Aws::DynamoDB::Model::ValueType::BOOL:
+    case Aws::DynamoDB::Model::ValueType::NULLVALUE:
+        break;
+    }
+    throw std::invalid_argument("unsupported DynamoDB partition-key attribute type");
+}
+
+AttributeMap PartitionKeyOnlyAttributeMap(
+    const Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue>& values,
+    const std::string& key_name) {
+    const auto it = values.find(Aws::String(key_name.c_str()));
+    if (it == values.end()) {
+        return {};
+    }
+    return {{key_name, ToAttributeValue(it->second)}};
+}
+
+WriteOperationOptions PutItemOptions(const Aws::DynamoDB::Model::PutItemRequest& request) {
+    WriteOperationOptions options;
+    options.has_condition_expression = !request.GetConditionExpression().empty();
+    options.has_expected = !request.GetExpected().empty();
+    options.return_values = ToReturnValues(request.GetReturnValues());
+    return options;
+}
+
+WriteOperationOptions DeleteItemOptions(const Aws::DynamoDB::Model::DeleteItemRequest& request) {
+    WriteOperationOptions options;
+    options.has_condition_expression = !request.GetConditionExpression().empty();
+    options.has_expected = !request.GetExpected().empty();
+    options.return_values = ToReturnValues(request.GetReturnValues());
+    return options;
+}
+
+std::vector<AttributeUpdate> AttributeUpdates(
+    const Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValueUpdate>& updates) {
+    std::vector<AttributeUpdate> out;
+    out.reserve(updates.size());
+    for (const auto& [_, update] : updates) {
+        out.push_back(AttributeUpdate{
+            ToAttributeAction(update.GetAction()),
+            update.ValueHasBeenSet(),
+        });
+    }
+    return out;
+}
+
+WriteOperationOptions UpdateItemOptions(const Aws::DynamoDB::Model::UpdateItemRequest& request) {
+    WriteOperationOptions options;
+    options.has_update_expression = !request.GetUpdateExpression().empty();
+    options.has_condition_expression = !request.GetConditionExpression().empty();
+    options.has_expected = !request.GetExpected().empty();
+    options.return_values = ToReturnValues(request.GetReturnValues());
+    options.attribute_updates = AttributeUpdates(request.GetAttributeUpdates());
+    return options;
+}
+
+QueryPlan DefaultQueryPlanFor(const DynamoDBHelper& helper) {
+    return QueryPlan::FromNodesSource(*helper.Nodes());
+}
+
+QueryPlan PartitionKeyQueryPlanFor(
+    const DynamoDBHelper& helper,
+    const Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue>& values,
+    const Aws::String& table_name) {
+    const auto table = std::string(table_name.c_str());
+    const auto key_name = helper.GetPartitionKeyName(table);
+    if (key_name.empty()) {
+        return helper.NewPartitionKeyQueryPlan({}, table);
+    }
+
+    try {
+        return helper.NewPartitionKeyQueryPlan(PartitionKeyOnlyAttributeMap(values, key_name), table);
+    } catch (const std::invalid_argument&) {
+        return helper.NewPartitionKeyQueryPlan({}, table);
+    }
+}
+
+QueryPlan PutItemQueryPlanFor(const DynamoDBHelper& helper,
+                              const Aws::DynamoDB::Model::PutItemRequest& request) {
+    if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::PutItem, PutItemOptions(request))) {
+        return DefaultQueryPlanFor(helper);
+    }
+    return PartitionKeyQueryPlanFor(helper, request.GetItem(), request.GetTableName());
+}
+
+QueryPlan UpdateItemQueryPlanFor(const DynamoDBHelper& helper,
+                                 const Aws::DynamoDB::Model::UpdateItemRequest& request) {
+    if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::UpdateItem, UpdateItemOptions(request))) {
+        return DefaultQueryPlanFor(helper);
+    }
+    return PartitionKeyQueryPlanFor(helper, request.GetKey(), request.GetTableName());
+}
+
+QueryPlan DeleteItemQueryPlanFor(const DynamoDBHelper& helper,
+                                 const Aws::DynamoDB::Model::DeleteItemRequest& request) {
+    if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::DeleteItem, DeleteItemOptions(request))) {
+        return DefaultQueryPlanFor(helper);
+    }
+    return PartitionKeyQueryPlanFor(helper, request.GetKey(), request.GetTableName());
+}
+
+void AddBatchWriteOperationForMissingMetadata(std::vector<BatchWriteOperation>& operations,
+                                              const std::string& table_name) {
+    operations.push_back(BatchWriteOperation::Put(table_name, {}));
+}
+
+void AddBatchWriteOperation(std::vector<BatchWriteOperation>& operations,
+                            const std::string& table_name,
+                            const std::string& key_name,
+                            const Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue>& values) {
+    try {
+        auto key_values = PartitionKeyOnlyAttributeMap(values, key_name);
+        if (!key_values.empty()) {
+            operations.push_back(BatchWriteOperation::Put(table_name, std::move(key_values)));
+        }
+    } catch (const std::invalid_argument&) {
+    }
+}
+
+std::vector<BatchWriteOperation> BatchWriteOperationsFor(const DynamoDBHelper& helper,
+                                                         const Aws::DynamoDB::Model::BatchWriteItemRequest& request) {
+    std::vector<BatchWriteOperation> operations;
+    for (const auto& [table, writes] : request.GetRequestItems()) {
+        const auto table_name = std::string(table.c_str());
+        const auto key_name = helper.GetPartitionKeyName(table_name);
+        if (key_name.empty()) {
+            if (!writes.empty()) {
+                AddBatchWriteOperationForMissingMetadata(operations, table_name);
+            }
+            continue;
+        }
+
+        for (const auto& write : writes) {
+            if (write.PutRequestHasBeenSet() && !write.DeleteRequestHasBeenSet()) {
+                AddBatchWriteOperation(operations, table_name, key_name, write.GetPutRequest().GetItem());
+            } else if (write.DeleteRequestHasBeenSet() && !write.PutRequestHasBeenSet()) {
+                AddBatchWriteOperation(operations, table_name, key_name, write.GetDeleteRequest().GetKey());
+            }
+        }
+    }
+    return operations;
+}
+
+QueryPlan BatchWriteItemQueryPlanFor(const DynamoDBHelper& helper,
+                                     const Aws::DynamoDB::Model::BatchWriteItemRequest& request) {
+    // A default PutItem is affinity-routed only in AnyWrite mode; batch writes follow the same rule.
+    if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::PutItem, {})) {
+        return DefaultQueryPlanFor(helper);
+    }
+
+    auto operations = BatchWriteOperationsFor(helper, request);
+    if (operations.empty()) {
+        return DefaultQueryPlanFor(helper);
+    }
+    return helper.NewBatchWriteQueryPlan(operations);
+}
+
 } // namespace
 
 AlternatorEndpointProvider::AlternatorEndpointProvider(std::shared_ptr<AlternatorLiveNodes> nodes)
@@ -315,8 +580,40 @@ DynamoDBHelper::~DynamoDBHelper() {
 }
 
 std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDB() const {
+    return NewDynamoDBWithEndpointProvider(NewEndpointProvider());
+}
+
+Aws::DynamoDB::Model::PutItemOutcome DynamoDBHelper::PutItem(
+    const Aws::DynamoDB::Model::PutItemRequest& request) const {
+    auto routed_request = request;
+    AttachNodeErrorReporter(routed_request);
+    return NewDynamoDBForQueryPlan(PutItemQueryPlanFor(*this, request))->PutItem(routed_request);
+}
+
+Aws::DynamoDB::Model::UpdateItemOutcome DynamoDBHelper::UpdateItem(
+    const Aws::DynamoDB::Model::UpdateItemRequest& request) const {
+    auto routed_request = request;
+    AttachNodeErrorReporter(routed_request);
+    return NewDynamoDBForQueryPlan(UpdateItemQueryPlanFor(*this, request))->UpdateItem(routed_request);
+}
+
+Aws::DynamoDB::Model::DeleteItemOutcome DynamoDBHelper::DeleteItem(
+    const Aws::DynamoDB::Model::DeleteItemRequest& request) const {
+    auto routed_request = request;
+    AttachNodeErrorReporter(routed_request);
+    return NewDynamoDBForQueryPlan(DeleteItemQueryPlanFor(*this, request))->DeleteItem(routed_request);
+}
+
+Aws::DynamoDB::Model::BatchWriteItemOutcome DynamoDBHelper::BatchWriteItem(
+    const Aws::DynamoDB::Model::BatchWriteItemRequest& request) const {
+    auto routed_request = request;
+    AttachNodeErrorReporter(routed_request);
+    return NewDynamoDBForQueryPlan(BatchWriteItemQueryPlanFor(*this, request))->BatchWriteItem(routed_request);
+}
+
+std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBWithEndpointProvider(
+    std::shared_ptr<Aws::DynamoDB::Endpoint::DynamoDBEndpointProviderBase> endpoint_provider) const {
     auto client_config = NewClientConfiguration();
-    auto endpoint_provider = NewEndpointProvider();
 
     if (!config_.credentials.access_key_id.empty() || !config_.credentials.secret_access_key.empty()) {
         Aws::Auth::AWSCredentials credentials(
@@ -325,14 +622,37 @@ std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDB() con
         return Aws::MakeShared<Aws::DynamoDB::DynamoDBClient>(
             "ScyllaDBAlternatorDynamoDBClient",
             credentials,
-            endpoint_provider,
+            std::move(endpoint_provider),
             client_config);
     }
 
     return Aws::MakeShared<Aws::DynamoDB::DynamoDBClient>(
         "ScyllaDBAlternatorDynamoDBClient",
         client_config,
-        endpoint_provider);
+        std::move(endpoint_provider));
+}
+
+std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBForNode(const Url& node) const {
+    std::lock_guard<std::mutex> lock(fixed_clients_mutex_);
+    const auto existing = fixed_clients_.find(node);
+    if (existing != fixed_clients_.end()) {
+        return existing->second;
+    }
+
+    auto endpoint_provider = Aws::MakeShared<FixedEndpointProvider>(
+        "ScyllaDBAlternatorFixedEndpointProvider",
+        node);
+    auto client = NewDynamoDBWithEndpointProvider(std::move(endpoint_provider));
+    fixed_clients_.emplace(node, client);
+    return client;
+}
+
+std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBForQueryPlan(QueryPlan plan) const {
+    const auto node = plan.Next();
+    if (node.Empty()) {
+        return NewDynamoDB();
+    }
+    return NewDynamoDBForNode(node);
 }
 
 std::shared_ptr<AlternatorEndpointProvider> DynamoDBHelper::NewEndpointProvider() const {

@@ -2,8 +2,14 @@
 
 #include <aws/core/Aws.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
+#include <aws/dynamodb/model/BatchWriteItemRequest.h>
+#include <aws/dynamodb/model/DeleteItemRequest.h>
+#include <aws/dynamodb/model/DeleteRequest.h>
 #include <aws/dynamodb/model/ListTablesRequest.h>
 #include <aws/dynamodb/model/PutItemRequest.h>
+#include <aws/dynamodb/model/PutRequest.h>
+#include <aws/dynamodb/model/UpdateItemRequest.h>
+#include <aws/dynamodb/model/WriteRequest.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -359,6 +365,25 @@ Config DiscoveryTestConfig(std::uint16_t port) {
     return cfg;
 }
 
+Aws::DynamoDB::Model::AttributeValue AwsStringValue(const std::string& value) {
+    Aws::DynamoDB::Model::AttributeValue out;
+    out.SetS(Aws::String(value.c_str()));
+    return out;
+}
+
+std::string PartitionKeyForHost(const aws::DynamoDBHelper& helper,
+                                const std::string& table_name,
+                                const std::string& host) {
+    for (int i = 0; i < 128; ++i) {
+        const auto key = "order-" + std::to_string(i);
+        auto plan = helper.NewPartitionKeyQueryPlan({{"id", AttributeValue::String(key)}}, table_name);
+        if (plan.Next().host == host) {
+            return key;
+        }
+    }
+    return {};
+}
+
 } // namespace
 
 TEST(AwsDynamoDBHelper, ConfiguresClientAndInstantiatesRequestHooks) {
@@ -543,6 +568,96 @@ TEST(AwsDynamoDBHelper, BatchWriteTriggersPartitionKeyDiscovery) {
 
     ASSERT_EQ(server.Requests().size(), 1U);
     EXPECT_NE(server.Requests()[0].find("DescribeTable"), std::string::npos);
+}
+
+TEST(AwsDynamoDBHelper, TypedPutItemUsesSameCoordinatorForSamePartitionKey) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+        {200, "OK", "{}"},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+    aws::DynamoDBHelper helper({"127.0.0.1", "localhost"}, cfg);
+
+    const auto partition_key = PartitionKeyForHost(helper, "orders", "127.0.0.1");
+    ASSERT_NE(partition_key, "");
+
+    auto expected_plan = helper.NewPartitionKeyQueryPlan({{"id", AttributeValue::String(partition_key)}}, "orders");
+    const auto expected_host = expected_plan.Next().Authority();
+
+    Aws::DynamoDB::Model::PutItemRequest request;
+    request.SetTableName("orders");
+    request.AddItem("id", AwsStringValue(partition_key));
+    request.AddItem("payload", AwsStringValue("value"));
+
+    EXPECT_TRUE(helper.PutItem(request).IsSuccess());
+    EXPECT_TRUE(helper.PutItem(request).IsSuccess());
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 2U);
+    EXPECT_EQ(HostHeader(server.Requests()[0]), expected_host);
+    EXPECT_EQ(HostHeader(server.Requests()[1]), expected_host);
+    EXPECT_NE(server.Requests()[0].find("PutItem"), std::string::npos);
+    EXPECT_NE(server.Requests()[1].find("PutItem"), std::string::npos);
+}
+
+TEST(AwsDynamoDBHelper, TypedWriteMethodsSendRequestsThroughHelper) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+        {200, "OK", "{}"},
+        {200, "OK", "{}"},
+        {200, "OK", "{}"},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::DynamoDB::Model::PutItemRequest put;
+    put.SetTableName("orders");
+    put.AddItem("id", AwsStringValue("order-123"));
+    put.AddItem("payload", AwsStringValue("created"));
+    EXPECT_TRUE(helper.PutItem(put).IsSuccess());
+
+    Aws::DynamoDB::Model::UpdateItemRequest update;
+    update.SetTableName("orders");
+    update.AddKey("id", AwsStringValue("order-123"));
+    update.SetUpdateExpression("SET payload = :payload");
+    EXPECT_TRUE(helper.UpdateItem(update).IsSuccess());
+
+    Aws::DynamoDB::Model::DeleteItemRequest remove;
+    remove.SetTableName("orders");
+    remove.AddKey("id", AwsStringValue("order-123"));
+    EXPECT_TRUE(helper.DeleteItem(remove).IsSuccess());
+
+    Aws::DynamoDB::Model::PutRequest batch_put;
+    batch_put.AddItem("id", AwsStringValue("order-123"));
+    batch_put.AddItem("payload", AwsStringValue("batched"));
+
+    Aws::DynamoDB::Model::WriteRequest write;
+    write.SetPutRequest(batch_put);
+
+    Aws::Vector<Aws::DynamoDB::Model::WriteRequest> writes;
+    writes.push_back(write);
+
+    Aws::DynamoDB::Model::BatchWriteItemRequest batch;
+    batch.AddRequestItems("orders", writes);
+    EXPECT_TRUE(helper.BatchWriteItem(batch).IsSuccess());
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 4U);
+    EXPECT_NE(server.Requests()[0].find("PutItem"), std::string::npos);
+    EXPECT_NE(server.Requests()[1].find("UpdateItem"), std::string::npos);
+    EXPECT_NE(server.Requests()[2].find("DeleteItem"), std::string::npos);
+    EXPECT_NE(server.Requests()[3].find("BatchWriteItem"), std::string::npos);
 }
 
 TEST(AwsDynamoDBHelper, HttpClientFactoryRotatesNodesAcrossRetries) {
