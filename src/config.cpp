@@ -17,6 +17,12 @@ void ValidateConfig(const Config& config) {
     if (config.max_connections == 0) {
         throw std::invalid_argument("max_connections must be > 0");
     }
+    if (config.key_route_affinity.partition_key_discovery_attempts == 0) {
+        throw std::invalid_argument("partition_key_discovery_attempts must be > 0");
+    }
+    if (config.key_route_affinity.partition_key_discovery_initial_backoff < std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("partition_key_discovery_initial_backoff must be >= 0");
+    }
     if (config.tls_session_cache_enabled) {
         if (config.tls_session_cache_size == 0) {
             throw std::invalid_argument("tls_session_cache_size must be > 0 when TLS session cache is enabled");

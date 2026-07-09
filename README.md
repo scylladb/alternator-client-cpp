@@ -206,6 +206,14 @@ You can also refresh one table explicitly during startup:
 (void)helper.UpdatePartitionKeyName("orders");
 ```
 
+Discovery retries `DescribeTable` a few times with exponential backoff to tolerate transient metadata
+unavailability, such as writes immediately after `CreateTable`:
+
+```cpp
+cfg.key_route_affinity.partition_key_discovery_attempts = 3;
+cfg.key_route_affinity.partition_key_discovery_initial_backoff = std::chrono::milliseconds{100};
+```
+
 For `BatchWriteItem`-style operations, pass the put/delete candidates and the helper will vote for preferred nodes. Voted nodes are tried first by descending vote count, with deterministic node-order tie breaking:
 
 ```cpp
