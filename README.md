@@ -70,6 +70,19 @@ int main() {
 }
 ```
 
+`Config::aws_region` is required by the AWS SDK for C++ client configuration,
+including request signing and diagnostic metadata. Alternator does not use that
+value to choose endpoints; `DynamoDBHelper` discovers nodes through
+`/localnodes` and installs the endpoint provider or HTTP wrapper that routes
+requests to live Alternator nodes. The default value is
+`default-alb-region`, which prevents the SDK configuration from being empty but
+can look confusing in logs, traces, or metrics.
+
+Set `cfg.aws_region` to the deployment or Scylla Cloud region that makes sense
+for your environment when AWS SDK observability should show a real region. The
+value only affects SDK metadata and signing scope; it does not change
+Alternator node discovery or load balancing.
+
 The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by default. AWS SDK for C++ resolves that endpoint once for a retried operation, so `DynamoDBHelper::ApplyToSDKOptions()` can also install a process-wide HTTP client factory before `Aws::InitAPI()`. That factory delegates to the SDK HTTP client and rotates only requests already aimed at the helper's Alternator endpoints.
 
 The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook for retry-aware endpoint rewriting, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic middleware features such as transparent header optimization and request-content-based endpoint rewriting are not available in the same form. The core library does provide deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
