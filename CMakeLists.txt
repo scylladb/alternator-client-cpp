@@ -10,6 +10,15 @@ include(GNUInstallDirs)
 
 option(ALTERNATOR_CLIENT_CPP_BUILD_TESTS "Build unit tests" ON)
 option(ALTERNATOR_CLIENT_CPP_ENABLE_AWS "Build AWS SDK for C++ DynamoDB adapter when AWSSDK is available" ON)
+option(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS "Fail configuration unless the AWS SDK adapter and its tests are built" OFF)
+
+if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS AND NOT ALTERNATOR_CLIENT_CPP_ENABLE_AWS)
+    message(FATAL_ERROR "ALTERNATOR_CLIENT_CPP_REQUIRE_AWS requires ALTERNATOR_CLIENT_CPP_ENABLE_AWS=ON")
+endif()
+
+if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS AND NOT ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
+    message(FATAL_ERROR "ALTERNATOR_CLIENT_CPP_REQUIRE_AWS requires ALTERNATOR_CLIENT_CPP_BUILD_TESTS=ON")
+endif()
 
 find_package(CURL QUIET)
 find_package(OpenSSL QUIET)
@@ -56,7 +65,11 @@ if(ALTERNATOR_CLIENT_CPP_ENABLE_AWS)
         find_package(AWSSDK QUIET COMPONENTS dynamodb)
     else()
         set(AWSSDK_FOUND FALSE)
-        message(STATUS "ZLIB not found; AWS DynamoDB adapter target will not be built")
+        if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS)
+            message(FATAL_ERROR "ZLIB not found; AWS DynamoDB adapter target cannot be built")
+        else()
+            message(STATUS "ZLIB not found; AWS DynamoDB adapter target will not be built")
+        endif()
     endif()
     if(AWSSDK_FOUND)
         add_library(alternator_client_cpp_aws
@@ -74,15 +87,25 @@ if(ALTERNATOR_CLIENT_CPP_ENABLE_AWS)
         target_compile_definitions(alternator_client_cpp_aws
             PUBLIC SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_AWS_SDK=1)
     else()
-        message(STATUS "AWSSDK not found; AWS DynamoDB adapter target will not be built")
+        if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS)
+            message(FATAL_ERROR "AWSSDK with the dynamodb component not found; AWS DynamoDB adapter target cannot be built")
+        else()
+            message(STATUS "AWSSDK not found; AWS DynamoDB adapter target will not be built")
+        endif()
     endif()
+endif()
+
+if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS AND NOT TARGET alternator_client_cpp_aws)
+    message(FATAL_ERROR "ALTERNATOR_CLIENT_CPP_REQUIRE_AWS requires the alternator_client_cpp_aws target")
 endif()
 
 if(ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
     enable_testing()
     find_package(GTest QUIET)
     if(GTest_FOUND)
-        add_executable(alternator_client_cpp_tests
+        include(GoogleTest)
+
+        set(ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
             tests/attribute_value_test.cpp
             tests/http_client_test.cpp
             tests/key_route_affinity_test.cpp
@@ -91,23 +114,54 @@ if(ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
             tests/node_health_test.cpp
             tests/query_plan_test.cpp
             tests/routing_scope_test.cpp)
+
+        add_executable(alternator_client_cpp_tests
+            ${ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES})
         target_link_libraries(alternator_client_cpp_tests
             PRIVATE
                 alternator_client_cpp
                 GTest::gtest_main)
-        if(TARGET alternator_client_cpp_aws)
-            target_sources(alternator_client_cpp_tests
-                PRIVATE
-                    tests/aws_integration_test.cpp
-                    tests/aws_dynamodb_helper_test.cpp)
-            target_link_libraries(alternator_client_cpp_tests
-                PRIVATE
-                    alternator_client_cpp_aws)
-        endif()
-        include(GoogleTest)
         gtest_discover_tests(alternator_client_cpp_tests)
+
+        set(ALTERNATOR_CLIENT_CPP_AWS_TEST_SOURCES
+            tests/aws_integration_test.cpp
+            tests/aws_dynamodb_helper_test.cpp)
+
+        if(TARGET alternator_client_cpp_aws)
+            if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS AND NOT ALTERNATOR_CLIENT_CPP_AWS_TEST_SOURCES)
+                message(FATAL_ERROR "ALTERNATOR_CLIENT_CPP_REQUIRE_AWS requires AWS adapter test sources")
+            endif()
+
+            add_executable(alternator_client_cpp_aws_tests
+                ${ALTERNATOR_CLIENT_CPP_AWS_TEST_SOURCES})
+            target_link_libraries(alternator_client_cpp_aws_tests
+                PRIVATE
+                    alternator_client_cpp_aws
+                    GTest::gtest_main)
+            gtest_discover_tests(alternator_client_cpp_aws_tests)
+
+            add_test(
+                NAME alternator_client_cpp_aws_tests_present
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:alternator_client_cpp_aws_tests>
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RequireGTestTests.cmake)
+            add_test(
+                NAME alternator_client_cpp_aws_integration_tests_present
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:alternator_client_cpp_aws_tests>
+                    -DREQUIRED_TEST_REGEX=AwsDynamoDBIntegration\\.
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RequireGTestTests.cmake)
+        endif()
+
+        if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS AND NOT TARGET alternator_client_cpp_aws_tests)
+            message(FATAL_ERROR "ALTERNATOR_CLIENT_CPP_REQUIRE_AWS requires the alternator_client_cpp_aws_tests target")
+        endif()
     else()
-        message(STATUS "GTest not found; tests will not be built")
+        if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS)
+            message(FATAL_ERROR "GTest not found; AWS adapter tests cannot be built")
+        else()
+            message(STATUS "GTest not found; tests will not be built")
+        endif()
     endif()
 endif()
 

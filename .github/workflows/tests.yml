@@ -14,9 +14,14 @@ jobs:
   test:
     name: Build lint and run tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      AWS_SDK_CPP_VERSION: 1.11.844
+      AWS_SDK_CPP_INSTALL_DIR: ${{ github.workspace }}/.deps/aws-sdk-cpp
+      CMAKE_PREFIX_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp
+      LD_LIBRARY_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp/lib:${{ github.workspace }}/.deps/aws-sdk-cpp/lib64
 
     steps:
       - name: Checkout source
@@ -28,9 +33,41 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake \
             g++ \
+            git \
             libcurl4-openssl-dev \
             libgtest-dev \
-            openssl
+            libssl-dev \
+            ninja-build \
+            openssl \
+            zlib1g-dev
+
+      - name: Cache AWS SDK for C++
+        id: cache-aws-sdk
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.AWS_SDK_CPP_INSTALL_DIR }}
+          key: aws-sdk-cpp-${{ env.AWS_SDK_CPP_VERSION }}-dynamodb-shared-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Build AWS SDK for C++
+        if: steps.cache-aws-sdk.outputs.cache-hit != 'true'
+        run: |
+          git clone \
+            --branch "$AWS_SDK_CPP_VERSION" \
+            --depth 1 \
+            --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/aws/aws-sdk-cpp.git \
+            .deps/aws-sdk-cpp-src
+          cmake -S .deps/aws-sdk-cpp-src -B .deps/aws-sdk-cpp-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$AWS_SDK_CPP_INSTALL_DIR" \
+            -DBUILD_ONLY=dynamodb \
+            -DBUILD_SHARED_LIBS=ON \
+            -DENABLE_TESTING=OFF \
+            -DAUTORUN_UNIT_TESTS=OFF \
+            -DBUILD_DEPS=ON
+          cmake --build .deps/aws-sdk-cpp-build --parallel 2
+          cmake --install .deps/aws-sdk-cpp-build
 
       - name: Run build
         run: |
