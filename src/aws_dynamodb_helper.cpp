@@ -14,9 +14,11 @@
 #include <aws/dynamodb/model/KeySchemaElement.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace scylladb::alternator::aws {
@@ -403,12 +405,23 @@ bool DynamoDBHelper::UpdatePartitionKeyName(const std::string& table_name) const
     if (table_name.empty()) {
         return false;
     }
-    const auto key_name = DiscoverPartitionKeyName(table_name);
-    if (key_name.empty()) {
-        return false;
+
+    auto backoff = config_.key_route_affinity.partition_key_discovery_initial_backoff;
+    for (std::uint32_t attempt = 1; attempt <= config_.key_route_affinity.partition_key_discovery_attempts; ++attempt) {
+        const auto key_name = DiscoverPartitionKeyName(table_name);
+        if (!key_name.empty()) {
+            partition_keys_->SetPartitionKeyName(table_name, key_name);
+            return true;
+        }
+        if (attempt == config_.key_route_affinity.partition_key_discovery_attempts) {
+            break;
+        }
+        if (backoff > std::chrono::milliseconds::zero()) {
+            std::this_thread::sleep_for(backoff);
+            backoff *= 2;
+        }
     }
-    partition_keys_->SetPartitionKeyName(table_name, key_name);
-    return true;
+    return false;
 }
 
 bool DynamoDBHelper::ShouldUseKeyRouteAffinityForWrite(WriteOperationKind kind,

@@ -327,6 +327,10 @@ std::string DescribeTableResponse(const std::string& table_name,
            partition_key_name + R"(","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}]}})";
 }
 
+std::string ResourceNotFoundResponse() {
+    return R"({"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"not ready"})";
+}
+
 bool WaitForPartitionKeyName(const aws::DynamoDBHelper& helper,
                              const std::string& table_name,
                              const std::string& partition_key_name) {
@@ -471,6 +475,29 @@ TEST(AwsDynamoDBHelper, UpdatesPartitionKeyNameOnDemand) {
 
     ASSERT_EQ(server.Requests().size(), 1U);
     EXPECT_NE(server.Requests()[0].find("DescribeTable"), std::string::npos);
+}
+
+TEST(AwsDynamoDBHelper, RetriesPartitionKeyDiscoveryAfterTransientFailure) {
+    KeepAliveSequenceHttpServer server({
+        {400, "Bad Request", ResourceNotFoundResponse()},
+        {200, "OK", DescribeTableResponse("orders", "id")},
+    });
+
+    Aws::SDKOptions sdk_options;
+    AwsApiGuard api(sdk_options);
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.key_route_affinity.partition_key_discovery_attempts = 2;
+    cfg.key_route_affinity.partition_key_discovery_initial_backoff = std::chrono::milliseconds{0};
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    EXPECT_TRUE(helper.UpdatePartitionKeyName("orders"));
+    EXPECT_EQ(helper.GetPartitionKeyName("orders"), "id");
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 2U);
+    EXPECT_NE(server.Requests()[0].find("DescribeTable"), std::string::npos);
+    EXPECT_NE(server.Requests()[1].find("DescribeTable"), std::string::npos);
 }
 
 TEST(AwsDynamoDBHelper, SuppressesDuplicatePartitionKeyDiscoveryForTable) {

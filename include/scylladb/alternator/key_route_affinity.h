@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -21,6 +22,8 @@ enum class KeyRouteAffinityMode {
 struct KeyRouteAffinityConfig {
     KeyRouteAffinityMode mode = KeyRouteAffinityMode::None;
     std::map<std::string, std::string> partition_key_by_table;
+    std::uint32_t partition_key_discovery_attempts = 3;
+    std::chrono::milliseconds partition_key_discovery_initial_backoff{100};
 };
 
 class PartitionKeyMetadata {
