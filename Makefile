@@ -6,12 +6,14 @@ CTEST ?= ctest
 BUILD_DIR ?= build
 CHECK_BUILD_DIR ?= build-check
 CHECK_CXX_FLAGS ?= -Wall -Wextra -Werror
+BUILD_CMAKE_FLAGS ?= -DALTERNATOR_CLIENT_CPP_REQUIRE_AWS=OFF
+INTEGRATION_CMAKE_FLAGS ?= -DALTERNATOR_CLIENT_CPP_ENABLE_AWS=ON -DALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON
 
 COMPOSE := docker compose -f $(MAKEFILE_PATH)/test/docker-compose.yml
 
 .PHONY: build
 build:
-	$(CMAKE) -S . -B $(BUILD_DIR)
+	$(CMAKE) -S . -B $(BUILD_DIR) $(BUILD_CMAKE_FLAGS)
 	$(CMAKE) --build $(BUILD_DIR) --parallel
 
 .PHONY: check
@@ -24,14 +26,18 @@ test: build check test-unit test-integration
 
 .PHONY: test-unit
 test-unit:
-	$(CMAKE) -S . -B $(BUILD_DIR)
+	$(CMAKE) -S . -B $(BUILD_DIR) $(BUILD_CMAKE_FLAGS)
 	$(CMAKE) --build $(BUILD_DIR) --parallel
 	$(CTEST) --test-dir $(BUILD_DIR) --output-on-failure -E Integration
 
-.PHONY: test-integration
-test-integration: scylla-start
-	$(CMAKE) -S . -B $(BUILD_DIR)
+.PHONY: build-integration
+build-integration:
+	$(CMAKE) -S . -B $(BUILD_DIR) $(INTEGRATION_CMAKE_FLAGS)
 	$(CMAKE) --build $(BUILD_DIR) --parallel
+	$(CTEST) --test-dir $(BUILD_DIR) --output-on-failure -R "alternator_client_cpp_aws_.*tests_present"
+
+.PHONY: test-integration
+test-integration: build-integration scylla-start
 	ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION=1 \
 	ALTERNATOR_CLIENT_CPP_CA_FILE=$(MAKEFILE_PATH)/test/scylla/db.crt \
 	$(CTEST) --test-dir $(BUILD_DIR) --output-on-failure -R Integration

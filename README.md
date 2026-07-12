@@ -11,7 +11,7 @@ make build
 make test
 ```
 
-The core target requires C++17. The default discovery HTTP client uses libcurl when CMake can find the libcurl development package; otherwise it falls back to a small POSIX plain-HTTP client. HTTPS discovery requires libcurl or a caller-provided `HttpClient`. Tests use GoogleTest when it is installed. The AWS adapter target is built only when CMake can find `AWSSDK` with the `dynamodb` component.
+The core target requires C++17. The default discovery HTTP client uses libcurl when CMake can find the libcurl development package; otherwise it falls back to a small POSIX plain-HTTP client. HTTPS discovery requires libcurl or a caller-provided `HttpClient`. Tests use GoogleTest when it is installed. The AWS adapter target is built only when CMake can find `AWSSDK` with the `dynamodb` component. `make test-integration` requires the AWS adapter and its tests by configuring with `ALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON`.
 
 ## Core Usage
 
@@ -272,6 +272,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - `alternator_client_cpp`: core discovery/load-balancing library.
 - `alternator_client_cpp_aws`: optional AWS SDK for C++ adapter, available when `AWSSDK` is found.
 - `alternator_client_cpp_tests`: unit tests when `GTest` is found.
+- `alternator_client_cpp_aws_tests`: AWS adapter tests, available when `AWSSDK` and `GTest` are found.
 
 After installation, downstream CMake projects can use:
 
