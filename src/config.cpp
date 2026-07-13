@@ -3,8 +3,36 @@
 #include "http_compression.h"
 
 #include <stdexcept>
+#include <utility>
 
 namespace scylladb::alternator {
+
+std::vector<std::string> DefaultHeaderOptimization::AllowedHeaders(
+    const HeaderOptimizationContext& context) const {
+    std::vector<std::string> headers = {
+        "Host",
+        "X-Amz-Target",
+        "Content-Length",
+        "Accept-Encoding",
+        "Content-Encoding",
+    };
+    if (context.credentials_configured) {
+        headers.push_back("Authorization");
+        headers.push_back("X-Amz-Date");
+    }
+    if (context.user_agent_configured) {
+        headers.push_back("User-Agent");
+    }
+    return headers;
+}
+
+HeaderAllowlistOptimization::HeaderAllowlistOptimization(std::vector<std::string> allowed_headers)
+    : allowed_headers_(std::move(allowed_headers)) {}
+
+std::vector<std::string> HeaderAllowlistOptimization::AllowedHeaders(
+    const HeaderOptimizationContext&) const {
+    return allowed_headers_;
+}
 
 void ValidateConfig(const Config& config) {
     if (config.scheme != "http" && config.scheme != "https") {

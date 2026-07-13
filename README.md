@@ -85,7 +85,60 @@ Alternator node discovery or load balancing.
 
 The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by default. AWS SDK for C++ resolves that endpoint once for a retried operation, so `DynamoDBHelper::ApplyToSDKOptions()` can also install a process-wide HTTP client factory before `Aws::InitAPI()`. That factory delegates to the SDK HTTP client and rotates only requests already aimed at the helper's Alternator endpoints.
 
-The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook for retry-aware endpoint rewriting, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic middleware features such as transparent header optimization and request-content-based endpoint rewriting are not available in the same form. The core library does provide deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
+The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook for retry-aware endpoint rewriting and header optimization, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic request-content-based endpoint rewriting is not available in the same form. The core library does provide deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
+
+### Headers Optimization
+
+Header optimization is disabled by default because `Config::header_optimization`
+is null. Set it to a `HeaderOptimization` implementation to make
+`DynamoDBHelper::ApplyToSDKOptions()` install an HTTP client factory that
+removes DynamoDB request headers not used by Alternator before the request is
+sent. The default allowlist keeps `Host`, `X-Amz-Target`, `Content-Length`,
+`Accept-Encoding`, and `Content-Encoding`. When `Config::credentials` is set,
+it also keeps `Authorization` and `X-Amz-Date`. When `Config::user_agent` is
+set, it keeps `User-Agent`.
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.header_optimization =
+    std::make_shared<scylladb::alternator::DefaultHeaderOptimization>();
+```
+
+Use `HeaderAllowlistOptimization` to replace the default allowlist:
+
+```cpp
+cfg.header_optimization =
+    std::make_shared<scylladb::alternator::HeaderAllowlistOptimization>(
+        std::vector<std::string>{
+            "Host",
+            "X-Amz-Target",
+            "Content-Length",
+        });
+```
+
+Header names are matched case-insensitively. The override is exact; if it is
+set, the helper does not add credential or user-agent headers automatically.
+Applications can provide their own implementation by deriving from
+`HeaderOptimization`:
+
+```cpp
+class MyHeaderOptimization final : public scylladb::alternator::HeaderOptimization {
+public:
+    std::vector<std::string> AllowedHeaders(
+        const scylladb::alternator::HeaderOptimizationContext& context) const override {
+        std::vector<std::string> headers = {"Host", "X-Amz-Target", "Content-Length"};
+        if (context.credentials_configured) {
+            headers.push_back("Authorization");
+            headers.push_back("X-Amz-Date");
+        }
+        return headers;
+    }
+};
+```
+
+Header optimization applies only to requests routed to known Alternator
+endpoints through the factory installed by `DynamoDBHelper::ApplyToSDKOptions()`
+before `Aws::InitAPI()`.
 
 ### HTTP Response Compression
 

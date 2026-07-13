@@ -43,6 +43,11 @@ namespace {
 constexpr char kAllocationTag[] = "ScyllaDBAlternatorAwsAdapter";
 constexpr char kEndpointOverrideHost[] = "dynamodb.fake.alternator.cluster.node";
 
+struct HeaderOptimizationPolicy {
+    bool enabled = false;
+    std::set<std::string> allowed_headers;
+};
+
 Aws::Http::Scheme AwsScheme(const std::string& scheme) {
     return scheme == "https" ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
 }
@@ -184,6 +189,46 @@ bool IsFirstSdkAttempt(const Aws::Http::HttpRequest& request) {
     return value_pos < header.size() && header[value_pos] == '1';
 }
 
+std::set<std::string> NormalizeHeaderAllowlist(const std::vector<std::string>& headers) {
+    std::set<std::string> allowlist;
+    for (const auto& header : headers) {
+        allowlist.insert(detail::ToLowerAscii(header));
+    }
+    return allowlist;
+}
+
+HeaderOptimizationContext HeaderOptimizationContextFromConfig(const Config& config) {
+    return {
+        !config.credentials.access_key_id.empty() || !config.credentials.secret_access_key.empty(),
+        !config.user_agent.empty(),
+    };
+}
+
+HeaderOptimizationPolicy BuildHeaderOptimizationPolicy(const Config& config) {
+    if (!config.header_optimization) {
+        return {};
+    }
+
+    const auto headers = config.header_optimization->AllowedHeaders(
+        HeaderOptimizationContextFromConfig(config));
+    return {true, NormalizeHeaderAllowlist(headers)};
+}
+
+void OptimizeRequestHeaders(const std::shared_ptr<Aws::Http::HttpRequest>& request,
+                            const HeaderOptimizationPolicy& policy) {
+    if (!request || !policy.enabled) {
+        return;
+    }
+
+    const auto headers = request->GetHeaders();
+    for (const auto& header : headers) {
+        const auto header_name = detail::ToLowerAscii(std::string(header.first.c_str()));
+        if (policy.allowed_headers.find(header_name) == policy.allowed_headers.end()) {
+            request->DeleteHeader(header.first.c_str());
+        }
+    }
+}
+
 Url SelectAttemptNode(const std::shared_ptr<Aws::Http::HttpRequest>& request,
                       const std::shared_ptr<AlternatorLiveNodes>& nodes,
                       std::uint16_t endpoint_override_port) {
@@ -208,11 +253,13 @@ public:
     AlternatorHttpClient(std::shared_ptr<AlternatorLiveNodes> nodes,
                          std::uint16_t endpoint_override_port,
                          std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders,
+                         HeaderOptimizationPolicy header_optimization,
                          std::shared_ptr<Aws::Http::HttpClient> delegate)
         : nodes_(std::move(nodes))
         , endpoint_override_port_(endpoint_override_port)
         , content_encoding_decoders_(std::move(content_encoding_decoders))
         , accept_encoding_value_(detail::BuildAcceptEncodingValue(content_encoding_decoders_))
+        , header_optimization_(std::move(header_optimization))
         , delegate_(std::move(delegate)) {
         if (!nodes_) {
             throw std::invalid_argument("nodes must not be null");
@@ -229,6 +276,9 @@ public:
         auto node = SelectAttemptNode(request, nodes_, endpoint_override_port_);
         if (!node.Empty() && !accept_encoding_value_.empty()) {
             request->SetAcceptEncoding(Aws::String(accept_encoding_value_.c_str()));
+        }
+        if (!node.Empty()) {
+            OptimizeRequestHeaders(request, header_optimization_);
         }
 
         auto response = delegate_->MakeRequest(request, read_limiter, write_limiter);
@@ -253,6 +303,7 @@ private:
     std::uint16_t endpoint_override_port_ = 0;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders_;
     std::string accept_encoding_value_;
+    HeaderOptimizationPolicy header_optimization_;
     std::shared_ptr<Aws::Http::HttpClient> delegate_;
 };
 
@@ -260,10 +311,12 @@ class AlternatorHttpClientFactory final : public Aws::Http::HttpClientFactory {
 public:
     AlternatorHttpClientFactory(std::shared_ptr<AlternatorLiveNodes> nodes,
                                 std::uint16_t endpoint_override_port,
-                                std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders)
+                                std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders,
+                                HeaderOptimizationPolicy header_optimization)
         : nodes_(std::move(nodes))
         , endpoint_override_port_(endpoint_override_port)
-        , content_encoding_decoders_(std::move(content_encoding_decoders)) {
+        , content_encoding_decoders_(std::move(content_encoding_decoders))
+        , header_optimization_(std::move(header_optimization)) {
         if (!nodes_) {
             throw std::invalid_argument("nodes must not be null");
         }
@@ -281,6 +334,7 @@ public:
             nodes_,
             endpoint_override_port_,
             content_encoding_decoders_,
+            header_optimization_,
             std::move(delegate));
     }
 
@@ -315,6 +369,7 @@ private:
     std::shared_ptr<AlternatorLiveNodes> nodes_;
     std::uint16_t endpoint_override_port_ = 0;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders_;
+    HeaderOptimizationPolicy header_optimization_;
 };
 
 std::string EndpointOverride(std::uint16_t port, const std::string& scheme) {
@@ -324,12 +379,14 @@ std::string EndpointOverride(std::uint16_t port, const std::string& scheme) {
 std::shared_ptr<Aws::Http::HttpClientFactory> NewAlternatorHttpClientFactory(
     std::shared_ptr<AlternatorLiveNodes> nodes,
     std::uint16_t endpoint_override_port,
-    std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders) {
+    std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders,
+    HeaderOptimizationPolicy header_optimization) {
     return Aws::MakeShared<AlternatorHttpClientFactory>(
         kAllocationTag,
         std::move(nodes),
         endpoint_override_port,
-        std::move(content_encoding_decoders));
+        std::move(content_encoding_decoders),
+        std::move(header_optimization));
 }
 
 class FixedEndpointProvider final : public Aws::DynamoDB::Endpoint::DynamoDBEndpointProviderBase {
@@ -741,7 +798,8 @@ std::shared_ptr<Aws::Http::HttpClientFactory> DynamoDBHelper::NewHttpClientFacto
     return NewAlternatorHttpClientFactory(
         nodes_,
         config_.port,
-        config_.content_encoding_decoders);
+        config_.content_encoding_decoders,
+        BuildHeaderOptimizationPolicy(config_));
 }
 
 Aws::DynamoDB::DynamoDBClientConfiguration DynamoDBHelper::NewClientConfiguration() const {
@@ -772,8 +830,9 @@ void DynamoDBHelper::ApplyToSDKOptions(Aws::SDKOptions& options) const {
     auto nodes = nodes_;
     const auto port = config_.port;
     const auto content_encoding_decoders = config_.content_encoding_decoders;
-    options.httpOptions.httpClientFactory_create_fn = [nodes, port, content_encoding_decoders] {
-        return NewAlternatorHttpClientFactory(nodes, port, content_encoding_decoders);
+    const auto header_optimization = BuildHeaderOptimizationPolicy(config_);
+    options.httpOptions.httpClientFactory_create_fn = [nodes, port, content_encoding_decoders, header_optimization] {
+        return NewAlternatorHttpClientFactory(nodes, port, content_encoding_decoders, header_optimization);
     };
 }
 

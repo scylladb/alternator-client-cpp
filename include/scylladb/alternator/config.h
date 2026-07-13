@@ -36,6 +36,35 @@ private:
     std::vector<std::string> accepted_response_encodings_;
 };
 
+struct HeaderOptimizationContext {
+    bool credentials_configured = false;
+    bool user_agent_configured = false;
+};
+
+class HeaderOptimization {
+public:
+    virtual ~HeaderOptimization() = default;
+
+    [[nodiscard]] virtual std::vector<std::string> AllowedHeaders(
+        const HeaderOptimizationContext& context) const = 0;
+};
+
+class DefaultHeaderOptimization final : public HeaderOptimization {
+public:
+    [[nodiscard]] std::vector<std::string> AllowedHeaders(
+        const HeaderOptimizationContext& context) const override;
+};
+
+class HeaderAllowlistOptimization final : public HeaderOptimization {
+public:
+    explicit HeaderAllowlistOptimization(std::vector<std::string> allowed_headers);
+
+    [[nodiscard]] std::vector<std::string> AllowedHeaders(
+        const HeaderOptimizationContext& context) const override;
+private:
+    std::vector<std::string> allowed_headers_;
+};
+
 struct Config {
     std::uint16_t port = 8080;
     std::string scheme = "http";
@@ -60,6 +89,7 @@ struct Config {
     bool reuse_discovery_connections = true;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders;
     std::string user_agent = "scylladb-alternator-client-cpp/devel";
+    std::shared_ptr<HeaderOptimization> header_optimization;
 
     NodeHealthStoreConfig node_health;
     KeyRouteAffinityConfig key_route_affinity;
