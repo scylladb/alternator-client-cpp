@@ -350,14 +350,14 @@ TEST(HttpClient, RequestsAndDecodesGzipResponse) {
 #endif
 }
 
-TEST(HttpClient, GzipContentEncodingEncoderRoundTripsWithZlibDecoder) {
+TEST(HttpClient, GzipRequestCompressorRoundTripsWithZlibDecoder) {
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
     const std::string body = R"({"TableName":"orders","Limit":10})";
-    const GzipContentEncodingEncoder encoder;
+    const GzipRequestCompressor compressor;
     const ZlibContentEncodingDecoder decoder({"gzip"});
 
-    EXPECT_EQ(encoder.ContentEncoding(), "gzip");
-    EXPECT_EQ(decoder.Decode(encoder.Encode(body), encoder.ContentEncoding()), body);
+    EXPECT_EQ(compressor.ContentEncoding(), "gzip");
+    EXPECT_EQ(decoder.Decode(compressor.Compress(body), compressor.ContentEncoding()), body);
 #else
     GTEST_SKIP() << "zlib support is not enabled";
 #endif

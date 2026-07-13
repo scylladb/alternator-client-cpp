@@ -142,7 +142,7 @@ before `Aws::InitAPI()`.
 
 ### HTTP Request Compression
 
-Request compression is disabled by default. Configure a request content encoder
+Request compression is disabled by default. Configure a request compressor
 before constructing `DynamoDBHelper`, then install the Alternator HTTP client
 factory with `DynamoDBHelper::ApplyToSDKOptions()` before `Aws::InitAPI()`.
 The factory compresses request bodies only for requests routed to known
@@ -151,13 +151,13 @@ headers before sending the request.
 
 ```cpp
 scylladb::alternator::Config cfg;
-cfg.content_encoding_encoder =
-    std::make_shared<scylladb::alternator::GzipContentEncodingEncoder>();
+cfg.request_compressor =
+    std::make_shared<scylladb::alternator::GzipRequestCompressor>();
 ```
 
-Only gzip request compression is built in. `GzipContentEncodingEncoder` requires
-zlib at build time. The `HttpContentEncodingEncoder` interface keeps request
-compression extensible for other content encodings.
+Only gzip request compression is built in. `GzipRequestCompressor` requires
+zlib at build time. The `HttpRequestCompressor` interface keeps request
+compression extensible for other HTTP content encodings.
 
 ### HTTP Response Compression
 

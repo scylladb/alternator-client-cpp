@@ -161,17 +161,17 @@ struct ContentEncodingDecoderEntry {
 }
 
 [[nodiscard]] std::string NormalizeRequestEncoding(
-    const std::shared_ptr<HttpContentEncodingEncoder>& content_encoding_encoder) {
-    if (!content_encoding_encoder) {
+    const std::shared_ptr<HttpRequestCompressor>& request_compressor) {
+    if (!request_compressor) {
         return {};
     }
 
-    auto encoding = NormalizeResponseEncoding(content_encoding_encoder->ContentEncoding());
+    auto encoding = NormalizeResponseEncoding(request_compressor->ContentEncoding());
     if (encoding.empty()) {
-        throw std::invalid_argument("content_encoding_encoder must not advertise an empty encoding");
+        throw std::invalid_argument("request_compressor must not advertise an empty encoding");
     }
     if (encoding.find(',') != std::string::npos) {
-        throw std::invalid_argument("content_encoding_encoder must advertise exactly one encoding");
+        throw std::invalid_argument("request_compressor must advertise exactly one encoding");
     }
     return encoding;
 }
@@ -233,9 +233,9 @@ struct ContentEncodingDecoderEntry {
 
 } // namespace
 
-std::string BuildContentEncodingValue(
-    const std::shared_ptr<HttpContentEncodingEncoder>& content_encoding_encoder) {
-    return NormalizeRequestEncoding(content_encoding_encoder);
+std::string BuildRequestContentEncodingValue(
+    const std::shared_ptr<HttpRequestCompressor>& request_compressor) {
+    return NormalizeRequestEncoding(request_compressor);
 }
 
 std::string ToLowerAscii(std::string value) {
@@ -295,17 +295,17 @@ std::string FindHttpHeaderValue(const std::string& headers, const std::string& n
 
 namespace scylladb::alternator {
 
-GzipContentEncodingEncoder::GzipContentEncodingEncoder() {
+GzipRequestCompressor::GzipRequestCompressor() {
 #if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
     throw std::invalid_argument("zlib request encoding is not available");
 #endif
 }
 
-std::string GzipContentEncodingEncoder::ContentEncoding() const {
+std::string GzipRequestCompressor::ContentEncoding() const {
     return "gzip";
 }
 
-std::string GzipContentEncodingEncoder::Encode(std::string body) const {
+std::string GzipRequestCompressor::Compress(std::string body) const {
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
     return detail::DeflateBody(body, MAX_WBITS + 16);
 #else

@@ -1081,7 +1081,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryCompressesGzipRequests) {
     });
 
     auto cfg = DiscoveryTestConfig(server.Port());
-    cfg.content_encoding_encoder = std::make_shared<GzipContentEncodingEncoder>();
+    cfg.request_compressor = std::make_shared<GzipRequestCompressor>();
     cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
         "Host",
         "X-Amz-Target",
@@ -1148,7 +1148,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternator
     cfg.nodes_list_update_period = std::chrono::milliseconds{0};
     cfg.http_client_timeout = std::chrono::milliseconds{2000};
     cfg.connect_timeout = std::chrono::milliseconds{1000};
-    cfg.content_encoding_encoder = std::make_shared<GzipContentEncodingEncoder>();
+    cfg.request_compressor = std::make_shared<GzipRequestCompressor>();
 
     aws::DynamoDBHelper helper({"node1.example.com"}, cfg);
 

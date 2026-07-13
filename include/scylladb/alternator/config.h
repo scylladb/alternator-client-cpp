@@ -25,12 +25,12 @@ public:
     [[nodiscard]] virtual std::string Decode(std::string body, const std::string& content_encoding) const = 0;
 };
 
-class HttpContentEncodingEncoder {
+class HttpRequestCompressor {
 public:
-    virtual ~HttpContentEncodingEncoder() = default;
+    virtual ~HttpRequestCompressor() = default;
 
     [[nodiscard]] virtual std::string ContentEncoding() const = 0;
-    [[nodiscard]] virtual std::string Encode(std::string body) const = 0;
+    [[nodiscard]] virtual std::string Compress(std::string body) const = 0;
 };
 
 class ZlibContentEncodingDecoder final : public HttpContentEncodingDecoder {
@@ -44,12 +44,12 @@ private:
     std::vector<std::string> accepted_response_encodings_;
 };
 
-class GzipContentEncodingEncoder final : public HttpContentEncodingEncoder {
+class GzipRequestCompressor final : public HttpRequestCompressor {
 public:
-    GzipContentEncodingEncoder();
+    GzipRequestCompressor();
 
     [[nodiscard]] std::string ContentEncoding() const override;
-    [[nodiscard]] std::string Encode(std::string body) const override;
+    [[nodiscard]] std::string Compress(std::string body) const override;
 };
 
 struct HeaderOptimizationContext {
@@ -103,7 +103,7 @@ struct Config {
 
     unsigned max_connections = 100;
     bool reuse_discovery_connections = true;
-    std::shared_ptr<HttpContentEncodingEncoder> content_encoding_encoder;
+    std::shared_ptr<HttpRequestCompressor> request_compressor;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders;
     std::string user_agent = "scylladb-alternator-client-cpp/devel";
     std::shared_ptr<HeaderOptimization> header_optimization;
