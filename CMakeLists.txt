@@ -42,6 +42,9 @@ add_library(alternator_client_cpp
 add_library(ScyllaDB::alternator_client_cpp ALIAS alternator_client_cpp)
 
 target_compile_features(alternator_client_cpp PUBLIC cxx_std_17)
+target_compile_definitions(alternator_client_cpp
+    PUBLIC
+        SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION="${PROJECT_VERSION}")
 target_include_directories(alternator_client_cpp
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -106,6 +109,7 @@ if(ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
 
         set(ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
             tests/attribute_value_test.cpp
+            tests/config_test.cpp
             tests/header_optimization_test.cpp
             tests/http_client_test.cpp
             tests/key_route_affinity_test.cpp

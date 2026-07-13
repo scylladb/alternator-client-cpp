@@ -10,6 +10,10 @@
 #include <scylladb/alternator/node_health.h>
 #include <scylladb/alternator/routing_scope.h>
 
+#ifndef SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION
+#define SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION "devel"
+#endif
+
 namespace scylladb::alternator {
 
 struct Credentials {
@@ -88,7 +92,7 @@ struct Config {
     unsigned max_connections = 100;
     bool reuse_discovery_connections = true;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders;
-    std::string user_agent = "scylladb-alternator-client-cpp/devel";
+    std::string user_agent = "scylladb-alternator-client-cpp/" SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION;
     std::shared_ptr<HeaderOptimization> header_optimization;
 
     NodeHealthStoreConfig node_health;
