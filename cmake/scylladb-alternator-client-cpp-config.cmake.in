@@ -4,6 +4,10 @@ include(CMakeFindDependencyMacro)
 
 find_dependency(Threads)
 
+if(@ZLIB_FOUND@)
+    find_dependency(ZLIB)
+endif()
+
 if(@CURL_FOUND@)
     find_dependency(CURL)
 endif()
@@ -13,7 +17,6 @@ if(@OpenSSL_FOUND@)
 endif()
 
 if(@ALTERNATOR_CLIENT_CPP_AWS_TARGET_BUILT@)
-    find_dependency(ZLIB)
     find_dependency(AWSSDK COMPONENTS dynamodb)
 endif()
 

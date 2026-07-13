@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -25,6 +26,23 @@ public:
 
 private:
     Handler handler_;
+};
+
+class PassthroughContentEncodingDecoder final : public HttpContentEncodingDecoder {
+public:
+    explicit PassthroughContentEncodingDecoder(std::vector<std::string> accepted_encodings = {"br"})
+        : accepted_encodings_(std::move(accepted_encodings)) {}
+
+    std::vector<std::string> AcceptedResponseEncodings() const override {
+        return accepted_encodings_;
+    }
+
+    std::string Decode(std::string body, const std::string&) const override {
+        return body;
+    }
+
+private:
+    std::vector<std::string> accepted_encodings_;
 };
 
 static std::vector<std::string> Hosts(const std::vector<Url>& nodes) {
@@ -443,4 +461,42 @@ TEST(AlternatorLiveNodes, RejectsInvalidTlsSessionCacheConfig) {
     });
 
     EXPECT_THROW(AlternatorLiveNodes({"node1.local"}, cfg, http), std::invalid_argument);
+}
+
+TEST(AlternatorLiveNodes, RejectsDuplicateContentEncodingDecoders) {
+    Config cfg;
+    cfg.content_encoding_decoders = {
+        std::make_shared<PassthroughContentEncodingDecoder>(std::vector<std::string>{"br"}),
+        std::make_shared<PassthroughContentEncodingDecoder>(std::vector<std::string>{"BR"}),
+    };
+
+    auto http = std::make_shared<FakeHttpClient>([](const Url&) {
+        return HttpResponse{200, "[]"};
+    });
+
+    EXPECT_THROW(AlternatorLiveNodes({"node1.local"}, cfg, http), std::invalid_argument);
+}
+
+TEST(AlternatorLiveNodes, RejectsEmptyContentEncodingDecoderEncoding) {
+    Config cfg;
+    cfg.content_encoding_decoders = {
+        std::make_shared<PassthroughContentEncodingDecoder>(std::vector<std::string>{""}),
+    };
+
+    auto http = std::make_shared<FakeHttpClient>([](const Url&) {
+        return HttpResponse{200, "[]"};
+    });
+
+    EXPECT_THROW(AlternatorLiveNodes({"node1.local"}, cfg, http), std::invalid_argument);
+}
+
+TEST(AlternatorLiveNodes, AcceptsCustomContentEncodingDecoder) {
+    Config cfg;
+    cfg.content_encoding_decoders = {std::make_shared<PassthroughContentEncodingDecoder>()};
+
+    auto http = std::make_shared<FakeHttpClient>([](const Url&) {
+        return HttpResponse{200, "[]"};
+    });
+
+    EXPECT_NO_THROW(AlternatorLiveNodes({"node1.local"}, cfg, http));
 }

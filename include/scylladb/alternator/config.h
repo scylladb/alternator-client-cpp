@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <scylladb/alternator/key_route_affinity.h>
 #include <scylladb/alternator/node_health.h>
@@ -13,6 +15,25 @@ namespace scylladb::alternator {
 struct Credentials {
     std::string access_key_id;
     std::string secret_access_key;
+};
+
+class HttpContentEncodingDecoder {
+public:
+    virtual ~HttpContentEncodingDecoder() = default;
+
+    [[nodiscard]] virtual std::vector<std::string> AcceptedResponseEncodings() const = 0;
+    [[nodiscard]] virtual std::string Decode(std::string body, const std::string& content_encoding) const = 0;
+};
+
+class ZlibContentEncodingDecoder final : public HttpContentEncodingDecoder {
+public:
+    explicit ZlibContentEncodingDecoder(std::vector<std::string> accepted_response_encodings = {"gzip", "deflate"});
+
+    [[nodiscard]] std::vector<std::string> AcceptedResponseEncodings() const override;
+    [[nodiscard]] std::string Decode(std::string body, const std::string& content_encoding) const override;
+
+private:
+    std::vector<std::string> accepted_response_encodings_;
 };
 
 struct Config {
@@ -37,6 +58,7 @@ struct Config {
 
     unsigned max_connections = 100;
     bool reuse_discovery_connections = true;
+    std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders;
     std::string user_agent = "scylladb-alternator-client-cpp/devel";
 
     NodeHealthStoreConfig node_health;

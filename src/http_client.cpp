@@ -1,5 +1,7 @@
 #include <scylladb/alternator/http_client.h>
 
+#include "http_compression.h"
+
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
 #include <curl/curl.h>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_OPENSSL
@@ -36,6 +38,12 @@ void EnsureCurlInitialized() {
 std::size_t WriteBody(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
     auto* body = static_cast<std::string*>(userdata);
     body->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+std::size_t WriteHeader(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    auto* headers = static_cast<std::string*>(userdata);
+    headers->append(ptr, size * nmemb);
     return size * nmemb;
 }
 
@@ -76,7 +84,12 @@ CURLcode ConfigureSslContext(CURL*, void* ssl_context, void* userdata) {
 }
 #endif
 
-void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::string& body) {
+void ConfigureCurlForGet(
+    CURL* curl,
+    const Url& url,
+    const Config& config,
+    std::string& body,
+    std::string& response_headers) {
     curl_easy_reset(curl);
 
     const auto url_string = url.ToString();
@@ -85,6 +98,8 @@ void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &WriteHeader);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_SESSIONID_CACHE, config.tls_session_cache_enabled ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, static_cast<long>(config.max_connections));
@@ -122,12 +137,18 @@ void ConfigureCurlForGet(CURL* curl, const Url& url, const Config& config, std::
 
 HttpResponse PerformCurlGet(CURL* curl, const Url& url, const Config& config) {
     std::string body;
-    ConfigureCurlForGet(curl, url, config, body);
+    std::string response_headers;
+    ConfigureCurlForGet(curl, url, config, body, response_headers);
 
     curl_slist* headers = nullptr;
     headers = curl_slist_append(
         headers,
         config.reuse_discovery_connections ? "Connection: keep-alive" : "Connection: close");
+    const auto accept_encoding_value = detail::BuildAcceptEncodingValue(config.content_encoding_decoders);
+    if (!accept_encoding_value.empty()) {
+        const auto accept_encoding = "Accept-Encoding: " + accept_encoding_value;
+        headers = curl_slist_append(headers, accept_encoding.c_str());
+    }
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     const auto code = curl_easy_perform(curl);
@@ -141,6 +162,10 @@ HttpResponse PerformCurlGet(CURL* curl, const Url& url, const Config& config) {
 
     long status_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    body = detail::DecodeHttpResponseBody(
+        std::move(body),
+        detail::FindHttpHeaderValue(response_headers, "content-encoding"),
+        config.content_encoding_decoders);
     return HttpResponse{status_code, std::move(body)};
 }
 
@@ -277,7 +302,9 @@ FdGuard ConnectTcp(const Url& url) {
     throw std::runtime_error("connect failed");
 }
 
-HttpResponse ParseHttpResponse(const std::string& raw) {
+HttpResponse ParseHttpResponse(
+    const std::string& raw,
+    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders) {
     const auto header_end = raw.find("\r\n\r\n");
     if (header_end == std::string::npos) {
         throw std::runtime_error("invalid HTTP response");
@@ -297,7 +324,12 @@ HttpResponse ParseHttpResponse(const std::string& raw) {
         throw std::runtime_error("invalid HTTP status line");
     }
 
-    return HttpResponse{status_code, raw.substr(header_end + 4)};
+    auto body = raw.substr(header_end + 4);
+    body = detail::DecodeHttpResponseBody(
+        std::move(body),
+        detail::FindHttpHeaderValue(raw.substr(0, header_end), "content-encoding"),
+        content_encoding_decoders);
+    return HttpResponse{status_code, std::move(body)};
 }
 
 } // namespace
@@ -318,6 +350,10 @@ HttpResponse CurlHttpClient::Get(const Url& url) const {
     request << "GET " << target << " HTTP/1.1\r\n"
             << "Host: " << url.Authority() << "\r\n"
             << "Connection: close\r\n";
+    const auto accept_encoding_value = detail::BuildAcceptEncodingValue(config_.content_encoding_decoders);
+    if (!accept_encoding_value.empty()) {
+        request << "Accept-Encoding: " << accept_encoding_value << "\r\n";
+    }
     if (!config_.user_agent.empty()) {
         request << "User-Agent: " << config_.user_agent << "\r\n";
     }
@@ -325,7 +361,9 @@ HttpResponse CurlHttpClient::Get(const Url& url) const {
 
     auto fd = ConnectTcp(url);
     SendAll(fd.get(), request.str());
-    return ParseHttpResponse(ReadAll(fd.get()));
+    return ParseHttpResponse(
+        ReadAll(fd.get()),
+        config_.content_encoding_decoders);
 }
 
 #endif
