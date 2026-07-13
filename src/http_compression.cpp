@@ -74,7 +74,7 @@ void DeflateBody(std::istream& input, std::ostream& output, int window_bits) {
     while (true) {
         input.read(input_buffer.data(), static_cast<std::streamsize>(input_buffer.size()));
         const auto read_size = input.gcount();
-        if (input.bad()) {
+        if (input.bad() || (input.fail() && !input.eof())) {
             throw std::runtime_error("failed to read HTTP request body");
         }
 
