@@ -17,11 +17,19 @@
 #include <unistd.h>
 
 #include <gtest/gtest.h>
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+#include <zlib.h>
 
+#include <array>
+#endif
 #include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstring>
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+#include <limits>
+#endif
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -141,6 +149,7 @@ struct SequencedHttpResponse {
     std::string reason = "OK";
     std::string body;
     std::chrono::milliseconds delay{0};
+    std::vector<std::pair<std::string, std::string>> headers;
 };
 
 class KeepAliveSequenceHttpServer {
@@ -295,8 +304,11 @@ private:
         }
         std::ostringstream text;
         text << "HTTP/1.1 " << response.status_code << " " << response.reason << "\r\n"
-             << "Content-Type: application/x-amz-json-1.0\r\n"
-             << "Content-Length: " << response.body.size() << "\r\n"
+             << "Content-Type: application/x-amz-json-1.0\r\n";
+        for (const auto& [name, value] : response.headers) {
+            text << name << ": " << value << "\r\n";
+        }
+        text << "Content-Length: " << response.body.size() << "\r\n"
              << "Connection: " << (keep_connection ? "keep-alive" : "close") << "\r\n"
              << "\r\n"
              << response.body;
@@ -326,6 +338,69 @@ std::string HostHeader(const std::string& request) {
     }
     return request.substr(start, end - start);
 }
+
+std::string ToLowerAscii(std::string value) {
+    for (auto& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+std::string CompressBody(const std::string& body, int window_bits) {
+    if (body.size() > std::numeric_limits<uInt>::max()) {
+        throw std::runtime_error("body too large to compress");
+    }
+
+    z_stream stream{};
+    const auto init_code = deflateInit2(
+        &stream,
+        Z_BEST_SPEED,
+        Z_DEFLATED,
+        window_bits,
+        8,
+        Z_DEFAULT_STRATEGY);
+    if (init_code != Z_OK) {
+        throw std::runtime_error("deflateInit2 failed");
+    }
+
+    struct DeflateGuard {
+        z_stream* stream;
+        ~DeflateGuard() {
+            deflateEnd(stream);
+        }
+    } guard{&stream};
+
+    auto* input = reinterpret_cast<const Bytef*>(body.data());
+    stream.next_in = const_cast<Bytef*>(input);
+    stream.avail_in = static_cast<uInt>(body.size());
+
+    std::array<char, 8192> buffer{};
+    std::string output;
+    while (true) {
+        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+        stream.avail_out = static_cast<uInt>(buffer.size());
+
+        const auto code = deflate(&stream, Z_FINISH);
+        const auto produced = buffer.size() - stream.avail_out;
+        output.append(buffer.data(), produced);
+
+        if (code == Z_STREAM_END) {
+            return output;
+        }
+        if (code != Z_OK) {
+            throw std::runtime_error("deflate failed");
+        }
+    }
+}
+
+SequencedHttpResponse GzipJsonResponse(const std::string& json) {
+    SequencedHttpResponse response;
+    response.body = CompressBody(json, MAX_WBITS + 16);
+    response.headers = {{"Content-Encoding", "gzip"}};
+    return response;
+}
+#endif
 
 std::string DescribeTableResponse(const std::string& table_name,
                                   const std::string& partition_key_name) {
@@ -700,6 +775,99 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryRotatesNodesAcrossRetries) {
     EXPECT_NE(first_host, "");
     EXPECT_NE(second_host, "");
     EXPECT_NE(first_host, second_host);
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryDecodesGzipResponses) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    KeepAliveSequenceHttpServer server({
+        GzipJsonResponse(R"({"TableNames":[]})"),
+    });
+
+    Config cfg;
+    cfg.port = server.Port();
+    cfg.scheme = "http";
+    cfg.aws_region = "us-east-1";
+    cfg.credentials = {"alternator", "secret"};
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.http_client_timeout = std::chrono::milliseconds{2000};
+    cfg.connect_timeout = std::chrono::milliseconds{1000};
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppCompressionTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    Aws::DynamoDB::Model::ListTablesRequest request;
+    auto outcome = client.ListTables(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto request_text = ToLowerAscii(server.Requests()[0]);
+    EXPECT_NE(request_text.find("accept-encoding: gzip, deflate"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotAdvertiseCompressionForNonAlternatorEndpoints) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", R"({"TableNames":[]})"},
+    });
+
+    Config cfg;
+    cfg.port = server.Port();
+    cfg.scheme = "http";
+    cfg.aws_region = "us-east-1";
+    cfg.credentials = {"alternator", "secret"};
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.http_client_timeout = std::chrono::milliseconds{2000};
+    cfg.connect_timeout = std::chrono::milliseconds{1000};
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+
+    aws::DynamoDBHelper helper({"node1.example.com"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.endpointOverride = Aws::String(("http://127.0.0.1:" + std::to_string(server.Port())).c_str());
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppCompressionHeaderTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, client_config);
+
+    Aws::DynamoDB::Model::ListTablesRequest request;
+    auto outcome = client.ListTables(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto request_text = ToLowerAscii(server.Requests()[0]);
+    EXPECT_EQ(request_text.find("accept-encoding:"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
 }
 
 TEST(AwsDynamoDBHelper, HandlesRepeatedNonSuccessDynamoDbResponses) {

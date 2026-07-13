@@ -11,7 +11,7 @@ make build
 make test
 ```
 
-The core target requires C++17. The default discovery HTTP client uses libcurl when CMake can find the libcurl development package; otherwise it falls back to a small POSIX plain-HTTP client. HTTPS discovery requires libcurl or a caller-provided `HttpClient`. Tests use GoogleTest when it is installed. The AWS adapter target is built only when CMake can find `AWSSDK` with the `dynamodb` component. `make test-integration` requires the AWS adapter and its tests by configuring with `ALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON`.
+The core target requires C++17. The default discovery HTTP client uses libcurl when CMake can find the libcurl development package; otherwise it falls back to a small POSIX plain-HTTP client. HTTPS discovery requires libcurl or a caller-provided `HttpClient`. Built-in gzip and deflate response decoding is available when CMake finds zlib; callers can provide a custom decoder for other content encodings or for builds without zlib. Tests use GoogleTest when it is installed. The AWS adapter target is built only when CMake can find `AWSSDK` with the `dynamodb` component. `make test-integration` requires the AWS adapter and its tests by configuring with `ALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON`.
 
 ## Core Usage
 
@@ -86,6 +86,71 @@ Alternator node discovery or load balancing.
 The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by default. AWS SDK for C++ resolves that endpoint once for a retried operation, so `DynamoDBHelper::ApplyToSDKOptions()` can also install a process-wide HTTP client factory before `Aws::InitAPI()`. That factory delegates to the SDK HTTP client and rotates only requests already aimed at the helper's Alternator endpoints.
 
 The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook for retry-aware endpoint rewriting, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic middleware features such as transparent header optimization and request-content-based endpoint rewriting are not available in the same form. The core library does provide deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
+
+### HTTP Response Compression
+
+Response compression is disabled by default. When configured, the built-in
+discovery client sends the configured `Accept-Encoding` value on `/localnodes`
+requests. If zlib was found at build time, configuring
+`ZlibContentEncodingDecoder` enables matching `Content-Encoding: gzip` and
+`Content-Encoding: deflate` responses.
+
+For DynamoDB operations, response compression is supported when
+`DynamoDBHelper::ApplyToSDKOptions()` installs the Alternator HTTP client
+factory before `Aws::InitAPI()`. The factory advertises the configured response
+encodings only for requests routed to Alternator nodes and decodes compressed
+responses before the AWS SDK parses the JSON body. A DynamoDB client that only
+uses the endpoint provider does not get this factory-level response decoding.
+
+Configure content-encoding decoders before constructing the helper or discovery
+client. The default empty decoder list disables compression advertisement.
+Each decoder advertises the encodings it supports, and each advertised encoding
+may be owned by only one decoder. Responses using an encoding outside the
+configured decoder list are rejected.
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.content_encoding_decoders.push_back(
+    std::make_shared<scylladb::alternator::ZlibContentEncodingDecoder>());
+```
+
+When zlib is available, `ZlibContentEncodingDecoder` implements gzip and deflate
+decoding and advertises both encodings by default. Pass a subset to advertise
+only one of them, for example `ZlibContentEncodingDecoder({"gzip"})`. zlib is
+optional at build time; without it, applications can still provide their own
+decoder implementations.
+
+For generic content-encoding support, provide another decoder. Its
+`AcceptedResponseEncodings()` method declares the encodings to advertise, and
+`Decode()` receives the encoded response body and the specific encoding token to
+decode:
+
+```cpp
+class BrotliDecoder final : public scylladb::alternator::HttpContentEncodingDecoder {
+public:
+    std::vector<std::string> AcceptedResponseEncodings() const override {
+        return {"br"};
+    }
+
+    std::string Decode(std::string body, const std::string& content_encoding) const override {
+        // Decode body according to content_encoding.
+        return body;
+    }
+};
+
+scylladb::alternator::Config cfg;
+cfg.content_encoding_decoders.push_back(std::make_shared<BrotliDecoder>());
+```
+
+To request gzip and zstd, configure zlib for gzip only and add a zstd decoder:
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.content_encoding_decoders.push_back(
+    std::make_shared<scylladb::alternator::ZlibContentEncodingDecoder>(
+        std::vector<std::string>{"gzip"}));
+cfg.content_encoding_decoders.push_back(std::make_shared<ZstdDecoder>());
+```
 
 ### DynamoDB HTTP Connections
 

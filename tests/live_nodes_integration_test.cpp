@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -72,6 +73,20 @@ TEST(AlternatorLiveNodesIntegration, RoutingFallbackLearnsNodes) {
     const auto discovered = Hosts(nodes.GetNodes());
     ASSERT_FALSE(discovered.empty());
     EXPECT_NE(discovered, IntegrationNodes());
+}
+
+TEST(AlternatorLiveNodesIntegration, CompressedHttpDiscoveryWorks) {
+    REQUIRE_INTEGRATION();
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+
+    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+
+    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+    EXPECT_FALSE(nodes.GetNodes().empty());
 }
 
 TEST(AlternatorLiveNodesIntegration, RejectsWrongDatacenter) {

@@ -1,5 +1,7 @@
 #include <scylladb/alternator/aws/dynamodb_helper.h>
 
+#include "http_compression.h"
+
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/client/CoreErrors.h>
@@ -9,6 +11,7 @@
 #include <aws/core/http/HttpTypes.h>
 #include <aws/core/http/curl/CurlHttpClient.h>
 #include <aws/core/http/standard/StandardHttpRequest.h>
+#include <aws/core/http/standard/StandardHttpResponse.h>
 #include <aws/core/utils/logging/LogMacros.h>
 #include <aws/dynamodb/model/AttributeAction.h>
 #include <aws/dynamodb/model/AttributeValueUpdate.h>
@@ -26,6 +29,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <ios>
+#include <istream>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -108,6 +114,56 @@ NodeHealthObservation ObservationFromHttpResult(const std::shared_ptr<Aws::Http:
     return NodeHealthObservation::Success;
 }
 
+std::string ReadResponseBody(Aws::IOStream& body) {
+    body.clear();
+    body.seekg(0, std::ios::beg);
+    return std::string(std::istreambuf_iterator<char>(body), std::istreambuf_iterator<char>());
+}
+
+void WriteResponseBody(Aws::IOStream& body, const std::string& value) {
+    if (!value.empty()) {
+        body.write(value.data(), static_cast<std::streamsize>(value.size()));
+    }
+    body.flush();
+    body.clear();
+    body.seekg(0, std::ios::beg);
+}
+
+std::shared_ptr<Aws::Http::HttpResponse> DecodeCompressedAwsResponse(
+    const std::shared_ptr<Aws::Http::HttpRequest>& request,
+    const std::shared_ptr<Aws::Http::HttpResponse>& response,
+    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders) {
+    if (!request || !response || response->HasClientError() ||
+        !response->HasHeader(Aws::Http::CONTENT_ENCODING_HEADER)) {
+        return response;
+    }
+
+    const auto content_encoding = std::string(response->GetHeader(Aws::Http::CONTENT_ENCODING_HEADER).c_str());
+    auto decoded_body = detail::DecodeHttpResponseBody(
+        ReadResponseBody(response->GetResponseBody()),
+        content_encoding,
+        content_encoding_decoders);
+
+    auto decoded_response = Aws::MakeShared<Aws::Http::Standard::StandardHttpResponse>(
+        kAllocationTag,
+        request);
+    decoded_response->SetResponseCode(response->GetResponseCode());
+
+    for (const auto& header : response->GetHeaders()) {
+        const auto header_name = detail::ToLowerAscii(std::string(header.first.c_str()));
+        if (header_name == Aws::Http::CONTENT_ENCODING_HEADER ||
+            header_name == Aws::Http::CONTENT_LENGTH_HEADER) {
+            continue;
+        }
+        decoded_response->AddHeader(header.first, header.second);
+    }
+    decoded_response->AddHeader(
+        Aws::Http::CONTENT_LENGTH_HEADER,
+        Aws::String(std::to_string(decoded_body.size()).c_str()));
+    WriteResponseBody(decoded_response->GetResponseBody(), decoded_body);
+    return decoded_response;
+}
+
 bool IsFirstSdkAttempt(const Aws::Http::HttpRequest& request) {
     if (!request.HasHeader(Aws::Http::SDK_REQUEST_HEADER)) {
         return false;
@@ -151,9 +207,12 @@ class AlternatorHttpClient final : public Aws::Http::HttpClient {
 public:
     AlternatorHttpClient(std::shared_ptr<AlternatorLiveNodes> nodes,
                          std::uint16_t endpoint_override_port,
+                         std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders,
                          std::shared_ptr<Aws::Http::HttpClient> delegate)
         : nodes_(std::move(nodes))
         , endpoint_override_port_(endpoint_override_port)
+        , content_encoding_decoders_(std::move(content_encoding_decoders))
+        , accept_encoding_value_(detail::BuildAcceptEncodingValue(content_encoding_decoders_))
         , delegate_(std::move(delegate)) {
         if (!nodes_) {
             throw std::invalid_argument("nodes must not be null");
@@ -168,8 +227,17 @@ public:
         Aws::Utils::RateLimits::RateLimiterInterface* read_limiter = nullptr,
         Aws::Utils::RateLimits::RateLimiterInterface* write_limiter = nullptr) const override {
         auto node = SelectAttemptNode(request, nodes_, endpoint_override_port_);
+        if (!node.Empty() && !accept_encoding_value_.empty()) {
+            request->SetAcceptEncoding(Aws::String(accept_encoding_value_.c_str()));
+        }
 
         auto response = delegate_->MakeRequest(request, read_limiter, write_limiter);
+        if (!node.Empty()) {
+            response = DecodeCompressedAwsResponse(
+                request,
+                response,
+                content_encoding_decoders_);
+        }
         if (!node.Empty()) {
             nodes_->ReportNodeResult(node, ObservationFromHttpResult(response));
         }
@@ -183,15 +251,19 @@ public:
 private:
     std::shared_ptr<AlternatorLiveNodes> nodes_;
     std::uint16_t endpoint_override_port_ = 0;
+    std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders_;
+    std::string accept_encoding_value_;
     std::shared_ptr<Aws::Http::HttpClient> delegate_;
 };
 
 class AlternatorHttpClientFactory final : public Aws::Http::HttpClientFactory {
 public:
     AlternatorHttpClientFactory(std::shared_ptr<AlternatorLiveNodes> nodes,
-                                std::uint16_t endpoint_override_port)
+                                std::uint16_t endpoint_override_port,
+                                std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders)
         : nodes_(std::move(nodes))
-        , endpoint_override_port_(endpoint_override_port) {
+        , endpoint_override_port_(endpoint_override_port)
+        , content_encoding_decoders_(std::move(content_encoding_decoders)) {
         if (!nodes_) {
             throw std::invalid_argument("nodes must not be null");
         }
@@ -208,6 +280,7 @@ public:
             kAllocationTag,
             nodes_,
             endpoint_override_port_,
+            content_encoding_decoders_,
             std::move(delegate));
     }
 
@@ -241,6 +314,7 @@ public:
 private:
     std::shared_ptr<AlternatorLiveNodes> nodes_;
     std::uint16_t endpoint_override_port_ = 0;
+    std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders_;
 };
 
 std::string EndpointOverride(std::uint16_t port, const std::string& scheme) {
@@ -249,11 +323,13 @@ std::string EndpointOverride(std::uint16_t port, const std::string& scheme) {
 
 std::shared_ptr<Aws::Http::HttpClientFactory> NewAlternatorHttpClientFactory(
     std::shared_ptr<AlternatorLiveNodes> nodes,
-    std::uint16_t endpoint_override_port) {
+    std::uint16_t endpoint_override_port,
+    std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders) {
     return Aws::MakeShared<AlternatorHttpClientFactory>(
         kAllocationTag,
         std::move(nodes),
-        endpoint_override_port);
+        endpoint_override_port,
+        std::move(content_encoding_decoders));
 }
 
 class FixedEndpointProvider final : public Aws::DynamoDB::Endpoint::DynamoDBEndpointProviderBase {
@@ -662,7 +738,10 @@ std::shared_ptr<AlternatorEndpointProvider> DynamoDBHelper::NewEndpointProvider(
 }
 
 std::shared_ptr<Aws::Http::HttpClientFactory> DynamoDBHelper::NewHttpClientFactory() const {
-    return NewAlternatorHttpClientFactory(nodes_, config_.port);
+    return NewAlternatorHttpClientFactory(
+        nodes_,
+        config_.port,
+        config_.content_encoding_decoders);
 }
 
 Aws::DynamoDB::DynamoDBClientConfiguration DynamoDBHelper::NewClientConfiguration() const {
@@ -692,8 +771,9 @@ std::shared_ptr<AlternatorLiveNodes> DynamoDBHelper::Nodes() const {
 void DynamoDBHelper::ApplyToSDKOptions(Aws::SDKOptions& options) const {
     auto nodes = nodes_;
     const auto port = config_.port;
-    options.httpOptions.httpClientFactory_create_fn = [nodes, port] {
-        return NewAlternatorHttpClientFactory(nodes, port);
+    const auto content_encoding_decoders = config_.content_encoding_decoders;
+    options.httpOptions.httpClientFactory_create_fn = [nodes, port, content_encoding_decoders] {
+        return NewAlternatorHttpClientFactory(nodes, port, content_encoding_decoders);
     };
 }
 

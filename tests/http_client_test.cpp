@@ -6,9 +6,17 @@
 #include <unistd.h>
 
 #include <gtest/gtest.h>
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+#include <zlib.h>
 
+#include <array>
+#endif
 #include <atomic>
 #include <cstring>
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+#include <limits>
+#endif
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -22,7 +30,9 @@ namespace {
 
 class LocalHttpServer {
 public:
-    LocalHttpServer() {
+    explicit LocalHttpServer(std::string body = "[\"node1.local\"]", std::string content_encoding = {})
+        : body_(std::move(body))
+        , content_encoding_(std::move(content_encoding)) {
         fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) {
             throw std::runtime_error("socket failed");
@@ -60,13 +70,17 @@ public:
                 request_.assign(buffer, static_cast<std::size_t>(n));
             }
 
-            const std::string response =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Length: 15\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "[\"node1.local\"]";
-            send(client, response.data(), response.size(), 0);
+            std::ostringstream response;
+            response << "HTTP/1.1 200 OK\r\n";
+            if (!content_encoding_.empty()) {
+                response << "Content-Encoding: " << content_encoding_ << "\r\n";
+            }
+            response << "Content-Length: " << body_.size() << "\r\n"
+                     << "Connection: close\r\n"
+                     << "\r\n"
+                     << body_;
+            const auto response_text = response.str();
+            send(client, response_text.data(), response_text.size(), 0);
             close(client);
         });
     }
@@ -91,6 +105,8 @@ public:
 private:
     int fd_ = -1;
     std::uint16_t port_ = 0;
+    std::string body_;
+    std::string content_encoding_;
     std::string request_;
     std::thread worker_;
 };
@@ -231,6 +247,72 @@ private:
     std::thread worker_;
 };
 
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+std::string CompressBody(const std::string& body, int window_bits) {
+    if (body.size() > std::numeric_limits<uInt>::max()) {
+        throw std::runtime_error("body too large to compress");
+    }
+
+    z_stream stream{};
+    const auto init_code = deflateInit2(
+        &stream,
+        Z_BEST_SPEED,
+        Z_DEFLATED,
+        window_bits,
+        8,
+        Z_DEFAULT_STRATEGY);
+    if (init_code != Z_OK) {
+        throw std::runtime_error("deflateInit2 failed");
+    }
+
+    struct DeflateGuard {
+        z_stream* stream;
+        ~DeflateGuard() {
+            deflateEnd(stream);
+        }
+    } guard{&stream};
+
+    auto* input = reinterpret_cast<const Bytef*>(body.data());
+    stream.next_in = const_cast<Bytef*>(input);
+    stream.avail_in = static_cast<uInt>(body.size());
+
+    std::array<char, 8192> buffer{};
+    std::string output;
+    while (true) {
+        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+        stream.avail_out = static_cast<uInt>(buffer.size());
+
+        const auto code = deflate(&stream, Z_FINISH);
+        const auto produced = buffer.size() - stream.avail_out;
+        output.append(buffer.data(), produced);
+
+        if (code == Z_STREAM_END) {
+            return output;
+        }
+        if (code != Z_OK) {
+            throw std::runtime_error("deflate failed");
+        }
+    }
+}
+#endif
+
+class TestContentEncodingDecoder final : public HttpContentEncodingDecoder {
+public:
+    explicit TestContentEncodingDecoder(std::vector<std::string> accepted_encodings = {"br"})
+        : accepted_encodings_(std::move(accepted_encodings)) {}
+
+    std::vector<std::string> AcceptedResponseEncodings() const override {
+        return accepted_encodings_;
+    }
+
+    std::string Decode(std::string body, const std::string& content_encoding) const override {
+        return content_encoding + ":" + body;
+    }
+
+private:
+    std::vector<std::string> accepted_encodings_;
+};
+
 } // namespace
 
 TEST(HttpClient, PerformsPlainHttpGet) {
@@ -245,6 +327,165 @@ TEST(HttpClient, PerformsPlainHttpGet) {
     EXPECT_EQ(response.status_code, 200);
     EXPECT_EQ(response.body, "[\"node1.local\"]");
     EXPECT_NE(server.Request().find("GET /localnodes?dc=dc1 HTTP/1.1"), std::string::npos);
+    EXPECT_EQ(server.Request().find("Accept-Encoding:"), std::string::npos);
+}
+
+TEST(HttpClient, RequestsAndDecodesGzipResponse) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    const std::string body = "[\"node1.local\"]";
+    LocalHttpServer server(CompressBody(body, MAX_WBITS + 16), "gzip");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, body);
+    EXPECT_NE(server.Request().find("Accept-Encoding: gzip"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(HttpClient, CanUseExplicitZlibContentEncodingDecoder) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    const std::string body = "[\"node1.local\"]";
+    LocalHttpServer server(CompressBody(body, MAX_WBITS + 16), "gzip");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, body);
+    EXPECT_NE(server.Request().find("Accept-Encoding: gzip"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(HttpClient, CanAdvertiseZlibContentEncodingSubset) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    const std::string body = "[\"node1.local\"]";
+    LocalHttpServer server(CompressBody(body, MAX_WBITS + 16), "gzip");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {
+        std::make_shared<ZlibContentEncodingDecoder>(std::vector<std::string>{"gzip"}),
+    };
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, body);
+    EXPECT_NE(server.Request().find("Accept-Encoding: gzip"), std::string::npos);
+    EXPECT_EQ(server.Request().find("deflate"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(HttpClient, RequestsAndDecodesDeflateResponse) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    const std::string body = "[\"node1.local\"]";
+    LocalHttpServer server(CompressBody(body, MAX_WBITS), "deflate");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, body);
+    EXPECT_NE(server.Request().find("Accept-Encoding: gzip, deflate"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(HttpClient, CanAdvertiseGzipAndCustomZstdResponseEncodings) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    LocalHttpServer server("encoded-body", "zstd");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {
+        std::make_shared<ZlibContentEncodingDecoder>(std::vector<std::string>{"gzip"}),
+        std::make_shared<TestContentEncodingDecoder>(std::vector<std::string>{"zstd"}),
+    };
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, "zstd:encoded-body");
+    EXPECT_NE(server.Request().find("Accept-Encoding: gzip, zstd"), std::string::npos);
+    EXPECT_EQ(server.Request().find("deflate"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(HttpClient, RejectsUnacceptedResponseEncoding) {
+    LocalHttpServer server("encoded", "deflate");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {std::make_shared<TestContentEncodingDecoder>(std::vector<std::string>{"gzip"})};
+    CurlHttpClient client(cfg);
+
+    EXPECT_THROW(
+        client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes")),
+        std::runtime_error);
+}
+
+TEST(HttpClient, UsesCustomContentEncodingDecoder) {
+    LocalHttpServer server("encoded-body", "br");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.content_encoding_decoders = {std::make_shared<TestContentEncodingDecoder>()};
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, "br:encoded-body");
+    EXPECT_NE(server.Request().find("Accept-Encoding: br"), std::string::npos);
+}
+
+TEST(HttpClient, RejectsUnsupportedZlibResponseEncoding) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    EXPECT_THROW(
+        ZlibContentEncodingDecoder(std::vector<std::string>{"zstd"}),
+        std::invalid_argument);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(HttpClient, DoesNotAdvertiseResponseCompressionByDefault) {
+    LocalHttpServer server;
+
+    Config cfg;
+    cfg.scheme = "http";
+    CurlHttpClient client(cfg);
+
+    auto response = client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes"));
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, "[\"node1.local\"]");
+    EXPECT_EQ(server.Request().find("Accept-Encoding:"), std::string::npos);
 }
 
 TEST(HttpClient, ReusesDiscoveryConnectionByDefaultWithCurl) {

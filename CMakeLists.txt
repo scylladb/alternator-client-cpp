@@ -23,11 +23,13 @@ endif()
 find_package(CURL QUIET)
 find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
+find_package(ZLIB QUIET)
 
 add_library(alternator_client_cpp
     src/attribute_value.cpp
     src/config.cpp
     src/go_random.cpp
+    src/http_compression.cpp
     src/http_client.cpp
     src/key_route_affinity.cpp
     src/live_nodes.cpp
@@ -48,6 +50,13 @@ target_link_libraries(alternator_client_cpp
     PUBLIC
         Threads::Threads)
 
+if(ZLIB_FOUND)
+    target_link_libraries(alternator_client_cpp PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(alternator_client_cpp PUBLIC SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB=1)
+else()
+    message(STATUS "ZLIB not found; gzip/deflate response decoding requires a caller-provided HttpContentEncodingDecoder")
+endif()
+
 if(CURL_FOUND)
     target_link_libraries(alternator_client_cpp PUBLIC CURL::libcurl)
     target_compile_definitions(alternator_client_cpp PUBLIC SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL=1)
@@ -60,17 +69,7 @@ else()
 endif()
 
 if(ALTERNATOR_CLIENT_CPP_ENABLE_AWS)
-    find_package(ZLIB QUIET)
-    if(ZLIB_FOUND)
-        find_package(AWSSDK QUIET COMPONENTS dynamodb)
-    else()
-        set(AWSSDK_FOUND FALSE)
-        if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS)
-            message(FATAL_ERROR "ZLIB not found; AWS DynamoDB adapter target cannot be built")
-        else()
-            message(STATUS "ZLIB not found; AWS DynamoDB adapter target will not be built")
-        endif()
-    endif()
+    find_package(AWSSDK QUIET COMPONENTS dynamodb)
     if(AWSSDK_FOUND)
         add_library(alternator_client_cpp_aws
             src/aws_dynamodb_helper.cpp)
