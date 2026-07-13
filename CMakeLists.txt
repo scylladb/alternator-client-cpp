@@ -106,6 +106,7 @@ if(ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
 
         set(ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
             tests/attribute_value_test.cpp
+            tests/header_optimization_test.cpp
             tests/http_client_test.cpp
             tests/key_route_affinity_test.cpp
             tests/live_nodes_integration_test.cpp

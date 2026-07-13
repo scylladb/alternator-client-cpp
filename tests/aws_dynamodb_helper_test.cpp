@@ -29,6 +29,7 @@
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
 #endif
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -344,6 +345,33 @@ std::string ToLowerAscii(std::string value) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     }
     return value;
+}
+
+std::map<std::string, std::string> RequestHeaders(const std::string& request) {
+    std::map<std::string, std::string> headers;
+    const auto header_end = request.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return headers;
+    }
+
+    std::istringstream lines(request.substr(0, header_end));
+    std::string line;
+    std::getline(lines, line);
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        auto value = line.substr(colon + 1);
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+            value.erase(value.begin());
+        }
+        headers.emplace(ToLowerAscii(line.substr(0, colon)), std::move(value));
+    }
+    return headers;
 }
 
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
@@ -775,6 +803,133 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryRotatesNodesAcrossRetries) {
     EXPECT_NE(first_host, "");
     EXPECT_NE(second_host, "");
     EXPECT_NE(first_host, second_host);
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryOptimizesSignedRequestHeaders) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", R"({"TableNames":[]})"},
+    });
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.header_optimization = std::make_shared<DefaultHeaderOptimization>();
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppHeaderOptimizationTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    Aws::DynamoDB::Model::ListTablesRequest request;
+    auto outcome = client.ListTables(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    EXPECT_NE(headers.find("host"), headers.end());
+    EXPECT_NE(headers.find("content-length"), headers.end());
+    EXPECT_NE(headers.find("x-amz-target"), headers.end());
+    EXPECT_NE(headers.find("authorization"), headers.end());
+    EXPECT_NE(headers.find("x-amz-date"), headers.end());
+    EXPECT_NE(headers.find("user-agent"), headers.end());
+    EXPECT_EQ(headers.find("content-type"), headers.end());
+    EXPECT_EQ(headers.find("amz-sdk-invocation-id"), headers.end());
+    EXPECT_EQ(headers.find("amz-sdk-request"), headers.end());
+    EXPECT_EQ(headers.find("x-amz-content-sha256"), headers.end());
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryOmitsAuthHeadersWhenCredentialsAreNotConfigured) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", R"({"TableNames":[]})"},
+    });
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.credentials = {};
+    cfg.header_optimization = std::make_shared<DefaultHeaderOptimization>();
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppHeaderOptimizationNoConfiguredCredentialsTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("external", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    Aws::DynamoDB::Model::ListTablesRequest request;
+    auto outcome = client.ListTables(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    EXPECT_NE(headers.find("host"), headers.end());
+    EXPECT_NE(headers.find("content-length"), headers.end());
+    EXPECT_NE(headers.find("x-amz-target"), headers.end());
+    EXPECT_EQ(headers.find("authorization"), headers.end());
+    EXPECT_EQ(headers.find("x-amz-date"), headers.end());
+    EXPECT_NE(headers.find("user-agent"), headers.end());
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryUsesCustomOptimizedHeaderAllowlist) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", R"({"TableNames":[]})"},
+    });
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
+        "Host",
+        "X-Amz-Target",
+        "Content-Length",
+    });
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppCustomHeaderOptimizationTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    Aws::DynamoDB::Model::ListTablesRequest request;
+    auto outcome = client.ListTables(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    EXPECT_NE(headers.find("host"), headers.end());
+    EXPECT_NE(headers.find("content-length"), headers.end());
+    EXPECT_NE(headers.find("x-amz-target"), headers.end());
+    EXPECT_EQ(headers.find("authorization"), headers.end());
+    EXPECT_EQ(headers.find("x-amz-date"), headers.end());
+    EXPECT_EQ(headers.find("user-agent"), headers.end());
+    EXPECT_EQ(headers.find("content-type"), headers.end());
 }
 
 TEST(AwsDynamoDBHelper, HttpClientFactoryDecodesGzipResponses) {
