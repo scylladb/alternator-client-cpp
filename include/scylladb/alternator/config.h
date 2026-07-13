@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,7 +31,12 @@ public:
     virtual ~HttpRequestCompressor() = default;
 
     [[nodiscard]] virtual std::string ContentEncoding() const = 0;
-    [[nodiscard]] virtual std::string Compress(std::string body) const = 0;
+    // Returns false to leave the request uncompressed, for example when
+    // input_size is below an implementation-defined minimum.
+    [[nodiscard]] virtual bool Compress(
+        std::istream& input,
+        std::uint64_t input_size,
+        std::ostream& output) const = 0;
 };
 
 class ZlibContentEncodingDecoder final : public HttpContentEncodingDecoder {
@@ -46,10 +52,16 @@ private:
 
 class GzipRequestCompressor final : public HttpRequestCompressor {
 public:
-    GzipRequestCompressor();
+    explicit GzipRequestCompressor(std::uint64_t min_size_bytes = 1024);
 
     [[nodiscard]] std::string ContentEncoding() const override;
-    [[nodiscard]] std::string Compress(std::string body) const override;
+    [[nodiscard]] bool Compress(
+        std::istream& input,
+        std::uint64_t input_size,
+        std::ostream& output) const override;
+
+private:
+    std::uint64_t min_size_bytes_ = 0;
 };
 
 struct HeaderOptimizationContext {

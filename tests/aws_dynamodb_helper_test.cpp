@@ -523,6 +523,35 @@ Aws::DynamoDB::Model::AttributeValue AwsStringValue(const std::string& value) {
     return out;
 }
 
+Aws::DynamoDB::Model::PutItemRequest NewPutItemRequest(std::string payload = "created") {
+    Aws::DynamoDB::Model::PutItemRequest request;
+    request.SetTableName("orders");
+    request.AddItem("id", AwsStringValue("order-123"));
+    request.AddItem("payload", AwsStringValue(payload));
+    return request;
+}
+
+class DecliningRequestCompressor final : public HttpRequestCompressor {
+public:
+    [[nodiscard]] std::string ContentEncoding() const override {
+        return "gzip";
+    }
+
+    [[nodiscard]] bool Compress(
+        std::istream& input,
+        std::uint64_t,
+        std::ostream& output) const override {
+        char buffer[256];
+        while (input.read(buffer, static_cast<std::streamsize>(sizeof(buffer))) || input.gcount() > 0) {
+        }
+        if (input.bad()) {
+            throw std::runtime_error("failed to read request body");
+        }
+        output << "ignored";
+        return false;
+    }
+};
+
 std::string PartitionKeyForHost(const aws::DynamoDBHelper& helper,
                                 const std::string& table_name,
                                 const std::string& host) {
@@ -1104,10 +1133,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryCompressesGzipRequests) {
     Aws::Auth::AWSCredentials credentials("alternator", "secret");
     Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
 
-    Aws::DynamoDB::Model::PutItemRequest request;
-    request.SetTableName("orders");
-    request.AddItem("id", AwsStringValue("order-123"));
-    request.AddItem("payload", AwsStringValue("created"));
+    auto request = NewPutItemRequest(std::string(2048, 'x'));
     auto outcome = client.PutItem(request);
     EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
 
@@ -1124,14 +1150,115 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryCompressesGzipRequests) {
     const auto content_length = headers.find("content-length");
     ASSERT_NE(content_length, headers.end());
     EXPECT_EQ(content_length->second, std::to_string(body.size()));
+    EXPECT_EQ(headers.find("transfer-encoding"), headers.end());
     EXPECT_EQ(headers.find("x-amz-content-sha256"), headers.end());
+    EXPECT_EQ(headers.find("content-type"), headers.end());
 
     const auto decoded_body = DecompressBody(body, MAX_WBITS + 16);
     EXPECT_NE(decoded_body.find(R"("TableName":"orders")"), std::string::npos);
     EXPECT_NE(decoded_body.find(R"("S":"order-123")"), std::string::npos);
+    EXPECT_NE(decoded_body.find(std::string(2048, 'x')), std::string::npos);
 #else
     GTEST_SKIP() << "zlib support is not enabled";
 #endif
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsBelowMinimumSize) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+    });
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.request_compressor = std::make_shared<GzipRequestCompressor>();
+    cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
+        "Host",
+        "X-Amz-Target",
+        "Content-Length",
+    });
+
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppRequestCompressionMinimumSizeTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    auto request = NewPutItemRequest();
+    auto outcome = client.PutItem(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    const auto body = RequestBody(server.Requests()[0]);
+    EXPECT_EQ(headers.find("content-encoding"), headers.end());
+    const auto content_length = headers.find("content-length");
+    ASSERT_NE(content_length, headers.end());
+    EXPECT_EQ(content_length->second, std::to_string(body.size()));
+    EXPECT_EQ(headers.find("transfer-encoding"), headers.end());
+    EXPECT_EQ(headers.find("content-type"), headers.end());
+    EXPECT_NE(body.find(R"("TableName":"orders")"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryKeepsOriginalRequestWhenCompressorDeclinesAfterReading) {
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+    });
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.request_compressor = std::make_shared<DecliningRequestCompressor>();
+    cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
+        "Host",
+        "X-Amz-Target",
+        "Content-Length",
+    });
+
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppRequestCompressionDeclinedTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    auto request = NewPutItemRequest();
+    auto outcome = client.PutItem(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    const auto body = RequestBody(server.Requests()[0]);
+    EXPECT_EQ(headers.find("content-encoding"), headers.end());
+    const auto content_length = headers.find("content-length");
+    ASSERT_NE(content_length, headers.end());
+    EXPECT_EQ(content_length->second, std::to_string(body.size()));
+    EXPECT_EQ(headers.find("transfer-encoding"), headers.end());
+    EXPECT_EQ(body.find("ignored"), std::string::npos);
+    EXPECT_NE(body.find(R"("TableName":"orders")"), std::string::npos);
 }
 
 TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternatorEndpoints) {
@@ -1148,7 +1275,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternator
     cfg.nodes_list_update_period = std::chrono::milliseconds{0};
     cfg.http_client_timeout = std::chrono::milliseconds{2000};
     cfg.connect_timeout = std::chrono::milliseconds{1000};
-    cfg.request_compressor = std::make_shared<GzipRequestCompressor>();
+    cfg.request_compressor = std::make_shared<GzipRequestCompressor>(0);
 
     aws::DynamoDBHelper helper({"node1.example.com"}, cfg);
 
@@ -1167,10 +1294,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternator
     Aws::Auth::AWSCredentials credentials("alternator", "secret");
     Aws::DynamoDB::DynamoDBClient client(credentials, client_config);
 
-    Aws::DynamoDB::Model::PutItemRequest request;
-    request.SetTableName("orders");
-    request.AddItem("id", AwsStringValue("order-123"));
-    request.AddItem("payload", AwsStringValue("created"));
+    auto request = NewPutItemRequest();
     auto outcome = client.PutItem(request);
     EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
 

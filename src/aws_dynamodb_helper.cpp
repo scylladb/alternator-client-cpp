@@ -126,15 +126,6 @@ std::string ReadResponseBody(Aws::IOStream& body) {
     return std::string(std::istreambuf_iterator<char>(body), std::istreambuf_iterator<char>());
 }
 
-std::string ReadRequestBody(Aws::IOStream& body) {
-    body.clear();
-    body.seekg(0, std::ios::beg);
-    auto value = std::string(std::istreambuf_iterator<char>(body), std::istreambuf_iterator<char>());
-    body.clear();
-    body.seekg(0, std::ios::beg);
-    return value;
-}
-
 void WriteResponseBody(Aws::IOStream& body, const std::string& value) {
     if (!value.empty()) {
         body.write(value.data(), static_cast<std::streamsize>(value.size()));
@@ -144,15 +135,43 @@ void WriteResponseBody(Aws::IOStream& body, const std::string& value) {
     body.seekg(0, std::ios::beg);
 }
 
-std::shared_ptr<Aws::IOStream> NewRequestBodyStream(const std::string& value) {
+std::shared_ptr<Aws::IOStream> NewRequestBodyStream() {
     auto stream = Aws::MakeShared<Aws::StringStream>(kAllocationTag);
-    if (!value.empty()) {
-        stream->write(value.data(), static_cast<std::streamsize>(value.size()));
-    }
-    stream->flush();
-    stream->clear();
-    stream->seekg(0, std::ios::beg);
     return stream;
+}
+
+std::size_t PrepareOriginalRequestBodyForReading(Aws::IOStream& body) {
+    body.clear();
+    body.seekg(0, std::ios::end);
+    if (!body) {
+        throw std::runtime_error("HTTP request body is not seekable");
+    }
+
+    const auto size = body.tellg();
+    if (size == std::streampos(-1)) {
+        throw std::runtime_error("HTTP request body size is unavailable");
+    }
+
+    body.clear();
+    body.seekg(0, std::ios::beg);
+    if (!body) {
+        throw std::runtime_error("HTTP request body is not seekable");
+    }
+    return static_cast<std::size_t>(size);
+}
+
+std::size_t PrepareCompressedRequestBodyForReading(Aws::IOStream& body) {
+    body.flush();
+    const auto size = body.tellp();
+    if (size == std::streampos(-1)) {
+        throw std::runtime_error("compressed HTTP request body size is unavailable");
+    }
+    body.clear();
+    body.seekg(0, std::ios::beg);
+    if (!body) {
+        throw std::runtime_error("compressed HTTP request body is not seekable");
+    }
+    return static_cast<std::size_t>(size);
 }
 
 void CompressAwsRequestBody(
@@ -165,10 +184,26 @@ void CompressAwsRequestBody(
         return;
     }
 
-    const auto compressed_body = request_compressor->Compress(ReadRequestBody(*request->GetContentBody()));
-    request->AddContentBody(NewRequestBodyStream(compressed_body));
+    auto& original_body = *request->GetContentBody();
+    const auto original_body_size = PrepareOriginalRequestBodyForReading(original_body);
+
+    auto compressed_body = NewRequestBodyStream();
+    const auto compressed = request_compressor->Compress(
+        original_body,
+        original_body_size,
+        *compressed_body);
+    if (!compressed) {
+        original_body.clear();
+        original_body.seekg(0, std::ios::beg);
+        if (!original_body) {
+            throw std::runtime_error("HTTP request body is not seekable");
+        }
+        return;
+    }
+    const auto compressed_body_size = PrepareCompressedRequestBodyForReading(*compressed_body);
     request->SetContentEncoding(Aws::String(request_content_encoding.c_str()));
-    request->SetContentLength(Aws::String(std::to_string(compressed_body.size()).c_str()));
+    request->SetContentLength(Aws::String(std::to_string(compressed_body_size).c_str()));
+    request->AddContentBody(std::move(compressed_body));
     request->DeleteHeader("x-amz-content-sha256");
 }
 
@@ -325,7 +360,10 @@ public:
             request->SetAcceptEncoding(Aws::String(accept_encoding_value_.c_str()));
         }
         if (!node.Empty()) {
-            CompressAwsRequestBody(request, request_compressor_, request_content_encoding_);
+            CompressAwsRequestBody(
+                request,
+                request_compressor_,
+                request_content_encoding_);
             OptimizeRequestHeaders(request, header_optimization_);
         }
 

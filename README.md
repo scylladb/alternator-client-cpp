@@ -156,8 +156,11 @@ cfg.request_compressor =
 ```
 
 Only gzip request compression is built in. `GzipRequestCompressor` requires
-zlib at build time. The `HttpRequestCompressor` interface keeps request
-compression extensible for other HTTP content encodings.
+zlib at build time and skips bodies smaller than 1024 bytes by default. Pass a
+different minimum size, such as `GzipRequestCompressor(0)`, to control that
+policy. The `HttpRequestCompressor` interface owns the decision to compress and
+compresses from an input stream to an output stream so implementations do not
+need to copy the whole request body into an intermediate string.
 
 ### HTTP Response Compression
 
