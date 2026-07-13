@@ -42,9 +42,52 @@ struct ContentEncodingDecoderEntry {
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 [[nodiscard]] uInt CheckedZlibSize(std::size_t size) {
     if (size > std::numeric_limits<uInt>::max()) {
-        throw std::runtime_error("compressed HTTP response is too large");
+        throw std::runtime_error("HTTP content is too large for zlib");
     }
     return static_cast<uInt>(size);
+}
+
+[[nodiscard]] std::string DeflateBody(const std::string& body, int window_bits) {
+    z_stream stream{};
+    const auto init_code = deflateInit2(
+        &stream,
+        Z_DEFAULT_COMPRESSION,
+        Z_DEFLATED,
+        window_bits,
+        8,
+        Z_DEFAULT_STRATEGY);
+    if (init_code != Z_OK) {
+        throw std::runtime_error("deflateInit2 failed");
+    }
+
+    struct DeflateGuard {
+        z_stream* stream;
+        ~DeflateGuard() {
+            deflateEnd(stream);
+        }
+    } guard{&stream};
+
+    auto* input = reinterpret_cast<const Bytef*>(body.data());
+    stream.next_in = const_cast<Bytef*>(input);
+    stream.avail_in = CheckedZlibSize(body.size());
+
+    std::array<char, 8192> buffer{};
+    std::string output;
+    while (true) {
+        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+        stream.avail_out = static_cast<uInt>(buffer.size());
+
+        const auto code = deflate(&stream, Z_FINISH);
+        const auto produced = buffer.size() - stream.avail_out;
+        output.append(buffer.data(), produced);
+
+        if (code == Z_STREAM_END) {
+            return output;
+        }
+        if (code != Z_OK) {
+            throw std::runtime_error("failed to deflate HTTP request");
+        }
+    }
 }
 
 [[nodiscard]] std::string InflateBody(const std::string& body, int window_bits) {
@@ -117,6 +160,22 @@ struct ContentEncodingDecoderEntry {
     return encodings;
 }
 
+[[nodiscard]] std::string NormalizeRequestEncoding(
+    const std::shared_ptr<HttpContentEncodingEncoder>& content_encoding_encoder) {
+    if (!content_encoding_encoder) {
+        return {};
+    }
+
+    auto encoding = NormalizeResponseEncoding(content_encoding_encoder->ContentEncoding());
+    if (encoding.empty()) {
+        throw std::invalid_argument("content_encoding_encoder must not advertise an empty encoding");
+    }
+    if (encoding.find(',') != std::string::npos) {
+        throw std::invalid_argument("content_encoding_encoder must advertise exactly one encoding");
+    }
+    return encoding;
+}
+
 [[nodiscard]] std::vector<ContentEncodingDecoderEntry> BuildDecoderEntries(
     const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders) {
     std::vector<ContentEncodingDecoderEntry> entries;
@@ -174,6 +233,11 @@ struct ContentEncodingDecoderEntry {
 
 } // namespace
 
+std::string BuildContentEncodingValue(
+    const std::shared_ptr<HttpContentEncodingEncoder>& content_encoding_encoder) {
+    return NormalizeRequestEncoding(content_encoding_encoder);
+}
+
 std::string ToLowerAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
@@ -230,6 +294,25 @@ std::string FindHttpHeaderValue(const std::string& headers, const std::string& n
 } // namespace scylladb::alternator::detail
 
 namespace scylladb::alternator {
+
+GzipContentEncodingEncoder::GzipContentEncodingEncoder() {
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    throw std::invalid_argument("zlib request encoding is not available");
+#endif
+}
+
+std::string GzipContentEncodingEncoder::ContentEncoding() const {
+    return "gzip";
+}
+
+std::string GzipContentEncodingEncoder::Encode(std::string body) const {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    return detail::DeflateBody(body, MAX_WBITS + 16);
+#else
+    (void)body;
+    throw std::runtime_error("zlib request encoding is not available");
+#endif
+}
 
 ZlibContentEncodingDecoder::ZlibContentEncodingDecoder(std::vector<std::string> accepted_response_encodings)
     : accepted_response_encodings_(detail::NormalizeZlibResponseEncodings(std::move(accepted_response_encodings))) {}

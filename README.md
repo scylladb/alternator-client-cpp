@@ -140,6 +140,25 @@ Header optimization applies only to requests routed to known Alternator
 endpoints through the factory installed by `DynamoDBHelper::ApplyToSDKOptions()`
 before `Aws::InitAPI()`.
 
+### HTTP Request Compression
+
+Request compression is disabled by default. Configure a request content encoder
+before constructing `DynamoDBHelper`, then install the Alternator HTTP client
+factory with `DynamoDBHelper::ApplyToSDKOptions()` before `Aws::InitAPI()`.
+The factory compresses request bodies only for requests routed to known
+Alternator nodes and sets the matching `Content-Encoding` and `Content-Length`
+headers before sending the request.
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.content_encoding_encoder =
+    std::make_shared<scylladb::alternator::GzipContentEncodingEncoder>();
+```
+
+Only gzip request compression is built in. `GzipContentEncodingEncoder` requires
+zlib at build time. The `HttpContentEncodingEncoder` interface keeps request
+compression extensible for other content encodings.
+
 ### HTTP Response Compression
 
 Response compression is disabled by default. When configured, the built-in
@@ -378,6 +397,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - Reused libcurl discovery HTTP connections with an opt-out switch.
 - TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
 - Persistent AWS SDK DynamoDB HTTP connection pooling via `max_connections`.
+- Optional gzip request compression for AWS SDK DynamoDB requests routed through the Alternator HTTP client factory.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
 - Round-robin `NextNode()` and flat per-request query plans, including deterministic seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.

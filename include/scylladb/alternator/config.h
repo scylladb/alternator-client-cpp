@@ -25,6 +25,14 @@ public:
     [[nodiscard]] virtual std::string Decode(std::string body, const std::string& content_encoding) const = 0;
 };
 
+class HttpContentEncodingEncoder {
+public:
+    virtual ~HttpContentEncodingEncoder() = default;
+
+    [[nodiscard]] virtual std::string ContentEncoding() const = 0;
+    [[nodiscard]] virtual std::string Encode(std::string body) const = 0;
+};
+
 class ZlibContentEncodingDecoder final : public HttpContentEncodingDecoder {
 public:
     explicit ZlibContentEncodingDecoder(std::vector<std::string> accepted_response_encodings = {"gzip", "deflate"});
@@ -34,6 +42,14 @@ public:
 
 private:
     std::vector<std::string> accepted_response_encodings_;
+};
+
+class GzipContentEncodingEncoder final : public HttpContentEncodingEncoder {
+public:
+    GzipContentEncodingEncoder();
+
+    [[nodiscard]] std::string ContentEncoding() const override;
+    [[nodiscard]] std::string Encode(std::string body) const override;
 };
 
 struct HeaderOptimizationContext {
@@ -87,6 +103,7 @@ struct Config {
 
     unsigned max_connections = 100;
     bool reuse_discovery_connections = true;
+    std::shared_ptr<HttpContentEncodingEncoder> content_encoding_encoder;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders;
     std::string user_agent = "scylladb-alternator-client-cpp/devel";
     std::shared_ptr<HeaderOptimization> header_optimization;

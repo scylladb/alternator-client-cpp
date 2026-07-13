@@ -374,6 +374,14 @@ std::map<std::string, std::string> RequestHeaders(const std::string& request) {
     return headers;
 }
 
+std::string RequestBody(const std::string& request) {
+    const auto header_end = request.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return {};
+    }
+    return request.substr(header_end + 4);
+}
+
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 std::string CompressBody(const std::string& body, int window_bits) {
     if (body.size() > std::numeric_limits<uInt>::max()) {
@@ -418,6 +426,47 @@ std::string CompressBody(const std::string& body, int window_bits) {
         }
         if (code != Z_OK) {
             throw std::runtime_error("deflate failed");
+        }
+    }
+}
+
+std::string DecompressBody(const std::string& body, int window_bits) {
+    if (body.size() > std::numeric_limits<uInt>::max()) {
+        throw std::runtime_error("body too large to decompress");
+    }
+
+    z_stream stream{};
+    const auto init_code = inflateInit2(&stream, window_bits);
+    if (init_code != Z_OK) {
+        throw std::runtime_error("inflateInit2 failed");
+    }
+
+    struct InflateGuard {
+        z_stream* stream;
+        ~InflateGuard() {
+            inflateEnd(stream);
+        }
+    } guard{&stream};
+
+    auto* input = reinterpret_cast<const Bytef*>(body.data());
+    stream.next_in = const_cast<Bytef*>(input);
+    stream.avail_in = static_cast<uInt>(body.size());
+
+    std::array<char, 8192> buffer{};
+    std::string output;
+    while (true) {
+        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+        stream.avail_out = static_cast<uInt>(buffer.size());
+
+        const auto code = inflate(&stream, Z_NO_FLUSH);
+        const auto produced = buffer.size() - stream.avail_out;
+        output.append(buffer.data(), produced);
+
+        if (code == Z_STREAM_END) {
+            return output;
+        }
+        if (code != Z_OK) {
+            throw std::runtime_error("failed to inflate compressed HTTP body");
         }
     }
 }
@@ -1020,6 +1069,117 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotAdvertiseCompressionForNonAltern
     ASSERT_EQ(server.Requests().size(), 1U);
     const auto request_text = ToLowerAscii(server.Requests()[0]);
     EXPECT_EQ(request_text.find("accept-encoding:"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryCompressesGzipRequests) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+    });
+
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.content_encoding_encoder = std::make_shared<GzipContentEncodingEncoder>();
+    cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
+        "Host",
+        "X-Amz-Target",
+        "Content-Length",
+    });
+
+    aws::DynamoDBHelper helper({"127.0.0.1"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppRequestCompressionTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, helper.NewEndpointProvider(), client_config);
+
+    Aws::DynamoDB::Model::PutItemRequest request;
+    request.SetTableName("orders");
+    request.AddItem("id", AwsStringValue("order-123"));
+    request.AddItem("payload", AwsStringValue("created"));
+    auto outcome = client.PutItem(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    const auto body = RequestBody(server.Requests()[0]);
+
+    const auto content_encoding = headers.find("content-encoding");
+    ASSERT_NE(content_encoding, headers.end());
+    EXPECT_EQ(content_encoding->second, "gzip");
+
+    const auto content_length = headers.find("content-length");
+    ASSERT_NE(content_length, headers.end());
+    EXPECT_EQ(content_length->second, std::to_string(body.size()));
+    EXPECT_EQ(headers.find("x-amz-content-sha256"), headers.end());
+
+    const auto decoded_body = DecompressBody(body, MAX_WBITS + 16);
+    EXPECT_NE(decoded_body.find(R"("TableName":"orders")"), std::string::npos);
+    EXPECT_NE(decoded_body.find(R"("S":"order-123")"), std::string::npos);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
+TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternatorEndpoints) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+    });
+
+    Config cfg;
+    cfg.port = server.Port();
+    cfg.scheme = "http";
+    cfg.aws_region = "us-east-1";
+    cfg.credentials = {"alternator", "secret"};
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.http_client_timeout = std::chrono::milliseconds{2000};
+    cfg.connect_timeout = std::chrono::milliseconds{1000};
+    cfg.content_encoding_encoder = std::make_shared<GzipContentEncodingEncoder>();
+
+    aws::DynamoDBHelper helper({"node1.example.com"}, cfg);
+
+    Aws::SDKOptions sdk_options;
+    helper.ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+
+    auto client_config = helper.NewClientConfiguration();
+    client_config.endpointOverride = Aws::String(("http://127.0.0.1:" + std::to_string(server.Port())).c_str());
+    client_config.retryStrategy = Aws::MakeShared<Aws::Client::DefaultRetryStrategy>(
+        "AlternatorClientCppRequestCompressionNonAlternatorTestRetryStrategy",
+        0,
+        0);
+    client_config.version = Aws::Http::Version::HTTP_VERSION_1_1;
+
+    Aws::Auth::AWSCredentials credentials("alternator", "secret");
+    Aws::DynamoDB::DynamoDBClient client(credentials, client_config);
+
+    Aws::DynamoDB::Model::PutItemRequest request;
+    request.SetTableName("orders");
+    request.AddItem("id", AwsStringValue("order-123"));
+    request.AddItem("payload", AwsStringValue("created"));
+    auto outcome = client.PutItem(request);
+    EXPECT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
+
+    server.Wait();
+
+    ASSERT_EQ(server.Requests().size(), 1U);
+    const auto headers = RequestHeaders(server.Requests()[0]);
+    EXPECT_EQ(headers.find("content-encoding"), headers.end());
+    EXPECT_NE(RequestBody(server.Requests()[0]).find(R"("TableName":"orders")"), std::string::npos);
 #else
     GTEST_SKIP() << "zlib support is not enabled";
 #endif

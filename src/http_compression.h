@@ -7,6 +7,8 @@
 
 namespace scylladb::alternator::detail {
 
+[[nodiscard]] std::string BuildContentEncodingValue(
+    const std::shared_ptr<HttpContentEncodingEncoder>& content_encoding_encoder);
 [[nodiscard]] std::string BuildAcceptEncodingValue(
     const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders);
 [[nodiscard]] std::string DecodeHttpResponseBody(
