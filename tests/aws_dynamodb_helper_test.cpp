@@ -2,6 +2,7 @@
 
 #include <aws/core/Aws.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
+#include <aws/core/utils/json/JsonSerializer.h>
 #include <aws/dynamodb/model/BatchWriteItemRequest.h>
 #include <aws/dynamodb/model/DeleteItemRequest.h>
 #include <aws/dynamodb/model/DeleteRequest.h>
@@ -380,6 +381,32 @@ std::string RequestBody(const std::string& request) {
         return {};
     }
     return request.substr(header_end + 4);
+}
+
+std::string ToStdString(const Aws::String& value) {
+    return std::string(value.data(), value.size());
+}
+
+void ExpectPutItemRequestBody(const std::string& body, const std::string& payload = "created") {
+    Aws::Utils::Json::JsonValue json(Aws::String(body.data(), body.size()));
+    ASSERT_TRUE(json.WasParseSuccessful()) << json.GetErrorMessage() << "\n" << body;
+
+    const auto root = json.View();
+    ASSERT_TRUE(root.ValueExists("TableName")) << body;
+    EXPECT_EQ(ToStdString(root.GetString("TableName")), "orders");
+
+    ASSERT_TRUE(root.ValueExists("Item")) << body;
+    const auto item = root.GetObject("Item");
+
+    ASSERT_TRUE(item.ValueExists("id")) << body;
+    const auto id = item.GetObject("id");
+    ASSERT_TRUE(id.ValueExists("S")) << body;
+    EXPECT_EQ(ToStdString(id.GetString("S")), "order-123");
+
+    ASSERT_TRUE(item.ValueExists("payload")) << body;
+    const auto payload_item = item.GetObject("payload");
+    ASSERT_TRUE(payload_item.ValueExists("S")) << body;
+    EXPECT_EQ(ToStdString(payload_item.GetString("S")), payload);
 }
 
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
@@ -1155,9 +1182,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryCompressesGzipRequests) {
     EXPECT_EQ(headers.find("content-type"), headers.end());
 
     const auto decoded_body = DecompressBody(body, MAX_WBITS + 16);
-    EXPECT_NE(decoded_body.find(R"("TableName":"orders")"), std::string::npos);
-    EXPECT_NE(decoded_body.find(R"("S":"order-123")"), std::string::npos);
-    EXPECT_NE(decoded_body.find(std::string(2048, 'x')), std::string::npos);
+    ExpectPutItemRequestBody(decoded_body, std::string(2048, 'x'));
 #else
     GTEST_SKIP() << "zlib support is not enabled";
 #endif
@@ -1208,7 +1233,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsBelowMinimumSize
     EXPECT_EQ(content_length->second, std::to_string(body.size()));
     EXPECT_EQ(headers.find("transfer-encoding"), headers.end());
     EXPECT_EQ(headers.find("content-type"), headers.end());
-    EXPECT_NE(body.find(R"("TableName":"orders")"), std::string::npos);
+    ExpectPutItemRequestBody(body);
 #else
     GTEST_SKIP() << "zlib support is not enabled";
 #endif
@@ -1258,7 +1283,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryKeepsOriginalRequestWhenCompressorDecli
     EXPECT_EQ(content_length->second, std::to_string(body.size()));
     EXPECT_EQ(headers.find("transfer-encoding"), headers.end());
     EXPECT_EQ(body.find("ignored"), std::string::npos);
-    EXPECT_NE(body.find(R"("TableName":"orders")"), std::string::npos);
+    ExpectPutItemRequestBody(body);
 }
 
 TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternatorEndpoints) {
@@ -1303,7 +1328,7 @@ TEST(AwsDynamoDBHelper, HttpClientFactoryDoesNotCompressRequestsForNonAlternator
     ASSERT_EQ(server.Requests().size(), 1U);
     const auto headers = RequestHeaders(server.Requests()[0]);
     EXPECT_EQ(headers.find("content-encoding"), headers.end());
-    EXPECT_NE(RequestBody(server.Requests()[0]).find(R"("TableName":"orders")"), std::string::npos);
+    ExpectPutItemRequestBody(RequestBody(server.Requests()[0]));
 #else
     GTEST_SKIP() << "zlib support is not enabled";
 #endif
