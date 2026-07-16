@@ -127,10 +127,11 @@ cfg.header_optimization =
         });
 ```
 
-Header names are matched case-insensitively. The override is exact; if it is
-set, the helper does not add credential or user-agent headers automatically.
-Applications can provide their own implementation by deriving from
-`HeaderOptimization`:
+Header names are matched case-insensitively. The override is exact except that
+request compression always keeps `Content-Encoding` and `Content-Length` when
+`Config::request_compressor` is set. If the override is set, the helper does
+not add credential or user-agent headers automatically. Applications can provide
+their own implementation by deriving from `HeaderOptimization`:
 
 ```cpp
 class MyHeaderOptimization final : public scylladb::alternator::HeaderOptimization {
