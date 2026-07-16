@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,6 +30,19 @@ public:
     [[nodiscard]] virtual std::string Decode(std::string body, const std::string& content_encoding) const = 0;
 };
 
+class HttpRequestCompressor {
+public:
+    virtual ~HttpRequestCompressor() = default;
+
+    [[nodiscard]] virtual std::string ContentEncoding() const = 0;
+    // Returns false to leave the request uncompressed, for example when
+    // input_size is below an implementation-defined minimum.
+    [[nodiscard]] virtual bool Compress(
+        std::istream& input,
+        std::uint64_t input_size,
+        std::ostream& output) const = 0;
+};
+
 class ZlibContentEncodingDecoder final : public HttpContentEncodingDecoder {
 public:
     explicit ZlibContentEncodingDecoder(std::vector<std::string> accepted_response_encodings = {"gzip", "deflate"});
@@ -38,6 +52,20 @@ public:
 
 private:
     std::vector<std::string> accepted_response_encodings_;
+};
+
+class GzipRequestCompressor final : public HttpRequestCompressor {
+public:
+    explicit GzipRequestCompressor(std::uint64_t min_size_bytes = 1024);
+
+    [[nodiscard]] std::string ContentEncoding() const override;
+    [[nodiscard]] bool Compress(
+        std::istream& input,
+        std::uint64_t input_size,
+        std::ostream& output) const override;
+
+private:
+    std::uint64_t min_size_bytes_ = 0;
 };
 
 struct HeaderOptimizationContext {
@@ -91,6 +119,7 @@ struct Config {
 
     unsigned max_connections = 100;
     bool reuse_discovery_connections = true;
+    std::shared_ptr<HttpRequestCompressor> request_compressor;
     std::vector<std::shared_ptr<HttpContentEncodingDecoder>> content_encoding_decoders;
     std::string user_agent = "scylladb-alternator-client-cpp/" SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION;
     std::shared_ptr<HeaderOptimization> header_optimization;

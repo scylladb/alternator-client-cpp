@@ -12,6 +12,8 @@
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
 #endif
+#include <istream>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -42,9 +44,69 @@ struct ContentEncodingDecoderEntry {
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 [[nodiscard]] uInt CheckedZlibSize(std::size_t size) {
     if (size > std::numeric_limits<uInt>::max()) {
-        throw std::runtime_error("compressed HTTP response is too large");
+        throw std::runtime_error("HTTP content is too large for zlib");
     }
     return static_cast<uInt>(size);
+}
+
+void DeflateBody(std::istream& input, std::ostream& output, int window_bits) {
+    z_stream stream{};
+    const auto init_code = deflateInit2(
+        &stream,
+        Z_DEFAULT_COMPRESSION,
+        Z_DEFLATED,
+        window_bits,
+        8,
+        Z_DEFAULT_STRATEGY);
+    if (init_code != Z_OK) {
+        throw std::runtime_error("deflateInit2 failed");
+    }
+
+    struct DeflateGuard {
+        z_stream* stream;
+        ~DeflateGuard() {
+            deflateEnd(stream);
+        }
+    } guard{&stream};
+
+    std::array<char, 8192> input_buffer{};
+    std::array<char, 8192> buffer{};
+    while (true) {
+        input.read(input_buffer.data(), static_cast<std::streamsize>(input_buffer.size()));
+        const auto read_size = input.gcount();
+        if (input.bad() || (input.fail() && !input.eof())) {
+            throw std::runtime_error("failed to read HTTP request body");
+        }
+
+        stream.next_in = reinterpret_cast<Bytef*>(input_buffer.data());
+        stream.avail_in = CheckedZlibSize(static_cast<std::size_t>(read_size));
+        const auto flush = input.eof() ? Z_FINISH : Z_NO_FLUSH;
+
+        do {
+            stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+            stream.avail_out = static_cast<uInt>(buffer.size());
+
+            const auto code = deflate(&stream, flush);
+            const auto produced = buffer.size() - stream.avail_out;
+            if (produced > 0) {
+                output.write(buffer.data(), static_cast<std::streamsize>(produced));
+                if (!output) {
+                    throw std::runtime_error("failed to write compressed HTTP request body");
+                }
+            }
+
+            if (code == Z_STREAM_END) {
+                return;
+            }
+            if (code != Z_OK) {
+                throw std::runtime_error("failed to deflate HTTP request");
+            }
+        } while (stream.avail_in != 0 || stream.avail_out == 0);
+
+        if (flush == Z_FINISH) {
+            throw std::runtime_error("failed to finish deflating HTTP request");
+        }
+    }
 }
 
 [[nodiscard]] std::string InflateBody(const std::string& body, int window_bits) {
@@ -117,6 +179,22 @@ struct ContentEncodingDecoderEntry {
     return encodings;
 }
 
+[[nodiscard]] std::string NormalizeRequestEncoding(
+    const std::shared_ptr<HttpRequestCompressor>& request_compressor) {
+    if (!request_compressor) {
+        return {};
+    }
+
+    auto encoding = NormalizeResponseEncoding(request_compressor->ContentEncoding());
+    if (encoding.empty()) {
+        throw std::invalid_argument("request_compressor must not advertise an empty encoding");
+    }
+    if (encoding.find(',') != std::string::npos) {
+        throw std::invalid_argument("request_compressor must advertise exactly one encoding");
+    }
+    return encoding;
+}
+
 [[nodiscard]] std::vector<ContentEncodingDecoderEntry> BuildDecoderEntries(
     const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders) {
     std::vector<ContentEncodingDecoderEntry> entries;
@@ -174,6 +252,11 @@ struct ContentEncodingDecoderEntry {
 
 } // namespace
 
+std::string BuildRequestContentEncodingValue(
+    const std::shared_ptr<HttpRequestCompressor>& request_compressor) {
+    return NormalizeRequestEncoding(request_compressor);
+}
+
 std::string ToLowerAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
@@ -230,6 +313,35 @@ std::string FindHttpHeaderValue(const std::string& headers, const std::string& n
 } // namespace scylladb::alternator::detail
 
 namespace scylladb::alternator {
+
+GzipRequestCompressor::GzipRequestCompressor(std::uint64_t min_size_bytes)
+    : min_size_bytes_(min_size_bytes) {
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    throw std::invalid_argument("zlib request encoding is not available");
+#endif
+}
+
+std::string GzipRequestCompressor::ContentEncoding() const {
+    return "gzip";
+}
+
+bool GzipRequestCompressor::Compress(
+    std::istream& input,
+    std::uint64_t input_size,
+    std::ostream& output) const {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    if (input_size < min_size_bytes_) {
+        return false;
+    }
+    detail::DeflateBody(input, output, MAX_WBITS + 16);
+    return true;
+#else
+    (void)input;
+    (void)input_size;
+    (void)output;
+    throw std::runtime_error("zlib request encoding is not available");
+#endif
+}
 
 ZlibContentEncodingDecoder::ZlibContentEncodingDecoder(std::vector<std::string> accepted_response_encodings)
     : accepted_response_encodings_(detail::NormalizeZlibResponseEncodings(std::move(accepted_response_encodings))) {}

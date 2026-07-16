@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -158,6 +159,22 @@ void RunDynamoDBOperations(Config cfg, const char* table_name) {
 TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttp) {
     REQUIRE_INTEGRATION();
     RunDynamoDBOperations(IntegrationConfig(IntegrationHttpPort()), "cpp_integration_http");
+}
+
+TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttpWithRequestCompressionAndHeaderOptimization) {
+    REQUIRE_INTEGRATION();
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+
+    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    cfg.request_compressor = std::make_shared<GzipRequestCompressor>(0);
+    cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
+        "Host",
+        "X-Amz-Target",
+        "Content-Length",
+    });
+    RunDynamoDBOperations(std::move(cfg), "cpp_integration_http_gzip_request");
 }
 
 TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttpsWithoutCertificateVerification) {

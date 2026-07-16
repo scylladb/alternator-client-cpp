@@ -57,7 +57,7 @@ if(ZLIB_FOUND)
     target_link_libraries(alternator_client_cpp PUBLIC ZLIB::ZLIB)
     target_compile_definitions(alternator_client_cpp PUBLIC SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB=1)
 else()
-    message(STATUS "ZLIB not found; gzip/deflate response decoding requires a caller-provided HttpContentEncodingDecoder")
+    message(STATUS "ZLIB not found; gzip request encoding and gzip/deflate response decoding are unavailable")
 endif()
 
 if(CURL_FOUND)

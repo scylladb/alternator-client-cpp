@@ -71,10 +71,12 @@ int main() {
 ```
 
 `Config::aws_region` is required by the AWS SDK for C++ client configuration,
-including request signing and diagnostic metadata. Alternator does not use that
-value to choose endpoints; `DynamoDBHelper` discovers nodes through
-`/localnodes` and installs the endpoint provider or HTTP wrapper that routes
-requests to live Alternator nodes. The default value is
+including request signing and diagnostic metadata. Alternator does not support
+SigV4 request validation, and this client does not try to preserve a valid
+SigV4 signature after Alternator-specific request rewriting. Alternator does
+not use the region value to choose endpoints; `DynamoDBHelper` discovers nodes
+through `/localnodes` and installs the endpoint provider or HTTP wrapper that
+routes requests to live Alternator nodes. The default value is
 `default-alb-region`, which prevents the SDK configuration from being empty but
 can look confusing in logs, traces, or metrics.
 
@@ -85,7 +87,16 @@ Alternator node discovery or load balancing.
 
 The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by default. AWS SDK for C++ resolves that endpoint once for a retried operation, so `DynamoDBHelper::ApplyToSDKOptions()` can also install a process-wide HTTP client factory before `Aws::InitAPI()`. That factory delegates to the SDK HTTP client and rotates only requests already aimed at the helper's Alternator endpoints.
 
-The HTTP client factory runs after request signing. This is the closest public AWS SDK for C++ hook for retry-aware endpoint rewriting and header optimization, but it means applications that depend on strict SigV4 host validation should prefer endpoint-provider routing or implement their own SDK wrapper. Automatic request-content-based endpoint rewriting is not available in the same form. The core library does provide deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them for applications that integrate request-specific routing in their own AWS SDK wrapper.
+The HTTP client factory runs after request signing. This is the closest public
+AWS SDK for C++ hook for retry-aware endpoint rewriting, header optimization,
+and request or response compression, and it matches Alternator's SigV4 behavior:
+Alternator does not validate SigV4 signatures. Do not use the factory through
+a proxy, gateway, or deployment policy that requires valid SigV4 signatures
+after the request leaves the SDK. Automatic request-content-based endpoint
+rewriting is not available in the same form. The core library does provide
+deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them
+for applications that integrate request-specific routing in their own AWS SDK
+wrapper.
 
 ### Headers Optimization
 
@@ -116,10 +127,11 @@ cfg.header_optimization =
         });
 ```
 
-Header names are matched case-insensitively. The override is exact; if it is
-set, the helper does not add credential or user-agent headers automatically.
-Applications can provide their own implementation by deriving from
-`HeaderOptimization`:
+Header names are matched case-insensitively. The override is exact except that
+request compression always keeps `Content-Encoding` and `Content-Length` when
+`Config::request_compressor` is set. If the override is set, the helper does
+not add credential or user-agent headers automatically. Applications can provide
+their own implementation by deriving from `HeaderOptimization`:
 
 ```cpp
 class MyHeaderOptimization final : public scylladb::alternator::HeaderOptimization {
@@ -139,6 +151,33 @@ public:
 Header optimization applies only to requests routed to known Alternator
 endpoints through the factory installed by `DynamoDBHelper::ApplyToSDKOptions()`
 before `Aws::InitAPI()`.
+
+### HTTP Request Compression
+
+Request compression is disabled by default. Configure a request compressor
+before constructing `DynamoDBHelper`, then install the Alternator HTTP client
+factory with `DynamoDBHelper::ApplyToSDKOptions()` before `Aws::InitAPI()`.
+The factory compresses request bodies only for requests routed to known
+Alternator nodes and sets the matching `Content-Encoding` and `Content-Length`
+headers before sending the request.
+
+Request compression is applied by the Alternator HTTP client factory after the
+AWS SDK signs the request. That is compatible with Alternator because Alternator
+does not support SigV4 validation. It is not compatible with any proxy, gateway,
+or DynamoDB-compatible service that validates SigV4 signatures.
+
+```cpp
+scylladb::alternator::Config cfg;
+cfg.request_compressor =
+    std::make_shared<scylladb::alternator::GzipRequestCompressor>();
+```
+
+Only gzip request compression is built in. `GzipRequestCompressor` requires
+zlib at build time and skips bodies smaller than 1024 bytes by default. Pass a
+different minimum size, such as `GzipRequestCompressor(0)`, to control that
+policy. The `HttpRequestCompressor` interface owns the decision to compress and
+compresses from an input stream to an output stream so implementations do not
+need to copy the whole request body into an intermediate string.
 
 ### HTTP Response Compression
 
@@ -378,6 +417,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - Reused libcurl discovery HTTP connections with an opt-out switch.
 - TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
 - Persistent AWS SDK DynamoDB HTTP connection pooling via `max_connections`.
+- Optional gzip request compression for AWS SDK DynamoDB requests routed through the Alternator HTTP client factory.
 - Active, quarantined, and down node pools with rigid observation-based transitions.
 - Round-robin `NextNode()` and flat per-request query plans, including deterministic seeded plans for affinity callers.
 - Key-route affinity helpers for single-write partition keys and batch-write preferred-node voting.
