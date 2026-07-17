@@ -101,6 +101,11 @@ struct Config {
     std::uint16_t port = 8080;
     std::string scheme = "http";
     RoutingScopePtr routing_scope = NewClusterScope();
+    // The AWS SDK requires a non-empty region for client configuration,
+    // signing scope, and diagnostics. Alternator routing ignores this value,
+    // so the default is only a placeholder. Set it to the deployment or
+    // Scylla Cloud region when SDK logs, traces, or metrics should show a
+    // meaningful region.
     std::string aws_region = "default-alb-region";
     Credentials credentials;
 
