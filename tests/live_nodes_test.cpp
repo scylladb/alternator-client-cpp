@@ -1,13 +1,19 @@
 #include <scylladb/alternator/live_nodes.h>
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -62,6 +68,90 @@ static std::int64_t HashWhereFirstNodeIs(const std::vector<Url>& nodes, const Ur
     }
     throw std::runtime_error("failed to find hash for target node");
 }
+
+class LocalDnsEntrypointServer {
+public:
+    explicit LocalDnsEntrypointServer(std::string body)
+        : body_(std::move(body)) {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error("socket failed");
+        }
+
+        int yes = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            throw std::runtime_error("bind failed");
+        }
+        if (listen(fd_, 1) != 0) {
+            throw std::runtime_error("listen failed");
+        }
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            throw std::runtime_error("getsockname failed");
+        }
+        port_ = ntohs(addr.sin_port);
+
+        worker_ = std::thread([this] {
+            int client = accept(fd_, nullptr, nullptr);
+            if (client < 0) {
+                return;
+            }
+
+            char buffer[2048];
+            const auto n = recv(client, buffer, sizeof(buffer), 0);
+            if (n > 0) {
+                request_.assign(buffer, static_cast<std::size_t>(n));
+            }
+
+            std::ostringstream response;
+            response << "HTTP/1.1 200 OK\r\n"
+                     << "Content-Type: application/json\r\n"
+                     << "Content-Length: " << body_.size() << "\r\n"
+                     << "Connection: close\r\n"
+                     << "\r\n"
+                     << body_;
+            const auto response_text = response.str();
+            send(client, response_text.data(), response_text.size(), 0);
+            close(client);
+        });
+    }
+
+    ~LocalDnsEntrypointServer() {
+        Wait();
+    }
+
+    void Wait() {
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    [[nodiscard]] std::uint16_t Port() const {
+        return port_;
+    }
+
+    [[nodiscard]] const std::string& Request() const {
+        return request_;
+    }
+
+private:
+    int fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::string body_;
+    std::string request_;
+    std::thread worker_;
+};
 
 TEST(AlternatorLiveNodes, RoutingScopeFallbackRetriesKnownNodes) {
     Config cfg;
@@ -121,6 +211,25 @@ TEST(AlternatorLiveNodes, ClusterScopeMergesSeedNodes) {
               }));
     EXPECT_GT(dc1_requests.load(), 0);
     EXPECT_GT(dc2_requests.load(), 0);
+}
+
+TEST(AlternatorLiveNodes, DnsEntrypointDiscoversDnsNodeRecords) {
+    LocalDnsEntrypointServer server(R"(["localhost","node-a.internal"])");
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.port = server.Port();
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    AlternatorLiveNodes nodes({"localhost"}, cfg);
+    nodes.UpdateLiveNodes();
+    server.Wait();
+
+    EXPECT_NE(server.Request().find("GET /localnodes HTTP/1.1"), std::string::npos);
+    EXPECT_TRUE(server.Request().find("Host: localhost:") != std::string::npos ||
+                server.Request().find("host: localhost:") != std::string::npos);
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"localhost", "node-a.internal"}));
 }
 
 TEST(AlternatorLiveNodes, ClusterScopeRefreshUsesConfiguredSeedNodes) {
