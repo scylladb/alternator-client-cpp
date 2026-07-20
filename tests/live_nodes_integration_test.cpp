@@ -1,12 +1,21 @@
+#include <scylladb/alternator/http_client.h>
 #include <scylladb/alternator/live_nodes.h>
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#include <cstdlib>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace scylladb::alternator;
@@ -42,6 +51,90 @@ std::vector<std::string> Hosts(const std::vector<Url>& nodes) {
     return out;
 }
 
+class LocalDnsEntrypointServer {
+public:
+    explicit LocalDnsEntrypointServer(std::string body)
+        : body_(std::move(body)) {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error("socket failed");
+        }
+
+        int yes = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            throw std::runtime_error("bind failed");
+        }
+        if (listen(fd_, 1) != 0) {
+            throw std::runtime_error("listen failed");
+        }
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            throw std::runtime_error("getsockname failed");
+        }
+        port_ = ntohs(addr.sin_port);
+
+        worker_ = std::thread([this] {
+            int client = accept(fd_, nullptr, nullptr);
+            if (client < 0) {
+                return;
+            }
+
+            char buffer[2048];
+            const auto n = recv(client, buffer, sizeof(buffer), 0);
+            if (n > 0) {
+                request_.assign(buffer, static_cast<std::size_t>(n));
+            }
+
+            std::ostringstream response;
+            response << "HTTP/1.1 200 OK\r\n"
+                     << "Content-Type: application/json\r\n"
+                     << "Content-Length: " << body_.size() << "\r\n"
+                     << "Connection: close\r\n"
+                     << "\r\n"
+                     << body_;
+            const auto response_text = response.str();
+            send(client, response_text.data(), response_text.size(), 0);
+            close(client);
+        });
+    }
+
+    ~LocalDnsEntrypointServer() {
+        Wait();
+    }
+
+    void Wait() {
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    [[nodiscard]] std::uint16_t Port() const {
+        return port_;
+    }
+
+    [[nodiscard]] const std::string& Request() const {
+        return request_;
+    }
+
+private:
+    int fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::string body_;
+    std::string request_;
+    std::thread worker_;
+};
+
 Config IntegrationConfig(std::uint16_t port) {
     Config cfg;
     cfg.port = port;
@@ -49,6 +142,18 @@ Config IntegrationConfig(std::uint16_t port) {
     cfg.idle_nodes_list_update_period = std::chrono::milliseconds{0};
     cfg.node_health.disabled = true;
     return cfg;
+}
+
+std::string FetchIntegrationLocalNodesBody() {
+    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    auto client = NewDefaultHttpClient(cfg);
+    auto url = Url::FromHostPort("http", IntegrationNodes()[0], IntegrationHttpPort())
+        .WithPathAndQuery("/localnodes");
+    auto response = client->Get(url);
+    if (response.status_code != 200) {
+        throw std::runtime_error("integration /localnodes returned HTTP " + std::to_string(response.status_code));
+    }
+    return response.body;
 }
 
 } // namespace
@@ -86,6 +191,22 @@ TEST(AlternatorLiveNodesIntegration, CompressedHttpDiscoveryWorks) {
 
     AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+    EXPECT_FALSE(nodes.GetNodes().empty());
+}
+
+TEST(AlternatorLiveNodesIntegration, DnsEntrypointDiscoversLiveClusterNodes) {
+    REQUIRE_INTEGRATION();
+
+    LocalDnsEntrypointServer server(FetchIntegrationLocalNodesBody());
+    auto cfg = IntegrationConfig(server.Port());
+
+    AlternatorLiveNodes nodes({"localhost"}, cfg);
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+    server.Wait();
+
+    EXPECT_NE(server.Request().find("GET /localnodes HTTP/1.1"), std::string::npos);
+    EXPECT_TRUE(server.Request().find("Host: localhost:") != std::string::npos ||
+        server.Request().find("host: localhost:") != std::string::npos);
     EXPECT_FALSE(nodes.GetNodes().empty());
 }
 
