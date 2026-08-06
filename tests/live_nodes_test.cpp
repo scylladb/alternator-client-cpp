@@ -248,6 +248,31 @@ TEST(AlternatorLiveNodes, DnsEntrypointDiscoversDnsNodeRecords) {
     EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"localhost", "node-a.internal"}));
 }
 
+TEST(AlternatorLiveNodes, IPv6LiteralDiscoversIPv6NodeRecords) {
+    std::vector<std::string> requested_urls;
+    auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
+        requested_urls.push_back(url.ToString());
+        if (url.host == "2001:db8::10") {
+            return HttpResponse{200, R"(["2001:db8::20","node-a.internal"])"};
+        }
+        return HttpResponse{200, "[]"};
+    });
+
+    Config cfg;
+    cfg.scheme = "https";
+    cfg.port = 8043;
+    cfg.routing_scope = std::make_shared<ClusterScope>();
+    AlternatorLiveNodes nodes({"2001:db8::10"}, cfg, http);
+
+    nodes.UpdateLiveNodes();
+
+    EXPECT_EQ(requested_urls, std::vector<std::string>({"https://[2001:db8::10]:8043/localnodes"}));
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"2001:db8::20", "node-a.internal"}));
+    const auto discovered = nodes.GetNodes();
+    ASSERT_EQ(discovered.size(), 2U);
+    EXPECT_EQ(discovered[0].ToString(), "https://[2001:db8::20]:8043");
+}
+
 TEST(AlternatorLiveNodes, ClusterScopeRefreshUsesConfiguredSeedNodes) {
     Config cfg;
     cfg.routing_scope = NewClusterScope();

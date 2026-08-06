@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -28,6 +29,7 @@
 #include <array>
 #endif
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
@@ -46,10 +48,13 @@ namespace {
 
 class LocalHttpServer {
 public:
-    explicit LocalHttpServer(std::string body = "[\"node1.local\"]", std::string content_encoding = {})
+    explicit LocalHttpServer(
+        std::string body = "[\"node1.local\"]",
+        std::string content_encoding = {},
+        int address_family = AF_INET)
         : body_(std::move(body))
         , content_encoding_(std::move(content_encoding)) {
-        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        fd_ = socket(address_family, SOCK_STREAM, 0);
         if (fd_ < 0) {
             throw std::runtime_error("socket failed");
         }
@@ -57,22 +62,36 @@ public:
         int yes = 1;
         setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
-        if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            throw std::runtime_error("bind failed");
+        if (address_family == AF_INET6) {
+            sockaddr_in6 addr{};
+            addr.sin6_family = AF_INET6;
+            addr.sin6_addr = in6addr_loopback;
+            addr.sin6_port = 0;
+            if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+                throw std::runtime_error("IPv6 bind failed");
+            }
+            socklen_t len = sizeof(addr);
+            if (getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+                throw std::runtime_error("IPv6 getsockname failed");
+            }
+            port_ = ntohs(addr.sin6_port);
+        } else {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+                throw std::runtime_error("bind failed");
+            }
+            socklen_t len = sizeof(addr);
+            if (getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+                throw std::runtime_error("getsockname failed");
+            }
+            port_ = ntohs(addr.sin_port);
         }
         if (listen(fd_, 1) != 0) {
             throw std::runtime_error("listen failed");
         }
-
-        socklen_t len = sizeof(addr);
-        if (getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-            throw std::runtime_error("getsockname failed");
-        }
-        port_ = ntohs(addr.sin_port);
 
         worker_ = std::thread([this] {
             int client = accept(fd_, nullptr, nullptr);
@@ -331,6 +350,18 @@ private:
 
 } // namespace
 
+bool LocalhostHasAddressFamily(int family) {
+    addrinfo hints{};
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* raw = nullptr;
+    if (getaddrinfo("localhost", nullptr, &hints, &raw) != 0) {
+        return false;
+    }
+    freeaddrinfo(raw);
+    return true;
+}
+
 TEST(HttpClient, PerformsPlainHttpGet) {
     LocalHttpServer server;
 
@@ -344,6 +375,51 @@ TEST(HttpClient, PerformsPlainHttpGet) {
     EXPECT_EQ(response.body, "[\"node1.local\"]");
     EXPECT_NE(server.Request().find("GET /localnodes?dc=dc1 HTTP/1.1"), std::string::npos);
     EXPECT_EQ(server.Request().find("Accept-Encoding:"), std::string::npos);
+}
+
+TEST(HttpClient, PerformsPlainHttpGetOverIPv6Literal) {
+    LocalHttpServer server("[\"::1\"]", {}, AF_INET6);
+
+    Config cfg;
+    cfg.scheme = "http";
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "::1", server.Port()).WithPathAndQuery("/localnodes");
+
+    const auto response = client.Get(url);
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, "[\"::1\"]");
+    EXPECT_EQ(url.Authority(), "[::1]:" + std::to_string(server.Port()));
+    EXPECT_EQ(url.ToString(), "http://[::1]:" + std::to_string(server.Port()) + "/localnodes");
+    EXPECT_NE(server.Request().find("Host: [::1]:" + std::to_string(server.Port())), std::string::npos);
+}
+
+TEST(HttpClient, DualStackDnsFallsBackToReachableIPv4) {
+    if (!LocalhostHasAddressFamily(AF_INET) || !LocalhostHasAddressFamily(AF_INET6)) {
+        GTEST_SKIP() << "localhost does not resolve to both IPv4 and IPv6";
+    }
+    LocalHttpServer server;
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.connect_timeout = std::chrono::milliseconds(500);
+    CurlHttpClient client(cfg);
+
+    EXPECT_EQ(client.Get(Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes")).status_code, 200);
+}
+
+TEST(HttpClient, DualStackDnsFallsBackToReachableIPv6) {
+    if (!LocalhostHasAddressFamily(AF_INET) || !LocalhostHasAddressFamily(AF_INET6)) {
+        GTEST_SKIP() << "localhost does not resolve to both IPv4 and IPv6";
+    }
+    LocalHttpServer server("[\"::1\"]", {}, AF_INET6);
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.connect_timeout = std::chrono::milliseconds(500);
+    CurlHttpClient client(cfg);
+
+    EXPECT_EQ(client.Get(Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes")).status_code, 200);
 }
 
 TEST(HttpClient, RequestsAndDecodesGzipResponse) {
