@@ -30,6 +30,12 @@ includes = [
     "test/**/*.yml",
     "tests/**/*.cpp",
 ]
+excludes = [
+    ".deps/**",
+    "build/**",
+    "build-*/**",
+    "cmake-build-*/**",
+]
 
 [mapping.SCRIPT_STYLE]
 filenames = ["CMakeLists.txt", "Makefile"]
