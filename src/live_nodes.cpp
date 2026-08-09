@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 
@@ -26,8 +27,10 @@ namespace {
 
 class HttpStatusError final : public std::runtime_error {
 public:
-    HttpStatusError(const Url& endpoint, long status_code)
-        : std::runtime_error("non-200 response from " + endpoint.ToString())
+    HttpStatusError(const Url& endpoint, const std::string& address, long status_code)
+        : std::runtime_error(
+              "HTTP " + std::to_string(status_code) + " from " + endpoint.ToString() +
+              " via " + address)
         , status_code(status_code) {}
 
     long status_code = 0;
@@ -35,8 +38,13 @@ public:
 
 class InvalidHttpResponseError final : public std::runtime_error {
 public:
-    explicit InvalidHttpResponseError(const std::string& message)
-        : std::runtime_error(message) {}
+    InvalidHttpResponseError(
+        const Url& endpoint,
+        const std::string& address,
+        const std::string& message)
+        : std::runtime_error(
+              "invalid /localnodes response from " + endpoint.ToString() +
+              " via " + address + ": " + message) {}
 };
 
 std::vector<std::string> ParseJsonStringArray(const std::string& body) {
@@ -133,6 +141,11 @@ std::vector<Url> ToUrls(const std::vector<std::string>& nodes, const Config& con
     std::vector<Url> urls;
     urls.reserve(nodes.size());
     for (const auto& node : nodes) {
+        if (node.empty() || std::any_of(node.begin(), node.end(), [](unsigned char ch) {
+                return std::isspace(ch) != 0 || std::iscntrl(ch) != 0;
+            })) {
+            continue;
+        }
         urls.emplace_back(config.scheme, node, config.port);
     }
     return SortAndDedupeNodes(std::move(urls));
@@ -141,6 +154,15 @@ std::vector<Url> ToUrls(const std::vector<std::string>& nodes, const Config& con
 void AppendUniqueNodes(std::vector<Url>& out, std::vector<Url> nodes) {
     for (auto& node : nodes) {
         if (!node.Empty() && std::find(out.begin(), out.end(), node) == out.end()) {
+            out.push_back(std::move(node));
+        }
+    }
+}
+
+void AppendRandomizedPlan(std::vector<Url>& out, std::vector<Url> nodes) {
+    QueryPlan plan(std::move(nodes));
+    for (auto node = plan.Next(); !node.Empty(); node = plan.Next()) {
+        if (std::find(out.begin(), out.end(), node) == out.end()) {
             out.push_back(std::move(node));
         }
     }
@@ -194,7 +216,12 @@ Url AlternatorLiveNodes::NextNode() {
 
     auto candidates = GetActiveNodes();
     if (candidates.empty()) {
-        ProbeDownNodes();
+        try {
+            RecoverLiveNodesIfNeeded();
+        } catch (...) {
+            // Endpoint selection keeps its existing empty-result contract when
+            // recovery fails. Background refresh will retry later.
+        }
         candidates = GetActiveNodes();
     }
 
@@ -256,6 +283,24 @@ std::vector<Url> AlternatorLiveNodes::GetDownNodes() const {
 }
 
 void AlternatorLiveNodes::UpdateLiveNodes() {
+    std::lock_guard<std::mutex> update_lock(update_mutex_);
+    UpdateLiveNodesLocked();
+}
+
+void AlternatorLiveNodes::RecoverLiveNodesIfNeeded() {
+    std::lock_guard<std::mutex> update_lock(update_mutex_);
+    if (!GetActiveNodes().empty()) {
+        return;
+    }
+
+    ProbeDownNodes();
+    if (!GetActiveNodes().empty()) {
+        return;
+    }
+    UpdateLiveNodesLocked();
+}
+
+void AlternatorLiveNodes::UpdateLiveNodesLocked() {
     auto new_nodes = FetchLiveNodes();
     if (new_nodes.empty()) {
         ProbeDownNodes();
@@ -265,16 +310,13 @@ void AlternatorLiveNodes::UpdateLiveNodes() {
     std::vector<Url> removed_nodes;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& node : new_nodes) {
-            health_store_->AddNode(node);
-        }
         for (const auto& node : live_nodes_) {
             if (std::find(new_nodes.begin(), new_nodes.end(), node) == new_nodes.end()) {
-                health_store_->RemoveNode(node);
                 removed_nodes.push_back(node);
             }
         }
         live_nodes_ = SortAndDedupeNodes(std::move(new_nodes));
+        health_store_->ReplaceNodes(live_nodes_);
     }
     for (const auto& node : removed_nodes) {
         RemoveQuarantineHashAssignmentsForNode(node);
@@ -322,8 +364,14 @@ void AlternatorLiveNodes::ReportNodeResult(const Url& node, NodeHealthObservatio
 std::vector<Url> AlternatorLiveNodes::ProbeDownNodes() {
     return health_store_->ProbeDownNodes([this](const Url& node, const NodeHealthStatus&) {
         try {
-            const auto resp = http_client_->Get(node.WithPathAndQuery("/localnodes"));
-            return resp.status_code >= 500 ? NodeHealthObservation::ServerError : NodeHealthObservation::Success;
+            const auto discovered = GetNodesFromEndpoint(node.WithPathAndQuery("/localnodes"));
+            return discovered.empty()
+                ? NodeHealthObservation::ConnectionFailure
+                : NodeHealthObservation::Success;
+        } catch (const HttpStatusError& error) {
+            return error.status_code >= 500
+                ? NodeHealthObservation::ServerError
+                : NodeHealthObservation::ConnectionFailure;
         } catch (...) {
             return NodeHealthObservation::ConnectionFailure;
         }
@@ -389,15 +437,30 @@ std::vector<Url> AlternatorLiveNodes::FetchLiveNodes() {
 
 std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope) {
     const bool cluster_scope = scope.IsCluster();
-    QueryPlan plan(GetDiscoveryNodesForScope(scope));
+    auto preferred_nodes = cluster_scope ? initial_nodes_ : GetQueryPlanNodes();
+    std::vector<Url> fallback_nodes;
+    if (!cluster_scope) {
+        for (const auto& node : initial_nodes_) {
+            if (std::find(preferred_nodes.begin(), preferred_nodes.end(), node) == preferred_nodes.end()) {
+                fallback_nodes.push_back(node);
+            }
+        }
+    }
+    std::vector<Url> discovery_order;
+    AppendRandomizedPlan(discovery_order, std::move(preferred_nodes));
+    AppendRandomizedPlan(discovery_order, std::move(fallback_nodes));
+    QueryPlan plan = QueryPlan::FromOrderedNodes(std::move(discovery_order));
     std::vector<Url> discovered;
     std::exception_ptr last_error;
+    bool saw_empty_response = false;
 
     for (Url node = plan.Next(); !node.Empty(); node = plan.Next()) {
         auto endpoint = node.WithPathAndQuery("/localnodes", scope.LocalNodesQuery());
         try {
             auto nodes = GetNodesFromEndpoint(endpoint);
+            ReportNodeResult(node, NodeHealthObservation::Success);
             if (nodes.empty()) {
+                saw_empty_response = true;
                 continue;
             }
             if (!cluster_scope) {
@@ -421,29 +484,76 @@ std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope
     if (!discovered.empty()) {
         return SortAndDedupeNodes(std::move(discovered));
     }
+    if (saw_empty_response && !cluster_scope) {
+        return {};
+    }
     if (last_error) {
         std::rethrow_exception(last_error);
+    }
+    if (saw_empty_response) {
+        throw std::runtime_error(
+            "all /localnodes responses for routing scope " + scope.ToString() +
+            " were empty or unusable");
     }
     return {};
 }
 
-std::vector<Url> AlternatorLiveNodes::GetDiscoveryNodesForScope(const RoutingScope& scope) const {
-    if (scope.IsCluster()) {
-        return initial_nodes_;
-    }
-    return GetQueryPlanNodes();
-}
-
 std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) const {
-    const auto resp = http_client_->Get(endpoint);
-    if (resp.status_code != 200) {
-        throw HttpStatusError(endpoint, resp.status_code);
+    auto addresses = http_client_->Resolve(endpoint);
+    std::vector<std::string> unique_addresses;
+    unique_addresses.reserve(addresses.size());
+    for (auto& address : addresses) {
+        if (!address.empty() &&
+            std::find(unique_addresses.begin(), unique_addresses.end(), address) == unique_addresses.end()) {
+            unique_addresses.push_back(std::move(address));
+        }
     }
-    try {
-        return ToUrls(ParseJsonStringArray(resp.body), config_);
-    } catch (const std::exception& error) {
-        throw InvalidHttpResponseError(error.what());
+    if (unique_addresses.empty()) {
+        throw std::runtime_error("DNS resolution returned no usable addresses for " + endpoint.host);
     }
+
+    std::exception_ptr last_nonempty_error;
+    bool saw_empty_response = false;
+    for (const auto& address : unique_addresses) {
+        try {
+            const auto resp = http_client_->GetResolved(endpoint, address);
+            if (resp.status_code != 200) {
+                throw HttpStatusError(endpoint, address, resp.status_code);
+            }
+
+            std::vector<Url> nodes;
+            try {
+                nodes = ToUrls(ParseJsonStringArray(resp.body), config_);
+            } catch (const std::exception& error) {
+                throw InvalidHttpResponseError(endpoint, address, error.what());
+            }
+            if (nodes.empty()) {
+                saw_empty_response = true;
+                continue;
+            }
+            return nodes;
+        } catch (const HttpStatusError&) {
+            last_nonempty_error = std::current_exception();
+        } catch (const InvalidHttpResponseError&) {
+            last_nonempty_error = std::current_exception();
+        } catch (const std::exception& error) {
+            last_nonempty_error = std::make_exception_ptr(std::runtime_error(
+                "request to " + endpoint.ToString() + " via " + address +
+                " failed: " + error.what()));
+        } catch (...) {
+            last_nonempty_error = std::make_exception_ptr(std::runtime_error(
+                "request to " + endpoint.ToString() + " via " + address +
+                " failed with an unknown error"));
+        }
+    }
+
+    if (last_nonempty_error) {
+        std::rethrow_exception(last_nonempty_error);
+    }
+    if (saw_empty_response) {
+        return {};
+    }
+    throw std::runtime_error("all resolved addresses failed for " + endpoint.host);
 }
 
 Url AlternatorLiveNodes::NextKnownNode() {

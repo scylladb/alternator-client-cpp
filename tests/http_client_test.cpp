@@ -28,6 +28,7 @@
 
 #include <array>
 #endif
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -375,6 +376,69 @@ TEST(HttpClient, PerformsPlainHttpGet) {
     EXPECT_EQ(response.body, "[\"node1.local\"]");
     EXPECT_NE(server.Request().find("GET /localnodes?dc=dc1 HTTP/1.1"), std::string::npos);
     EXPECT_EQ(server.Request().find("Accept-Encoding:"), std::string::npos);
+}
+
+TEST(HttpClient, ResolvedAddressPreservesLogicalHostHeader) {
+    LocalHttpServer server;
+
+    Config cfg;
+    cfg.scheme = "http";
+    CurlHttpClient client(cfg);
+    const auto logical_url = Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes");
+
+    auto response = client.GetResolved(logical_url, "127.0.0.1");
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, "[\"node1.local\"]");
+    EXPECT_NE(server.Request().find("GET /localnodes HTTP/1.1"), std::string::npos);
+    EXPECT_NE(
+        server.Request().find("Host: localhost:" + std::to_string(server.Port())),
+        std::string::npos);
+}
+
+TEST(HttpClient, ResolvedIPv6AddressPreservesLogicalHostHeader) {
+    LocalHttpServer server("[\"::1\"]", {}, AF_INET6);
+
+    Config cfg;
+    cfg.scheme = "http";
+    CurlHttpClient client(cfg);
+    const auto logical_url = Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes");
+
+    auto response = client.GetResolved(logical_url, "::1");
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_EQ(response.body, "[\"::1\"]");
+    EXPECT_NE(
+        server.Request().find("Host: localhost:" + std::to_string(server.Port())),
+        std::string::npos);
+}
+
+TEST(HttpClient, ResolveReturnsUniqueNumericAddresses) {
+    Config cfg;
+    CurlHttpClient client(cfg);
+
+    auto addresses = client.Resolve(Url("http", "localhost", 8080));
+
+    ASSERT_FALSE(addresses.empty());
+    auto unique = addresses;
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    EXPECT_EQ(addresses.size(), unique.size());
+    for (const auto& address : addresses) {
+        in_addr ipv4{};
+        in6_addr ipv6{};
+        EXPECT_TRUE(inet_pton(AF_INET, address.c_str(), &ipv4) == 1 ||
+                    inet_pton(AF_INET6, address.c_str(), &ipv6) == 1);
+    }
+}
+
+TEST(HttpClient, ResolveReportsDnsFailure) {
+    Config cfg;
+    CurlHttpClient client(cfg);
+
+    EXPECT_THROW(
+        (void)client.Resolve(Url("http", "does-not-exist.invalid", 8080)),
+        std::runtime_error);
 }
 
 TEST(HttpClient, PerformsPlainHttpGetOverIPv6Literal) {

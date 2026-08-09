@@ -72,6 +72,7 @@ public:
 
     void AddNode(const Url& node);
     void RemoveNode(const Url& node);
+    void ReplaceNodes(const std::vector<Url>& nodes);
     void ReportNodeResult(const Url& node, NodeHealthObservation observation);
     std::vector<Url> ProbeDownNodes(const DownProbe& probe);
 

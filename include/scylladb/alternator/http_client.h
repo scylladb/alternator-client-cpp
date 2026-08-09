@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <scylladb/alternator/config.h>
 #include <scylladb/alternator/uri.h>
@@ -35,6 +36,19 @@ public:
     virtual ~HttpClient() = default;
 
     [[nodiscard]] virtual HttpResponse Get(const Url& url) const = 0;
+
+    // Resolve every address for a logical endpoint. Discovery calls this for
+    // each refresh so DNS entrypoints can change without pinning stale answers.
+    // Custom clients may keep the default behavior and let Get() resolve the
+    // hostname itself.
+    [[nodiscard]] virtual std::vector<std::string> Resolve(const Url& url) const;
+
+    // Connect to one resolved address while retaining url as the logical
+    // endpoint. Implementations must preserve its Host header and, for HTTPS,
+    // TLS SNI and certificate verification semantics.
+    [[nodiscard]] virtual HttpResponse GetResolved(
+        const Url& url,
+        const std::string& resolved_address) const;
 };
 
 class CurlHttpClient final : public HttpClient {
@@ -43,11 +57,16 @@ public:
     ~CurlHttpClient() override;
 
     [[nodiscard]] HttpResponse Get(const Url& url) const override;
+    [[nodiscard]] std::vector<std::string> Resolve(const Url& url) const override;
+    [[nodiscard]] HttpResponse GetResolved(
+        const Url& url,
+        const std::string& resolved_address) const override;
 
 private:
     Config config_;
     mutable std::mutex mutex_;
     mutable void* reusable_handle_ = nullptr;
+    mutable std::string reusable_resolved_address_;
 };
 
 std::shared_ptr<HttpClient> NewDefaultHttpClient(const Config& config);

@@ -24,9 +24,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -47,6 +50,32 @@ public:
     }
 
 private:
+    Handler handler_;
+};
+
+class ResolvedFakeHttpClient final : public HttpClient {
+public:
+    using Resolver = std::function<std::vector<std::string>(const Url&)>;
+    using Handler = std::function<HttpResponse(const Url&, const std::string&)>;
+
+    ResolvedFakeHttpClient(Resolver resolver, Handler handler)
+        : resolver_(std::move(resolver))
+        , handler_(std::move(handler)) {}
+
+    std::vector<std::string> Resolve(const Url& url) const override {
+        return resolver_(url);
+    }
+
+    HttpResponse Get(const Url& url) const override {
+        return handler_(url, url.host);
+    }
+
+    HttpResponse GetResolved(const Url& url, const std::string& resolved_address) const override {
+        return handler_(url, resolved_address);
+    }
+
+private:
+    Resolver resolver_;
     Handler handler_;
 };
 
@@ -248,6 +277,419 @@ TEST(AlternatorLiveNodes, DnsEntrypointDiscoversDnsNodeRecords) {
     EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"localhost", "node-a.internal"}));
 }
 
+TEST(AlternatorLiveNodes, DnsEntrypointFallsBackAfterNon200MalformedAndEmptyResponses) {
+    Config cfg;
+    cfg.scheme = "https";
+    cfg.port = 8043;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::vector<std::string> attempts;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url& url) {
+            EXPECT_EQ(url.host, "seed.example");
+            return std::vector<std::string>{
+                "192.0.2.9",
+                "192.0.2.10",
+                "192.0.2.10",
+                "192.0.2.11",
+                "192.0.2.12",
+                "192.0.2.13",
+            };
+        },
+        [&](const Url& url, const std::string& address) {
+            EXPECT_EQ(url.host, "seed.example");
+            EXPECT_EQ(url.scheme, "https");
+            EXPECT_EQ(url.port, 8043);
+            EXPECT_EQ(url.path, "/localnodes");
+            attempts.push_back(address);
+            if (address == "192.0.2.9") {
+                throw std::runtime_error("connection reset");
+            }
+            if (address == "192.0.2.10") {
+                return HttpResponse{503, ""};
+            }
+            if (address == "192.0.2.11") {
+                return HttpResponse{200, R"({"nodes":["wrong-shape"]})"};
+            }
+            if (address == "192.0.2.12") {
+                return HttpResponse{200, R"(["","   "])"};
+            }
+            return HttpResponse{200, R"(["node-a.internal","node-b.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+
+    EXPECT_EQ(attempts,
+              std::vector<std::string>({
+                  "192.0.2.9",
+                  "192.0.2.10",
+                  "192.0.2.11",
+                  "192.0.2.12",
+                  "192.0.2.13",
+              }));
+    EXPECT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"node-a.internal", "node-b.internal"}));
+}
+
+TEST(AlternatorLiveNodes, AllResolvedAddressesUnavailableFailsAndPreservesLearnedNodes) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    int phase = 0;
+    std::vector<std::string> failed_attempts;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [&](const Url& url) {
+            EXPECT_EQ(url.host, "seed.example");
+            if (phase == 0) {
+                return std::vector<std::string>{"192.0.2.20"};
+            }
+            return std::vector<std::string>{"192.0.2.21", "192.0.2.22", "192.0.2.21"};
+        },
+        [&](const Url&, const std::string& address) -> HttpResponse {
+            if (phase == 0) {
+                EXPECT_EQ(address, "192.0.2.20");
+                return {200, R"(["learned-a.internal","learned-b.internal"])"};
+            }
+            failed_attempts.push_back(address);
+            throw std::runtime_error("connect failed: " + address);
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    nodes.UpdateLiveNodes();
+    ASSERT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"learned-a.internal", "learned-b.internal"}));
+
+    phase = 1;
+    EXPECT_THROW(nodes.UpdateLiveNodes(), std::runtime_error);
+
+    EXPECT_EQ(failed_attempts,
+              std::vector<std::string>({"192.0.2.21", "192.0.2.22"}));
+    EXPECT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"learned-a.internal", "learned-b.internal"}));
+}
+
+TEST(AlternatorLiveNodes, EmptyResolutionFailsClearlyWithoutDiscardingSeed) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) {
+            return std::vector<std::string>{"", ""};
+        },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["unexpected.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    try {
+        nodes.UpdateLiveNodes();
+        FAIL() << "empty DNS resolution unexpectedly succeeded";
+    } catch (const std::runtime_error& error) {
+        EXPECT_NE(std::string(error.what()).find("no usable addresses"), std::string::npos);
+    }
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"seed.example"}));
+}
+
+TEST(AlternatorLiveNodes, EmptyClusterResponsesFailClearly) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) {
+            return std::vector<std::string>{"192.0.2.25"};
+        },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["","   "])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    try {
+        nodes.UpdateLiveNodes();
+        FAIL() << "empty cluster discovery unexpectedly succeeded";
+    } catch (const std::runtime_error& error) {
+        EXPECT_NE(std::string(error.what()).find("empty or unusable"), std::string::npos);
+    }
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"seed.example"}));
+}
+
+TEST(AlternatorLiveNodes, FailedImmediateRecoveryReturnsNoNode) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) -> std::vector<std::string> {
+            throw std::runtime_error("SERVFAIL");
+        },
+        [](const Url&, const std::string&) -> HttpResponse {
+            throw std::runtime_error("seed unavailable");
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    nodes.ReportNodeResult(
+        Url("http", "seed.example", 8080),
+        NodeHealthObservation::ConnectionFailure);
+
+    EXPECT_TRUE(nodes.NextNode().Empty());
+    EXPECT_EQ(nodes.GetDownNodes(),
+              std::vector<Url>({Url("http", "seed.example", 8080)}));
+}
+
+TEST(AlternatorLiveNodes, AllApplicationResponsesInvalidFailAndPreserveLearnedNodes) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    int phase = 0;
+    std::vector<std::string> attempts;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [&](const Url&) {
+            if (phase == 0) {
+                return std::vector<std::string>{"192.0.2.30"};
+            }
+            return std::vector<std::string>{"192.0.2.31", "192.0.2.32", "192.0.2.33"};
+        },
+        [&](const Url&, const std::string& address) {
+            if (phase == 0) {
+                return HttpResponse{200, R"(["learned.internal"])"};
+            }
+            attempts.push_back(address);
+            if (address == "192.0.2.31") {
+                return HttpResponse{502, ""};
+            }
+            if (address == "192.0.2.32") {
+                return HttpResponse{200, "not-json"};
+            }
+            return HttpResponse{200, "[]"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    nodes.UpdateLiveNodes();
+    phase = 1;
+
+    EXPECT_THROW(nodes.UpdateLiveNodes(), std::runtime_error);
+    EXPECT_EQ(attempts,
+              std::vector<std::string>({"192.0.2.31", "192.0.2.32", "192.0.2.33"}));
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"learned.internal"}));
+}
+
+TEST(AlternatorLiveNodes, InvalidConfiguredSeedsDoNotBlockLaterUsableSeed) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::vector<std::string> attempts;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url& url) {
+            return std::vector<std::string>{"address-for-" + url.host};
+        },
+        [&](const Url& url, const std::string&) {
+            attempts.push_back(url.host);
+            if (url.host == "seed-a.example") {
+                return HttpResponse{500, ""};
+            }
+            if (url.host == "seed-b.example") {
+                return HttpResponse{200, "[]"};
+            }
+            return HttpResponse{200, R"(["learned.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes(
+        {"seed-a.example", "seed-b.example", "seed-c.example"},
+        cfg,
+        http);
+
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+    std::sort(attempts.begin(), attempts.end());
+    EXPECT_EQ(attempts,
+              std::vector<std::string>({
+                  "seed-a.example",
+                  "seed-b.example",
+                  "seed-c.example",
+              }));
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"learned.internal"}));
+}
+
+TEST(AlternatorLiveNodes, MixedLocalNodesResponseKeepsUsableUniqueEntries) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) {
+            return std::vector<std::string>{"192.0.2.60"};
+        },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["","   ","node-a.internal","node-a.internal","node-b.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+    EXPECT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"node-a.internal", "node-b.internal"}));
+}
+
+TEST(AlternatorLiveNodes, OverlappingRefreshesPublishOnlyCompleteNodeSets) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::mutex refresh_mutex;
+    std::condition_variable refresh_cv;
+    bool block_refresh = false;
+    bool refresh_entered = false;
+    int in_flight = 0;
+    int max_in_flight = 0;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) {
+            return std::vector<std::string>{"192.0.2.70"};
+        },
+        [&](const Url&, const std::string&) {
+            std::unique_lock<std::mutex> lock(refresh_mutex);
+            ++in_flight;
+            max_in_flight = std::max(max_in_flight, in_flight);
+            if (block_refresh) {
+                refresh_entered = true;
+                refresh_cv.notify_all();
+                refresh_cv.wait(lock, [&] { return !block_refresh; });
+            }
+            --in_flight;
+            return HttpResponse{
+                200,
+                refresh_entered
+                    ? R"(["new-a.internal","new-b.internal"])"
+                    : R"(["old-a.internal","old-b.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    nodes.UpdateLiveNodes();
+    ASSERT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"old-a.internal", "old-b.internal"}));
+
+    {
+        std::lock_guard<std::mutex> lock(refresh_mutex);
+        block_refresh = true;
+        refresh_entered = false;
+    }
+    std::thread first_refresh([&] { nodes.UpdateLiveNodes(); });
+    bool entered = false;
+    {
+        std::unique_lock<std::mutex> lock(refresh_mutex);
+        entered = refresh_cv.wait_for(
+            lock,
+            std::chrono::seconds(1),
+            [&] { return refresh_entered; });
+        if (!entered) {
+            block_refresh = false;
+        }
+    }
+    if (!entered) {
+        refresh_cv.notify_all();
+        first_refresh.join();
+        FAIL() << "refresh did not enter HTTP handler";
+    }
+    std::thread second_refresh([&] { nodes.UpdateLiveNodes(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    EXPECT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"old-a.internal", "old-b.internal"}));
+    EXPECT_EQ(Hosts(nodes.GetActiveNodes()),
+              std::vector<std::string>({"old-a.internal", "old-b.internal"}));
+    {
+        std::lock_guard<std::mutex> lock(refresh_mutex);
+        EXPECT_EQ(in_flight, 1);
+        EXPECT_EQ(max_in_flight, 1);
+        block_refresh = false;
+    }
+    refresh_cv.notify_all();
+    first_refresh.join();
+    second_refresh.join();
+
+    EXPECT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"new-a.internal", "new-b.internal"}));
+    EXPECT_EQ(Hosts(nodes.GetActiveNodes()),
+              std::vector<std::string>({"new-a.internal", "new-b.internal"}));
+    EXPECT_EQ(max_in_flight, 1);
+}
+
+TEST(AlternatorLiveNodes, ActiveSessionRecoversThroughReresolvedSeedEntrypoint) {
+    Config cfg;
+    cfg.routing_scope = NewDCScope("dc1");
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    int phase = 0;
+    int seed_resolutions = 0;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [&](const Url& url) {
+            if (url.host == "live-a.internal" || url.host == "live-b.internal") {
+                return std::vector<std::string>{url.host};
+            }
+            EXPECT_EQ(url.host, "seed.example");
+            EXPECT_EQ(url.query, "dc=dc1");
+            ++seed_resolutions;
+            return phase == 0
+                ? std::vector<std::string>{"192.0.2.40"}
+                : std::vector<std::string>{"192.0.2.41"};
+        },
+        [&](const Url& url, const std::string& address) -> HttpResponse {
+            if (url.host == "live-a.internal" || url.host == "live-b.internal") {
+                throw std::runtime_error("learned node unavailable");
+            }
+            EXPECT_EQ(url.host, "seed.example");
+            if (address == "192.0.2.40") {
+                return {200, R"(["live-a.internal","live-b.internal"])"};
+            }
+            EXPECT_EQ(address, "192.0.2.41");
+            return {200, R"(["live-c.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    nodes.UpdateLiveNodes();
+    ASSERT_EQ(Hosts(nodes.GetNodes()),
+              std::vector<std::string>({"live-a.internal", "live-b.internal"}));
+
+    nodes.ReportNodeResult(Url("http", "live-a.internal", 8080), NodeHealthObservation::ConnectionFailure);
+    nodes.ReportNodeResult(Url("http", "live-b.internal", 8080), NodeHealthObservation::ConnectionFailure);
+    phase = 1;
+
+    EXPECT_EQ(nodes.NextNode(), Url("http", "live-c.internal", 8080));
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"live-c.internal"}));
+    EXPECT_EQ(seed_resolutions, 2);
+}
+
+TEST(AlternatorLiveNodes, FailedDnsResolutionRetainsSeedForLaterRecovery) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    int resolution_attempts = 0;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [&](const Url&) {
+            ++resolution_attempts;
+            if (resolution_attempts == 1) {
+                throw std::runtime_error("NXDOMAIN");
+            }
+            return std::vector<std::string>{"192.0.2.50"};
+        },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["recovered.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    EXPECT_THROW(nodes.UpdateLiveNodes(), std::runtime_error);
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"seed.example"}));
+
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"recovered.internal"}));
+    EXPECT_EQ(resolution_attempts, 2);
+}
+
 TEST(AlternatorLiveNodes, IPv6LiteralDiscoversIPv6NodeRecords) {
     std::vector<std::string> requested_urls;
     auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
@@ -422,7 +864,7 @@ TEST(AlternatorLiveNodes, ProbeDownNodesMovesResponsiveNodeToQuarantine) {
 
     auto http = std::make_shared<FakeHttpClient>([](const Url& url) {
         EXPECT_EQ(url.path, "/localnodes");
-        return HttpResponse{200, "[]"};
+        return HttpResponse{200, "[\"recovering.local\"]"};
     });
 
     AlternatorLiveNodes nodes({"active.local", "recovering.local"}, cfg, http);
@@ -436,6 +878,24 @@ TEST(AlternatorLiveNodes, ProbeDownNodesMovesResponsiveNodeToQuarantine) {
     EXPECT_TRUE(nodes.GetDownNodes().empty());
 }
 
+TEST(AlternatorLiveNodes, ProbeDownNodesRejectsEmptyLocalNodesResponse) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.quarantine_success_threshold = 2;
+
+    auto http = std::make_shared<FakeHttpClient>([](const Url&) {
+        return HttpResponse{200, "[]"};
+    });
+
+    AlternatorLiveNodes nodes({"recovering.local"}, cfg, http);
+    Url recovering("http", "recovering.local", 8080);
+    nodes.ReportNodeResult(recovering, NodeHealthObservation::ConnectionFailure);
+
+    EXPECT_TRUE(nodes.ProbeDownNodes().empty());
+    EXPECT_EQ(nodes.GetDownNodes(), std::vector<Url>({recovering}));
+    EXPECT_TRUE(nodes.GetQuarantinedNodes().empty());
+}
+
 TEST(AlternatorLiveNodes, QuarantineTrafficIsSampledByConfiguredInterval) {
     Config cfg;
     cfg.nodes_list_update_period = std::chrono::milliseconds{0};
@@ -443,7 +903,7 @@ TEST(AlternatorLiveNodes, QuarantineTrafficIsSampledByConfiguredInterval) {
     cfg.node_health.quarantine_traffic_interval = 2;
 
     auto http = std::make_shared<FakeHttpClient>([](const Url&) {
-        return HttpResponse{200, "[]"};
+        return HttpResponse{200, "[\"recovering.local\"]"};
     });
 
     AlternatorLiveNodes nodes({"active.local", "recovering.local"}, cfg, http);
@@ -464,7 +924,7 @@ TEST(AlternatorLiveNodes, QuarantineHashAssignmentStaysExposedUntilVerified) {
     cfg.node_health.quarantine_traffic_interval = 2;
 
     auto http = std::make_shared<FakeHttpClient>([](const Url&) {
-        return HttpResponse{200, "[]"};
+        return HttpResponse{200, "[\"recovering.local\"]"};
     });
 
     AlternatorLiveNodes nodes({"active.local", "recovering.local"}, cfg, http);
@@ -503,7 +963,7 @@ TEST(AlternatorLiveNodes, QuarantineHashAssignmentIsRemovedWhenNodeGoesDown) {
     cfg.node_health.quarantine_traffic_interval = 1;
 
     auto http = std::make_shared<FakeHttpClient>([](const Url&) {
-        return HttpResponse{200, "[]"};
+        return HttpResponse{200, "[\"recovering.local\"]"};
     });
 
     AlternatorLiveNodes nodes({"active.local", "recovering.local"}, cfg, http);
@@ -528,7 +988,7 @@ TEST(AlternatorLiveNodes, QuarantinePromotesAfterSuccessfulTraffic) {
     cfg.node_health.quarantine_success_threshold = 2;
 
     auto http = std::make_shared<FakeHttpClient>([](const Url&) {
-        return HttpResponse{200, "[]"};
+        return HttpResponse{200, "[\"recovering.local\"]"};
     });
 
     AlternatorLiveNodes nodes({"active.local", "recovering.local"}, cfg, http);
@@ -556,7 +1016,7 @@ TEST(AlternatorLiveNodes, BackgroundProbesDownNodesPeriodically) {
         if (url.host == "recovering.local" && url.path == "/localnodes") {
             ++probes;
         }
-        return HttpResponse{200, "[]"};
+        return HttpResponse{200, "[\"recovering.local\"]"};
     });
 
     AlternatorLiveNodes nodes({"active.local", "recovering.local"}, cfg, http);

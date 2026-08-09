@@ -63,9 +63,10 @@ public:
     [[nodiscard]] const Config& GetConfig() const;
 
 private:
+    void RecoverLiveNodesIfNeeded();
+    void UpdateLiveNodesLocked();
     [[nodiscard]] std::vector<Url> FetchLiveNodes();
     [[nodiscard]] std::vector<Url> GetNodesForScope(const RoutingScope& scope);
-    [[nodiscard]] std::vector<Url> GetDiscoveryNodesForScope(const RoutingScope& scope) const;
     [[nodiscard]] std::vector<Url> GetNodesFromEndpoint(const Url& endpoint) const;
     [[nodiscard]] Url NextKnownNode();
     [[nodiscard]] bool ShouldTryQuarantinedNode(bool active_nodes_empty) const;
@@ -91,6 +92,7 @@ private:
     std::chrono::steady_clock::time_point next_update_;
     std::chrono::steady_clock::time_point last_activity_;
 
+    std::mutex update_mutex_;
     std::mutex background_mutex_;
     std::condition_variable background_cv_;
     bool background_started_ = false;

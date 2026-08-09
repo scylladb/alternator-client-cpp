@@ -18,17 +18,19 @@
 
 #include "http_compression.h"
 
+#include <netdb.h>
+#include <sys/socket.h>
+
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
 #include <curl/curl.h>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_OPENSSL
 #include <openssl/ssl.h>
 #endif
 #else
-#include <netdb.h>
-#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -36,6 +38,45 @@
 #include <utility>
 
 namespace scylladb::alternator {
+namespace {
+
+std::vector<std::string> ResolveAddresses(const Url& url) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* raw = nullptr;
+    const auto service = std::to_string(url.port);
+    const int code = getaddrinfo(url.host.c_str(), service.c_str(), &hints, &raw);
+    if (code != 0) {
+        throw std::runtime_error("DNS resolution failed for " + url.host + ": " + gai_strerror(code));
+    }
+    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> results(raw, &freeaddrinfo);
+
+    std::vector<std::string> addresses;
+    for (auto* it = results.get(); it != nullptr; it = it->ai_next) {
+        char host[NI_MAXHOST]{};
+        if (getnameinfo(it->ai_addr,
+                        it->ai_addrlen,
+                        host,
+                        sizeof(host),
+                        nullptr,
+                        0,
+                        NI_NUMERICHOST) != 0) {
+            continue;
+        }
+        std::string address(host);
+        if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) {
+            addresses.push_back(std::move(address));
+        }
+    }
+    if (addresses.empty()) {
+        throw std::runtime_error("DNS resolution returned no usable addresses for " + url.host);
+    }
+    return addresses;
+}
+
+} // namespace
 
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
 namespace {
@@ -104,8 +145,11 @@ void ConfigureCurlForGet(
     CURL* curl,
     const Url& url,
     const Config& config,
+    const std::string& resolved_address,
+    bool force_fresh_connection,
     std::string& body,
-    std::string& response_headers) {
+    std::string& response_headers,
+    curl_slist*& resolve_entries) {
     curl_easy_reset(curl);
 
     const auto url_string = url.ToString();
@@ -120,7 +164,23 @@ void ConfigureCurlForGet(
     curl_easy_setopt(curl, CURLOPT_SSL_SESSIONID_CACHE, config.tls_session_cache_enabled ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, static_cast<long>(config.max_connections));
     curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, config.reuse_discovery_connections ? 0L : 1L);
-    curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, config.reuse_discovery_connections ? 0L : 1L);
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FRESH_CONNECT,
+        !config.reuse_discovery_connections || force_fresh_connection ? 1L : 0L);
+
+    if (!resolved_address.empty() && resolved_address != url.host) {
+        auto curl_address = resolved_address;
+        if (curl_address.find(':') != std::string::npos && curl_address.front() != '[') {
+            curl_address = "[" + curl_address + "]";
+        }
+        const auto entry = url.host + ":" + std::to_string(url.port) + ":" + curl_address;
+        resolve_entries = curl_slist_append(resolve_entries, entry.c_str());
+        if (resolve_entries == nullptr) {
+            throw std::runtime_error("curl_slist_append failed for resolved address");
+        }
+        curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_entries);
+    }
 
     SetDuration(curl, CURLOPT_TIMEOUT_MS, config.http_client_timeout);
     SetDuration(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout);
@@ -151,10 +211,24 @@ void ConfigureCurlForGet(
 #endif
 }
 
-HttpResponse PerformCurlGet(CURL* curl, const Url& url, const Config& config) {
+HttpResponse PerformCurlGet(
+    CURL* curl,
+    const Url& url,
+    const Config& config,
+    const std::string& resolved_address,
+    bool force_fresh_connection) {
     std::string body;
     std::string response_headers;
-    ConfigureCurlForGet(curl, url, config, body, response_headers);
+    curl_slist* resolve_entries = nullptr;
+    ConfigureCurlForGet(
+        curl,
+        url,
+        config,
+        resolved_address,
+        force_fresh_connection,
+        body,
+        response_headers,
+        resolve_entries);
 
     curl_slist* headers = nullptr;
     headers = curl_slist_append(
@@ -169,8 +243,12 @@ HttpResponse PerformCurlGet(CURL* curl, const Url& url, const Config& config) {
 
     const auto code = curl_easy_perform(curl);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, nullptr);
+    curl_easy_setopt(curl, CURLOPT_RESOLVE, nullptr);
     if (headers != nullptr) {
         curl_slist_free_all(headers);
+    }
+    if (resolve_entries != nullptr) {
+        curl_slist_free_all(resolve_entries);
     }
     if (code != CURLE_OK) {
         throw std::runtime_error(curl_easy_strerror(code));
@@ -201,6 +279,16 @@ CurlHttpClient::~CurlHttpClient() {
 }
 
 HttpResponse CurlHttpClient::Get(const Url& url) const {
+    return GetResolved(url, {});
+}
+
+std::vector<std::string> CurlHttpClient::Resolve(const Url& url) const {
+    return ResolveAddresses(url);
+}
+
+HttpResponse CurlHttpClient::GetResolved(
+    const Url& url,
+    const std::string& resolved_address) const {
     EnsureCurlInitialized();
 
     if (config_.reuse_discovery_connections) {
@@ -211,7 +299,16 @@ HttpResponse CurlHttpClient::Get(const Url& url) const {
                 throw std::runtime_error("curl_easy_init failed");
             }
         }
-        return PerformCurlGet(static_cast<CURL*>(reusable_handle_), url, config_);
+        const bool force_fresh_connection =
+            !resolved_address.empty() &&
+            reusable_resolved_address_ != resolved_address;
+        reusable_resolved_address_ = resolved_address;
+        return PerformCurlGet(
+            static_cast<CURL*>(reusable_handle_),
+            url,
+            config_,
+            resolved_address,
+            force_fresh_connection);
     }
 
     CURL* raw = curl_easy_init();
@@ -219,7 +316,7 @@ HttpResponse CurlHttpClient::Get(const Url& url) const {
         throw std::runtime_error("curl_easy_init failed");
     }
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
-    return PerformCurlGet(curl.get(), url, config_);
+    return PerformCurlGet(curl.get(), url, config_, resolved_address, false);
 }
 
 #else
@@ -292,14 +389,18 @@ void SendAll(int fd, const std::string& data) {
     }
 }
 
-FdGuard ConnectTcp(const Url& url) {
+FdGuard ConnectTcp(const Url& url, const std::string& resolved_address) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    if (!resolved_address.empty()) {
+        hints.ai_flags = AI_NUMERICHOST;
+    }
 
     addrinfo* raw = nullptr;
     const auto service = std::to_string(url.port);
-    const int code = getaddrinfo(url.host.c_str(), service.c_str(), &hints, &raw);
+    const auto& connect_host = resolved_address.empty() ? url.host : resolved_address;
+    const int code = getaddrinfo(connect_host.c_str(), service.c_str(), &hints, &raw);
     if (code != 0) {
         throw std::runtime_error(gai_strerror(code));
     }
@@ -356,6 +457,16 @@ CurlHttpClient::CurlHttpClient(Config config)
 CurlHttpClient::~CurlHttpClient() = default;
 
 HttpResponse CurlHttpClient::Get(const Url& url) const {
+    return GetResolved(url, {});
+}
+
+std::vector<std::string> CurlHttpClient::Resolve(const Url& url) const {
+    return ResolveAddresses(url);
+}
+
+HttpResponse CurlHttpClient::GetResolved(
+    const Url& url,
+    const std::string& resolved_address) const {
     if (url.scheme != "http") {
         throw std::runtime_error("alternator_client_cpp was built without libcurl support; https is unavailable");
     }
@@ -375,7 +486,7 @@ HttpResponse CurlHttpClient::Get(const Url& url) const {
     }
     request << "\r\n";
 
-    auto fd = ConnectTcp(url);
+    auto fd = ConnectTcp(url, resolved_address);
     SendAll(fd.get(), request.str());
     return ParseHttpResponse(
         ReadAll(fd.get()),
@@ -383,6 +494,16 @@ HttpResponse CurlHttpClient::Get(const Url& url) const {
 }
 
 #endif
+
+std::vector<std::string> HttpClient::Resolve(const Url& url) const {
+    return {url.host};
+}
+
+HttpResponse HttpClient::GetResolved(
+    const Url& url,
+    const std::string&) const {
+    return Get(url);
+}
 
 std::shared_ptr<HttpClient> NewDefaultHttpClient(const Config& config) {
     return std::make_shared<CurlHttpClient>(config);

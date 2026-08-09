@@ -308,6 +308,22 @@ cfg.idle_nodes_list_update_period = std::chrono::minutes(1);
 The AWS helper starts and stops this background refresh automatically. The core `AlternatorLiveNodes`
 type leaves lifecycle control to the caller.
 
+Each discovery attempt resolves every endpoint it tries and uses each unique
+resolved address at most once. Retained DNS seed entrypoints are re-resolved
+whenever discovery falls back to them. Connection failures, non-200 responses,
+malformed JSON, and empty or unusable `/localnodes` data cause discovery to
+continue with the next address or configured seed. Requests still use the
+configured hostname for the HTTP `Host` header and, with libcurl HTTPS, TLS SNI
+and certificate verification. A failed refresh keeps the last complete learned
+node set. When every learned node is down, `NextNode()` performs one serialized
+recovery attempt through responsive nodes and retained seeds before returning no
+endpoint.
+
+Custom `HttpClient` implementations can override `Resolve()` and
+`GetResolved()` to provide the same address-level behavior. Their default
+implementations preserve compatibility by returning the logical host and
+delegating to `Get()`.
+
 When libcurl is available, the default discovery client reuses HTTP connections by default. It keeps
 a libcurl connection cache bounded by `max_connections` and can be disabled for debugging or
 compatibility:
@@ -413,6 +429,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 - `/localnodes` discovery with cluster, datacenter, and rack scopes.
 - Scope fallback chains such as rack -> datacenter -> cluster.
 - Cluster scope merge across configured initial nodes.
+- DNS re-resolution, per-address discovery fallback, and seed recovery after all learned nodes fail.
 - Active and idle `/localnodes` refresh cadence.
 - Reused libcurl discovery HTTP connections with an opt-out switch.
 - TLS session cache enable/disable, cache size, and timeout configuration for HTTPS discovery.
