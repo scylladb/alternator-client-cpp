@@ -319,6 +319,22 @@ node set. When every learned node is down, `NextNode()` performs one serialized
 recovery attempt through responsive nodes and retained seeds before returning no
 endpoint.
 
+The default client bounds each resolved-address discovery request with
+`discovery_attempt_timeout` (5 seconds by default). This safety ceiling applies
+even though `http_client_timeout` defaults to zero for compatibility. If both
+values are positive, the shorter value wins; setting
+`discovery_attempt_timeout` to zero disables the extra ceiling. With both values
+zero, a peer that accepts a connection but never responds can block discovery
+indefinitely. `connect_timeout` defaults to 1 second and separately bounds the
+connection phase.
+
+Hostname resolution uses the platform's synchronous `getaddrinfo()` call. POSIX
+does not provide a portable deadline or cancellation API for that call, so its
+timing follows the operating system resolver configuration. The client does not
+launch detached resolver threads, which avoids accumulating unbounded threads
+when a resolver stalls. Applications that require an application-owned DNS
+deadline can supply an `HttpClient` that overrides `Resolve()`.
+
 Custom `HttpClient` implementations can override `Resolve()` and
 `GetResolved()` to provide the same address-level behavior. Their default
 implementations preserve compatibility by returning the logical host and
@@ -334,7 +350,10 @@ cfg.max_connections = 100;
 cfg.reuse_discovery_connections = false;
 ```
 
-The POSIX fallback discovery client supports plain HTTP only and closes each request.
+The POSIX fallback discovery client supports plain HTTP only and closes each
+request. It uses nonblocking sockets and monotonic poll deadlines for connect,
+send, and receive. A disabled deadline waits in the kernel rather than polling
+in a busy loop.
 
 TLS session caching is enabled by default for HTTPS discovery. The libcurl session cache can be
 disabled, and OpenSSL-backed libcurl builds also honor the configured cache size and timeout:

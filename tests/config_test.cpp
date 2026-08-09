@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 
 using namespace scylladb::alternator;
@@ -37,4 +38,12 @@ TEST(Config, UserAgentCanBeCleared) {
     config.user_agent.clear();
 
     EXPECT_TRUE(config.user_agent.empty());
+}
+
+TEST(Config, DefaultDiscoveryTimeoutsAreFiniteWithoutChangingHttpTimeoutCompatibility) {
+    const Config config;
+
+    EXPECT_EQ(config.http_client_timeout, std::chrono::milliseconds::zero());
+    EXPECT_EQ(config.connect_timeout, std::chrono::seconds{1});
+    EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
 }

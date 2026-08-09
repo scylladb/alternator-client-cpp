@@ -15,8 +15,13 @@
  */
 
 #include <scylladb/alternator/http_client.h>
+#include <scylladb/alternator/live_nodes.h>
 
 #include <arpa/inet.h>
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL && defined(__linux__)
+#include <fcntl.h>
+#include <poll.h>
+#endif
 #include <netinet/in.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -30,6 +35,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -125,7 +131,9 @@ public:
 
     ~LocalHttpServer() {
         if (fd_ >= 0) {
+            shutdown(fd_, SHUT_RDWR);
             close(fd_);
+            fd_ = -1;
         }
         if (worker_.joinable()) {
             worker_.join();
@@ -147,6 +155,189 @@ private:
     std::string content_encoding_;
     std::string request_;
     std::thread worker_;
+};
+
+class UnavailableIpv6Socket {
+public:
+    explicit UnavailableIpv6Socket(std::uint16_t port) {
+        fd_ = socket(AF_INET6, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error("IPv6 socket failed");
+        }
+        int yes = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        setsockopt(fd_, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes));
+        sockaddr_in6 address{};
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_loopback;
+        address.sin6_port = htons(port);
+        if (bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("IPv6 unavailable-address bind failed");
+        }
+    }
+
+    ~UnavailableIpv6Socket() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    UnavailableIpv6Socket(const UnavailableIpv6Socket&) = delete;
+    UnavailableIpv6Socket& operator=(const UnavailableIpv6Socket&) = delete;
+
+private:
+    int fd_ = -1;
+};
+
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL && defined(__linux__)
+class SaturatedTcpListener {
+public:
+    SaturatedTcpListener() {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            return;
+        }
+        int yes = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            listen(fd_, 1) != 0) {
+            Close();
+            return;
+        }
+        socklen_t address_size = sizeof(address);
+        if (getsockname(
+                fd_,
+                reinterpret_cast<sockaddr*>(&address),
+                &address_size) != 0) {
+            Close();
+            return;
+        }
+        port_ = ntohs(address.sin_port);
+
+        // Linux leaves further loopback connects pending once this deliberately
+        // tiny accept queue is full. That provides a local, packet-loss-free
+        // connect-timeout fixture without depending on an external address.
+        for (int attempt = 0; attempt < 32; ++attempt) {
+            const int client = socket(AF_INET, SOCK_STREAM, 0);
+            if (client < 0) {
+                break;
+            }
+            const int flags = fcntl(client, F_GETFL, 0);
+            if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
+                close(client);
+                break;
+            }
+            const int result = connect(
+                client,
+                reinterpret_cast<sockaddr*>(&address),
+                sizeof(address));
+            if (result != 0 && errno != EINPROGRESS) {
+                close(client);
+                continue;
+            }
+            clients_.push_back(client);
+            if (result == 0) {
+                continue;
+            }
+
+            pollfd descriptor{};
+            descriptor.fd = client;
+            descriptor.events = POLLOUT;
+            int poll_result = 0;
+            do {
+                poll_result = poll(&descriptor, 1, 20);
+            } while (poll_result < 0 && errno == EINTR);
+            if (poll_result == 0) {
+                saturated_ = true;
+                break;
+            }
+            if (poll_result < 0) {
+                break;
+            }
+            int socket_error = 0;
+            socklen_t socket_error_size = sizeof(socket_error);
+            if (getsockopt(
+                    client,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    &socket_error,
+                    &socket_error_size) != 0 ||
+                socket_error != 0) {
+                close(client);
+                clients_.pop_back();
+            }
+        }
+    }
+
+    ~SaturatedTcpListener() {
+        Close();
+    }
+
+    SaturatedTcpListener(const SaturatedTcpListener&) = delete;
+    SaturatedTcpListener& operator=(const SaturatedTcpListener&) = delete;
+
+    [[nodiscard]] bool Ready() const {
+        return saturated_;
+    }
+
+    [[nodiscard]] std::uint16_t Port() const {
+        return port_;
+    }
+
+private:
+    void Close() {
+        for (const int client : clients_) {
+            close(client);
+        }
+        clients_.clear();
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    int fd_ = -1;
+    std::uint16_t port_ = 0;
+    bool saturated_ = false;
+    std::vector<int> clients_;
+};
+#endif
+
+class FixedAddressHttpClient final : public HttpClient {
+public:
+    FixedAddressHttpClient(Config config, std::vector<std::string> addresses)
+        : delegate_(std::move(config))
+        , addresses_(std::move(addresses)) {}
+
+    HttpResponse Get(const Url& url) const override {
+        return delegate_.Get(url);
+    }
+
+    std::vector<std::string> Resolve(const Url&) const override {
+        return addresses_;
+    }
+
+    HttpResponse GetResolved(
+        const Url& url,
+        const std::string& resolved_address) const override {
+        attempts_.push_back(resolved_address);
+        return delegate_.GetResolved(url, resolved_address);
+    }
+
+    [[nodiscard]] const std::vector<std::string>& Attempts() const {
+        return attempts_;
+    }
+
+private:
+    CurlHttpClient delegate_;
+    std::vector<std::string> addresses_;
+    mutable std::vector<std::string> attempts_;
 };
 
 class CountingHttpServer {
@@ -444,6 +635,23 @@ bool LocalhostHasAddressFamily(int family) {
     return true;
 }
 
+bool LocalhostUnspecifiedLookupHasAddressFamily(int family) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* raw = nullptr;
+    if (getaddrinfo("localhost", nullptr, &hints, &raw) != 0) {
+        return false;
+    }
+    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> results(raw, &freeaddrinfo);
+    for (auto* current = results.get(); current != nullptr; current = current->ai_next) {
+        if (current->ai_family == family) {
+            return true;
+        }
+    }
+    return false;
+}
+
 TEST(HttpClient, PerformsPlainHttpGet) {
     LocalHttpServer server;
 
@@ -523,7 +731,6 @@ TEST(HttpClient, ResolveReportsDnsFailure) {
 }
 
 TEST(HttpClient, ConfiguredTimeoutBoundsStalledResolvedAddress) {
-#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
     StallingHttpServer server;
 
     Config cfg;
@@ -540,8 +747,91 @@ TEST(HttpClient, ConfiguredTimeoutBoundsStalledResolvedAddress) {
     EXPECT_TRUE(server.Accepted());
     EXPECT_GE(elapsed, std::chrono::milliseconds{50});
     EXPECT_LT(elapsed, std::chrono::seconds{2});
+}
+
+TEST(HttpClient, NoCurlConnectTimeoutBoundsSaturatedListener) {
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL && defined(__linux__)
+    SaturatedTcpListener server;
+    if (!server.Ready()) {
+        GTEST_SKIP() << "could not saturate the local TCP accept queue";
+    }
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.connect_timeout = std::chrono::milliseconds{100};
+    cfg.http_client_timeout = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::seconds{1};
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes");
+
+    std::string error_message;
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        (void)client.GetResolved(url, "127.0.0.1");
+    } catch (const std::runtime_error& error) {
+        error_message = error.what();
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_NE(error_message.find("connect timed out"), std::string::npos);
+    EXPECT_GE(elapsed, std::chrono::milliseconds{50});
+    EXPECT_LT(elapsed, std::chrono::seconds{2});
 #else
-    GTEST_SKIP() << "libcurl is required";
+    GTEST_SKIP() << "deterministic saturated-listener fixture is Linux no-curl only";
+#endif
+}
+
+TEST(HttpClient, DiscoverySafetyTimeoutBoundsAllUnavailableAddresses) {
+    StallingHttpServer server;
+    UnavailableIpv6Socket unavailable(server.Port());
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.port = server.Port();
+    cfg.connect_timeout = std::chrono::seconds{1};
+    cfg.http_client_timeout = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::milliseconds{100};
+    cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    auto http = std::make_shared<FixedAddressHttpClient>(
+        cfg,
+        std::vector<std::string>{"127.0.0.1", "::1"});
+    AlternatorLiveNodes nodes({"localhost"}, cfg, http);
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_THROW(nodes.UpdateLiveNodes(), std::runtime_error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_TRUE(server.Accepted());
+    EXPECT_EQ(http->Attempts(), std::vector<std::string>({"127.0.0.1", "::1"}));
+    EXPECT_GE(elapsed, std::chrono::milliseconds{50});
+    EXPECT_LT(elapsed, std::chrono::seconds{2});
+}
+
+TEST(HttpClient, NoCurlDiscoveryFallsBackFromUnavailableIPv6ToIPv4) {
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
+    LocalHttpServer server;
+    UnavailableIpv6Socket unavailable(server.Port());
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.port = server.Port();
+    cfg.connect_timeout = std::chrono::milliseconds{100};
+    cfg.http_client_timeout = std::chrono::milliseconds{1000};
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+    auto http = std::make_shared<FixedAddressHttpClient>(
+        cfg,
+        std::vector<std::string>{"::1", "127.0.0.1"});
+
+    AlternatorLiveNodes nodes({"localhost"}, cfg, http);
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+
+    EXPECT_EQ(http->Attempts(), std::vector<std::string>({"::1", "127.0.0.1"}));
+    EXPECT_EQ(nodes.GetNodes(),
+              std::vector<Url>({Url("http", "node1.local", server.Port())}));
+#else
+    GTEST_SKIP() << "plain socket fallback is only used without libcurl";
 #endif
 }
 
@@ -580,6 +870,11 @@ TEST(HttpClient, DualStackDnsFallsBackToReachableIPv6) {
     if (!LocalhostHasAddressFamily(AF_INET) || !LocalhostHasAddressFamily(AF_INET6)) {
         GTEST_SKIP() << "localhost does not resolve to both IPv4 and IPv6";
     }
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
+    if (!LocalhostUnspecifiedLookupHasAddressFamily(AF_INET6)) {
+        GTEST_SKIP() << "AF_UNSPEC localhost lookup does not return IPv6";
+    }
+#endif
     LocalHttpServer server("[\"::1\"]", {}, AF_INET6);
 
     Config cfg;

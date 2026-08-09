@@ -127,8 +127,14 @@ struct Config {
 
     std::chrono::milliseconds nodes_list_update_period{std::chrono::seconds(1)};
     std::chrono::milliseconds idle_nodes_list_update_period{std::chrono::minutes(1)};
+    // Positive values bound the whole HTTP transfer and connection phase,
+    // respectively. Non-positive values disable the corresponding limit.
     std::chrono::milliseconds http_client_timeout{0};
     std::chrono::milliseconds connect_timeout{1000};
+    // Per-resolved-address safety ceiling used by the default discovery HTTP
+    // client. The shorter positive value wins when http_client_timeout is also
+    // configured. Non-positive values disable this additional ceiling.
+    std::chrono::milliseconds discovery_attempt_timeout{5000};
 
     bool verify_ssl = true;
     std::string ca_file;

@@ -27,12 +27,18 @@
 #include <openssl/ssl.h>
 #endif
 #else
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #endif
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -74,6 +80,18 @@ std::vector<std::string> ResolveAddresses(const Url& url) {
         throw std::runtime_error("DNS resolution returned no usable addresses for " + url.host);
     }
     return addresses;
+}
+
+std::chrono::milliseconds EffectiveDiscoveryTimeout(const Config& config) {
+    const auto request_timeout = config.http_client_timeout;
+    const auto safety_timeout = config.discovery_attempt_timeout;
+    if (request_timeout <= std::chrono::milliseconds::zero()) {
+        return safety_timeout;
+    }
+    if (safety_timeout <= std::chrono::milliseconds::zero()) {
+        return request_timeout;
+    }
+    return std::min(request_timeout, safety_timeout);
 }
 
 } // namespace
@@ -182,7 +200,7 @@ void ConfigureCurlForGet(
         curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_entries);
     }
 
-    SetDuration(curl, CURLOPT_TIMEOUT_MS, config.http_client_timeout);
+    SetDuration(curl, CURLOPT_TIMEOUT_MS, EffectiveDiscoveryTimeout(config));
     SetDuration(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout);
 
     if (!config.user_agent.empty()) {
@@ -356,10 +374,85 @@ private:
     int fd_ = -1;
 };
 
-std::string ReadAll(int fd) {
+using IoClock = std::chrono::steady_clock;
+using IoDeadline = std::optional<IoClock::time_point>;
+
+IoDeadline MakeDeadline(
+    IoClock::time_point started,
+    std::chrono::milliseconds timeout) {
+    if (timeout <= std::chrono::milliseconds::zero()) {
+        return std::nullopt;
+    }
+    const auto maximum_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+        IoClock::time_point::max() - started);
+    if (timeout >= maximum_timeout) {
+        return IoClock::time_point::max();
+    }
+    return started + timeout;
+}
+
+IoDeadline EarlierDeadline(const IoDeadline& left, const IoDeadline& right) {
+    if (!left) {
+        return right;
+    }
+    if (!right) {
+        return left;
+    }
+    return std::min(*left, *right);
+}
+
+int RemainingTimeoutMilliseconds(const IoDeadline& deadline) {
+    if (!deadline) {
+        return -1;
+    }
+    const auto remaining = *deadline - IoClock::now();
+    if (remaining <= IoClock::duration::zero()) {
+        return 0;
+    }
+    auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    if (milliseconds < remaining) {
+        milliseconds += std::chrono::milliseconds{1};
+    }
+    if (milliseconds.count() > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(milliseconds.count());
+}
+
+void WaitForSocket(int fd, short events, const IoDeadline& deadline, const char* operation) {
+    while (true) {
+        pollfd descriptor{};
+        descriptor.fd = fd;
+        descriptor.events = events;
+        const int result = poll(
+            &descriptor,
+            1,
+            RemainingTimeoutMilliseconds(deadline));
+        if (result > 0) {
+            return;
+        }
+        if (result == 0) {
+            throw std::runtime_error(std::string(operation) + " timed out");
+        }
+        if (errno != EINTR) {
+            throw std::runtime_error(
+                std::string(operation) + " poll failed: " + std::strerror(errno));
+        }
+    }
+}
+
+void SetNonBlocking(int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        throw std::runtime_error("failed to configure nonblocking socket");
+    }
+}
+
+std::string ReadAll(int fd, const IoDeadline& deadline) {
     std::string data;
     char buffer[4096];
     while (true) {
+        WaitForSocket(fd, POLLIN, deadline, "HTTP receive");
         const auto n = recv(fd, buffer, sizeof(buffer), 0);
         if (n == 0) {
             break;
@@ -368,28 +461,50 @@ std::string ReadAll(int fd) {
             if (errno == EINTR) {
                 continue;
             }
-            throw std::runtime_error("recv failed");
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            throw std::runtime_error("recv failed: " + std::string(std::strerror(errno)));
         }
         data.append(buffer, static_cast<std::size_t>(n));
     }
     return data;
 }
 
-void SendAll(int fd, const std::string& data) {
+void SendAll(int fd, const std::string& data, const IoDeadline& deadline) {
     std::size_t sent = 0;
     while (sent < data.size()) {
-        const auto n = send(fd, data.data() + sent, data.size() - sent, 0);
+        WaitForSocket(fd, POLLOUT, deadline, "HTTP send");
+#ifdef MSG_NOSIGNAL
+        constexpr int send_flags = MSG_NOSIGNAL;
+#else
+        constexpr int send_flags = 0;
+#endif
+        const auto n = send(
+            fd,
+            data.data() + sent,
+            data.size() - sent,
+            send_flags);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            throw std::runtime_error("send failed");
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            throw std::runtime_error("send failed: " + std::string(std::strerror(errno)));
+        }
+        if (n == 0) {
+            throw std::runtime_error("send returned no progress");
         }
         sent += static_cast<std::size_t>(n);
     }
 }
 
-FdGuard ConnectTcp(const Url& url, const std::string& resolved_address) {
+FdGuard ConnectTcp(
+    const Url& url,
+    const std::string& resolved_address,
+    const IoDeadline& deadline) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -406,17 +521,49 @@ FdGuard ConnectTcp(const Url& url, const std::string& resolved_address) {
     }
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> results(raw, &freeaddrinfo);
 
+    std::string last_error = "connect failed";
     for (auto* it = results.get(); it != nullptr; it = it->ai_next) {
+        if (deadline && IoClock::now() >= *deadline) {
+            throw std::runtime_error("connect timed out");
+        }
         int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if (fd < 0) {
             continue;
         }
         FdGuard guard(fd);
+        try {
+            SetNonBlocking(fd);
+        } catch (const std::exception& error) {
+            last_error = error.what();
+            continue;
+        }
+
         if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
             return guard;
         }
+        if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+            last_error = "connect failed: " + std::string(std::strerror(errno));
+            continue;
+        }
+
+        WaitForSocket(fd, POLLOUT, deadline, "connect");
+        int socket_error = 0;
+        socklen_t socket_error_size = sizeof(socket_error);
+        if (getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                &socket_error,
+                &socket_error_size) != 0) {
+            last_error = "getsockopt(SO_ERROR) failed: " + std::string(std::strerror(errno));
+            continue;
+        }
+        if (socket_error == 0) {
+            return guard;
+        }
+        last_error = "connect failed: " + std::string(std::strerror(socket_error));
     }
-    throw std::runtime_error("connect failed");
+    throw std::runtime_error(last_error);
 }
 
 HttpResponse ParseHttpResponse(
@@ -486,10 +633,15 @@ HttpResponse CurlHttpClient::GetResolved(
     }
     request << "\r\n";
 
-    auto fd = ConnectTcp(url, resolved_address);
-    SendAll(fd.get(), request.str());
+    const auto started = IoClock::now();
+    const auto request_deadline = MakeDeadline(started, EffectiveDiscoveryTimeout(config_));
+    const auto connect_deadline = EarlierDeadline(
+        MakeDeadline(started, config_.connect_timeout),
+        request_deadline);
+    auto fd = ConnectTcp(url, resolved_address, connect_deadline);
+    SendAll(fd.get(), request.str(), request_deadline);
     return ParseHttpResponse(
-        ReadAll(fd.get()),
+        ReadAll(fd.get(), request_deadline),
         config_.content_encoding_decoders);
 }
 
