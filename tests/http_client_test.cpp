@@ -31,11 +31,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
 #endif
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -283,6 +285,85 @@ private:
     std::thread worker_;
 };
 
+class StallingHttpServer {
+public:
+    StallingHttpServer() {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error("socket failed");
+        }
+
+        int yes = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            listen(fd_, 1) != 0) {
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("bind/listen failed");
+        }
+        socklen_t address_size = sizeof(address);
+        if (getsockname(
+                fd_,
+                reinterpret_cast<sockaddr*>(&address),
+                &address_size) != 0) {
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("getsockname failed");
+        }
+        port_ = ntohs(address.sin_port);
+
+        worker_ = std::thread([this] {
+            const int client = accept(fd_, nullptr, nullptr);
+            if (client < 0) {
+                return;
+            }
+            accepted_.store(true);
+            char buffer[1024];
+            (void)recv(client, buffer, sizeof(buffer), 0);
+            std::unique_lock<std::mutex> lock(mutex_);
+            condition_.wait(lock, [this] { return release_; });
+            close(client);
+        });
+    }
+
+    ~StallingHttpServer() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            release_ = true;
+        }
+        condition_.notify_all();
+        if (fd_ >= 0) {
+            shutdown(fd_, SHUT_RDWR);
+            close(fd_);
+            fd_ = -1;
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    [[nodiscard]] std::uint16_t Port() const {
+        return port_;
+    }
+
+    [[nodiscard]] bool Accepted() const {
+        return accepted_.load();
+    }
+
+private:
+    int fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::atomic<bool> accepted_{false};
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool release_ = false;
+    std::thread worker_;
+};
+
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 std::string CompressBody(const std::string& body, int window_bits) {
     if (body.size() > std::numeric_limits<uInt>::max()) {
@@ -439,6 +520,29 @@ TEST(HttpClient, ResolveReportsDnsFailure) {
     EXPECT_THROW(
         (void)client.Resolve(Url("http", "does-not-exist.invalid", 8080)),
         std::runtime_error);
+}
+
+TEST(HttpClient, ConfiguredTimeoutBoundsStalledResolvedAddress) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
+    StallingHttpServer server;
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.connect_timeout = std::chrono::milliseconds{100};
+    cfg.http_client_timeout = std::chrono::milliseconds{100};
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes");
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_THROW((void)client.GetResolved(url, "127.0.0.1"), std::runtime_error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_TRUE(server.Accepted());
+    EXPECT_GE(elapsed, std::chrono::milliseconds{50});
+    EXPECT_LT(elapsed, std::chrono::seconds{2});
+#else
+    GTEST_SKIP() << "libcurl is required";
+#endif
 }
 
 TEST(HttpClient, PerformsPlainHttpGetOverIPv6Literal) {

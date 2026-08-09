@@ -16,6 +16,8 @@
 
 #include <scylladb/alternator/live_nodes.h>
 
+#include <arpa/inet.h>
+
 #include <algorithm>
 #include <cctype>
 #include <exception>
@@ -137,13 +139,24 @@ std::vector<std::string> ParseJsonStringArray(const std::string& body) {
     return out;
 }
 
+bool IsUsableNodeHost(const std::string& node) {
+    if (node.empty() || std::any_of(node.begin(), node.end(), [](unsigned char ch) {
+            return std::isspace(ch) != 0 || std::iscntrl(ch) != 0;
+        })) {
+        return false;
+    }
+    if (node.find(':') != std::string::npos) {
+        in6_addr address{};
+        return inet_pton(AF_INET6, node.c_str(), &address) == 1;
+    }
+    return node.find_first_of("/?#[]@!$&'()*+,;=%\\") == std::string::npos;
+}
+
 std::vector<Url> ToUrls(const std::vector<std::string>& nodes, const Config& config) {
     std::vector<Url> urls;
     urls.reserve(nodes.size());
     for (const auto& node : nodes) {
-        if (node.empty() || std::any_of(node.begin(), node.end(), [](unsigned char ch) {
-                return std::isspace(ch) != 0 || std::iscntrl(ch) != 0;
-            })) {
+        if (!IsUsableNodeHost(node)) {
             continue;
         }
         urls.emplace_back(config.scheme, node, config.port);
@@ -512,7 +525,8 @@ std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) 
         throw std::runtime_error("DNS resolution returned no usable addresses for " + endpoint.host);
     }
 
-    std::exception_ptr last_nonempty_error;
+    std::exception_ptr last_error;
+    std::exception_ptr last_invalid_response_error;
     bool saw_empty_response = false;
     for (const auto& address : unique_addresses) {
         try {
@@ -521,34 +535,47 @@ std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) 
                 throw HttpStatusError(endpoint, address, resp.status_code);
             }
 
-            std::vector<Url> nodes;
+            std::vector<std::string> parsed_nodes;
             try {
-                nodes = ToUrls(ParseJsonStringArray(resp.body), config_);
+                parsed_nodes = ParseJsonStringArray(resp.body);
             } catch (const std::exception& error) {
                 throw InvalidHttpResponseError(endpoint, address, error.what());
             }
-            if (nodes.empty()) {
+            if (parsed_nodes.empty()) {
                 saw_empty_response = true;
                 continue;
             }
+            auto nodes = ToUrls(parsed_nodes, config_);
+            if (nodes.empty()) {
+                throw InvalidHttpResponseError(
+                    endpoint,
+                    address,
+                    "non-empty list contained no usable node hosts");
+            }
             return nodes;
         } catch (const HttpStatusError&) {
-            last_nonempty_error = std::current_exception();
+            last_error = std::current_exception();
         } catch (const InvalidHttpResponseError&) {
-            last_nonempty_error = std::current_exception();
+            last_invalid_response_error = std::current_exception();
         } catch (const std::exception& error) {
-            last_nonempty_error = std::make_exception_ptr(std::runtime_error(
+            last_error = std::make_exception_ptr(std::runtime_error(
                 "request to " + endpoint.ToString() + " via " + address +
                 " failed: " + error.what()));
         } catch (...) {
-            last_nonempty_error = std::make_exception_ptr(std::runtime_error(
+            last_error = std::make_exception_ptr(std::runtime_error(
                 "request to " + endpoint.ToString() + " via " + address +
                 " failed with an unknown error"));
         }
     }
 
-    if (last_nonempty_error) {
-        std::rethrow_exception(last_nonempty_error);
+    if (saw_empty_response && !endpoint.query.empty()) {
+        return {};
+    }
+    if (last_invalid_response_error) {
+        std::rethrow_exception(last_invalid_response_error);
+    }
+    if (last_error) {
+        std::rethrow_exception(last_error);
     }
     if (saw_empty_response) {
         return {};

@@ -223,6 +223,68 @@ TEST(AlternatorLiveNodes, RoutingScopeFallbackRetriesKnownNodes) {
     EXPECT_GT(fallback_requests.load(), 0);
 }
 
+TEST(AlternatorLiveNodes, ScopedEmptyAddressWinsOverSiblingFailureAndUsesFallbackScope) {
+    Config cfg;
+    cfg.routing_scope = NewDCScope("missing", NewDCScope("fallback"));
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::vector<std::string> attempts;
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) {
+            return std::vector<std::string>{"192.0.2.80", "192.0.2.81"};
+        },
+        [&](const Url& url, const std::string& address) -> HttpResponse {
+            attempts.push_back(url.query + "@" + address);
+            if (url.query == "dc=missing") {
+                if (address == "192.0.2.80") {
+                    return {200, "[]"};
+                }
+                throw std::runtime_error("connection reset");
+            }
+            EXPECT_EQ(url.query, "dc=fallback");
+            return {200, R"(["fallback.internal"])"};
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    EXPECT_NO_THROW(nodes.UpdateLiveNodes());
+
+    EXPECT_EQ(attempts,
+              std::vector<std::string>({
+                  "dc=missing@192.0.2.80",
+                  "dc=missing@192.0.2.81",
+                  "dc=fallback@192.0.2.80",
+              }));
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"fallback.internal"}));
+}
+
+TEST(AlternatorLiveNodes, WhollyUnusableAddressWinsOverSiblingFailureAndFailsClearly) {
+    Config cfg;
+    cfg.routing_scope = NewDCScope("dc1", NewClusterScope());
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) {
+            return std::vector<std::string>{"192.0.2.82", "192.0.2.83"};
+        },
+        [](const Url&, const std::string& address) -> HttpResponse {
+            if (address == "192.0.2.82") {
+                return {200, R"(["","https://node.internal/path","node.internal:8080"])"};
+            }
+            throw std::runtime_error("connection reset");
+        });
+
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    try {
+        nodes.UpdateLiveNodes();
+        FAIL() << "wholly unusable response unexpectedly used fallback scope";
+    } catch (const std::runtime_error& error) {
+        EXPECT_NE(std::string(error.what()).find("no usable node hosts"), std::string::npos);
+    }
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"seed.example"}));
+}
+
 TEST(AlternatorLiveNodes, ClusterScopeMergesSeedNodes) {
     Config cfg;
     cfg.routing_scope = NewClusterScope();
@@ -313,7 +375,7 @@ TEST(AlternatorLiveNodes, DnsEntrypointFallsBackAfterNon200MalformedAndEmptyResp
                 return HttpResponse{200, R"({"nodes":["wrong-shape"]})"};
             }
             if (address == "192.0.2.12") {
-                return HttpResponse{200, R"(["","   "])"};
+                return HttpResponse{200, "[]"};
             }
             return HttpResponse{200, R"(["node-a.internal","node-b.internal"])"};
         });
@@ -404,7 +466,7 @@ TEST(AlternatorLiveNodes, EmptyClusterResponsesFailClearly) {
             return std::vector<std::string>{"192.0.2.25"};
         },
         [](const Url&, const std::string&) {
-            return HttpResponse{200, R"(["","   "])"};
+            return HttpResponse{200, "[]"};
         });
 
     AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
@@ -525,7 +587,9 @@ TEST(AlternatorLiveNodes, MixedLocalNodesResponseKeepsUsableUniqueEntries) {
             return std::vector<std::string>{"192.0.2.60"};
         },
         [](const Url&, const std::string&) {
-            return HttpResponse{200, R"(["","   ","node-a.internal","node-a.internal","node-b.internal"])"};
+            return HttpResponse{
+                200,
+                R"(["","   ","https://bad.internal/path","node.internal:8080","node-a.internal","node-a.internal","node-b.internal"])"};
         });
 
     AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
