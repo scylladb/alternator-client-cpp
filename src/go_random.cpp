@@ -221,12 +221,13 @@ void GoRandom::Seed(std::int64_t seed) {
     for (int i = -20; i < rng_len; ++i) {
         x = SeedRand(x);
         if (i >= 0) {
-            std::int64_t u = static_cast<std::int64_t>(x) << 40U;
+            std::uint64_t u = static_cast<std::uint64_t>(x) << 40U;
             x = SeedRand(x);
-            u ^= static_cast<std::int64_t>(x) << 20U;
+            u ^= static_cast<std::uint64_t>(x) << 20U;
             x = SeedRand(x);
-            u ^= static_cast<std::int64_t>(x);
-            u ^= rng_cooked[static_cast<std::size_t>(i)];
+            u ^= static_cast<std::uint64_t>(x);
+            u ^= static_cast<std::uint64_t>(
+                rng_cooked[static_cast<std::size_t>(i)]);
             vec_[static_cast<std::size_t>(i)] = u;
         }
     }
@@ -245,7 +246,7 @@ std::uint64_t GoRandom::Uint64() {
 
     const auto tap = static_cast<std::size_t>(tap_);
     const auto feed = static_cast<std::size_t>(feed_);
-    const std::int64_t x = vec_[feed] + vec_[tap];
+    const std::uint64_t x = vec_[feed] + vec_[tap];
     vec_[feed] = x;
     return static_cast<std::uint64_t>(x);
 }

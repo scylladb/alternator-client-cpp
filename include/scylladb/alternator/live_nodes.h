@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <map>
@@ -63,20 +64,39 @@ public:
     [[nodiscard]] const Config& GetConfig() const;
 
 private:
-    void RecoverLiveNodesIfNeeded();
-    void UpdateLiveNodesLocked(const std::atomic<bool>* resolution_cancellation = nullptr);
-    [[nodiscard]] std::vector<Url> FetchLiveNodes(
-        const std::atomic<bool>* resolution_cancellation = nullptr);
+    struct LiveNodesDiscovery {
+        std::vector<Url> nodes;
+        RoutingScopePtr scope;
+    };
+
+    void RecoverLiveNodesIfNeeded(std::uint64_t observed_recovery_generation);
+    void UpdateLiveNodesLocked(
+        const std::atomic<bool>* resolution_cancellation = nullptr,
+        bool probe_down_nodes = true);
+    void PublishLiveNodes(
+        std::vector<Url> nodes,
+        RoutingScopePtr published_scope,
+        const std::atomic<bool>* resolution_cancellation = nullptr,
+        std::chrono::steady_clock::time_point discovery_deadline =
+            std::chrono::steady_clock::time_point::max());
+    [[nodiscard]] LiveNodesDiscovery FetchLiveNodes(
+        const std::atomic<bool>* resolution_cancellation = nullptr,
+        std::chrono::steady_clock::time_point discovery_deadline =
+            std::chrono::steady_clock::time_point::max());
     [[nodiscard]] std::vector<Url> GetNodesForScope(
         const RoutingScope& scope,
-        const std::atomic<bool>* resolution_cancellation = nullptr);
+        const std::atomic<bool>* resolution_cancellation = nullptr,
+        std::chrono::steady_clock::time_point discovery_deadline =
+            std::chrono::steady_clock::time_point::max());
     [[nodiscard]] std::vector<Url> GetNodesFromEndpoint(
         const Url& endpoint,
-        const std::atomic<bool>* resolution_cancellation = nullptr) const;
+        bool seed_candidate,
+        const std::atomic<bool>* resolution_cancellation = nullptr,
+        std::chrono::steady_clock::time_point discovery_deadline =
+            std::chrono::steady_clock::time_point::max()) const;
     std::vector<Url> ProbeDownNodesInternal(
         const std::atomic<bool>* resolution_cancellation);
     void ObserveNodeResult(const Url& node, NodeHealthObservation observation);
-    [[nodiscard]] Url NextKnownNode();
     [[nodiscard]] bool ShouldTryQuarantinedNode(bool active_nodes_empty) const;
     [[nodiscard]] Url NextQuarantinedNode() const;
     [[nodiscard]] Url StickyQuarantinedNodeForHash(std::int64_t hash, const std::vector<Url>& active_nodes) const;
@@ -92,9 +112,11 @@ private:
 
     mutable std::mutex mutex_;
     std::vector<Url> live_nodes_;
+    RoutingScopePtr published_scope_;
     mutable std::map<std::int64_t, Url> quarantine_by_hash_;
     std::unique_ptr<NodeHealthStore> health_store_;
     std::atomic<std::uint64_t> next_node_index_{0};
+    std::atomic<std::uint64_t> recovery_generation_{0};
     mutable std::atomic<std::uint64_t> quarantine_plan_index_{0};
     mutable std::atomic<std::uint64_t> quarantine_node_index_{0};
     std::chrono::steady_clock::time_point next_update_;

@@ -38,12 +38,14 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
 #endif
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -54,6 +56,34 @@
 using namespace scylladb::alternator;
 
 namespace {
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name, const char* value)
+        : name_(name) {
+        if (const char* previous = std::getenv(name); previous != nullptr) {
+            previous_ = previous;
+        }
+        if (setenv(name, value, 1) != 0) {
+            throw std::runtime_error("setenv failed");
+        }
+    }
+
+    ~ScopedEnvironmentVariable() {
+        if (previous_) {
+            (void)setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            (void)unsetenv(name_.c_str());
+        }
+    }
+
+    ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+    ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) = delete;
+
+private:
+    std::string name_;
+    std::optional<std::string> previous_;
+};
 
 class LocalHttpServer {
 public:
@@ -326,18 +356,79 @@ public:
     HttpResponse GetResolved(
         const Url& url,
         const std::string& resolved_address) const override {
-        attempts_.push_back(resolved_address);
-        return delegate_.GetResolved(url, resolved_address);
+        RecordAttempt(resolved_address);
+        try {
+            auto response = delegate_.GetResolved(url, resolved_address);
+            FinishAttempt();
+            return response;
+        } catch (...) {
+            FinishAttempt();
+            throw;
+        }
     }
 
-    [[nodiscard]] const std::vector<std::string>& Attempts() const {
+    HttpResponse GetResolvedWithTimeout(
+        const Url& url,
+        const std::string& resolved_address,
+        std::chrono::milliseconds timeout) const override {
+        RecordAttempt(resolved_address);
+        try {
+            auto response =
+                delegate_.GetResolvedWithTimeout(url, resolved_address, timeout);
+            FinishAttempt();
+            return response;
+        } catch (...) {
+            FinishAttempt();
+            throw;
+        }
+    }
+
+    [[nodiscard]] std::vector<std::string> Attempts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return attempts_;
     }
 
+    [[nodiscard]] bool WaitForAttempts(
+        std::size_t expected,
+        std::chrono::milliseconds timeout = std::chrono::seconds{1}) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [this, expected] {
+            return attempts_.size() >= expected;
+        });
+    }
+
+    [[nodiscard]] bool WaitForIdle(
+        std::chrono::milliseconds timeout = std::chrono::seconds{1}) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [this] {
+            return active_attempts_ == 0U;
+        });
+    }
+
 private:
+    void RecordAttempt(const std::string& resolved_address) const {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            attempts_.push_back(resolved_address);
+            ++active_attempts_;
+        }
+        condition_.notify_all();
+    }
+
+    void FinishAttempt() const {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --active_attempts_;
+        }
+        condition_.notify_all();
+    }
+
     CurlHttpClient delegate_;
     std::vector<std::string> addresses_;
+    mutable std::mutex mutex_;
+    mutable std::condition_variable condition_;
     mutable std::vector<std::string> attempts_;
+    mutable std::size_t active_attempts_ = 0;
 };
 
 class CountingHttpServer {
@@ -685,6 +776,32 @@ TEST(HttpClient, ResolvedAddressPreservesLogicalHostHeader) {
         std::string::npos);
 }
 
+TEST(HttpClient, ResolvedAddressBypassesProxyEnvironment) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
+    LocalHttpServer server;
+    ScopedEnvironmentVariable proxy("http_proxy", "http://127.0.0.1:1");
+    ScopedEnvironmentVariable no_proxy("no_proxy", "");
+
+    Config cfg;
+    cfg.scheme = "http";
+    CurlHttpClient client(cfg);
+    const auto logical_url = Url(
+        "http",
+        "proxy-must-not-resolve.invalid",
+        server.Port()).WithPathAndQuery("/localnodes");
+
+    const auto response = client.GetResolved(logical_url, "127.0.0.1");
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_NE(
+        server.Request().find(
+            "Host: proxy-must-not-resolve.invalid:" + std::to_string(server.Port())),
+        std::string::npos);
+#else
+    GTEST_SKIP() << "proxy environment behavior is libcurl-specific";
+#endif
+}
+
 TEST(HttpClient, ResolvedIPv6AddressPreservesLogicalHostHeader) {
     LocalHttpServer server("[\"::1\"]", {}, AF_INET6);
 
@@ -749,6 +866,63 @@ TEST(HttpClient, ConfiguredTimeoutBoundsStalledResolvedAddress) {
     EXPECT_LT(elapsed, std::chrono::seconds{2});
 }
 
+TEST(HttpClient, PerCallTimeoutBoundsStalledResolvedAddress) {
+    StallingHttpServer server;
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.connect_timeout = std::chrono::seconds{1};
+    cfg.http_client_timeout = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::seconds{2};
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "localhost", server.Port())
+        .WithPathAndQuery("/localnodes");
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_THROW(
+        (void)client.GetResolvedWithTimeout(
+            url,
+            "127.0.0.1",
+            std::chrono::milliseconds{60}),
+        std::runtime_error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_TRUE(server.Accepted());
+    EXPECT_GE(elapsed, std::chrono::milliseconds{30});
+    EXPECT_LT(elapsed, std::chrono::seconds{1});
+}
+
+TEST(HttpClient, RejectsResponseBodyAboveConfiguredDiscoveryLimit) {
+    LocalHttpServer server(std::string(256, 'x'));
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.max_discovery_response_bytes = 32;
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes");
+
+    EXPECT_THROW((void)client.GetResolved(url, "127.0.0.1"), std::runtime_error);
+}
+
+TEST(HttpClient, RejectsGzipExpansionAboveConfiguredDiscoveryLimit) {
+#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
+    const auto compressed = CompressBody(std::string(64U * 1024U, 'x'), MAX_WBITS + 16);
+    ASSERT_LT(compressed.size(), 512U);
+    LocalHttpServer server(compressed, "gzip");
+
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.max_discovery_response_bytes = 512;
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
+    CurlHttpClient client(cfg);
+    const auto url = Url("http", "localhost", server.Port()).WithPathAndQuery("/localnodes");
+
+    EXPECT_THROW((void)client.GetResolved(url, "127.0.0.1"), std::runtime_error);
+#else
+    GTEST_SKIP() << "zlib support is not enabled";
+#endif
+}
+
 TEST(HttpClient, NoCurlConnectTimeoutBoundsSaturatedListener) {
 #if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL && defined(__linux__)
     SaturatedTcpListener server;
@@ -803,6 +977,8 @@ TEST(HttpClient, DiscoverySafetyTimeoutBoundsAllUnavailableAddresses) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     EXPECT_TRUE(server.Accepted());
+    EXPECT_TRUE(http->WaitForAttempts(2));
+    EXPECT_TRUE(http->WaitForIdle());
     EXPECT_EQ(http->Attempts(), std::vector<std::string>({"127.0.0.1", "::1"}));
     EXPECT_GE(elapsed, std::chrono::milliseconds{50});
     EXPECT_LT(elapsed, std::chrono::seconds{2});
@@ -827,6 +1003,8 @@ TEST(HttpClient, NoCurlDiscoveryFallsBackFromUnavailableIPv6ToIPv4) {
     AlternatorLiveNodes nodes({"localhost"}, cfg, http);
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
 
+    EXPECT_TRUE(http->WaitForAttempts(2));
+    EXPECT_TRUE(http->WaitForIdle());
     EXPECT_EQ(http->Attempts(), std::vector<std::string>({"::1", "127.0.0.1"}));
     EXPECT_EQ(nodes.GetNodes(),
               std::vector<Url>({Url("http", "node1.local", server.Port())}));

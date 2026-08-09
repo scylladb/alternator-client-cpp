@@ -41,10 +41,13 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace scylladb::alternator {
 namespace {
+
+constexpr std::size_t kMaxDiscoveryResponseHeaderBytes = 64U * 1024U;
 
 std::vector<std::string> ResolveAddresses(const Url& url) {
     addrinfo hints{};
@@ -60,6 +63,7 @@ std::vector<std::string> ResolveAddresses(const Url& url) {
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> results(raw, &freeaddrinfo);
 
     std::vector<std::string> addresses;
+    std::unordered_set<std::string> seen_addresses;
     for (auto* it = results.get(); it != nullptr; it = it->ai_next) {
         char host[NI_MAXHOST]{};
         if (getnameinfo(it->ai_addr,
@@ -72,7 +76,7 @@ std::vector<std::string> ResolveAddresses(const Url& url) {
             continue;
         }
         std::string address(host);
-        if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) {
+        if (seen_addresses.insert(address).second) {
             addresses.push_back(std::move(address));
         }
     }
@@ -82,17 +86,39 @@ std::vector<std::string> ResolveAddresses(const Url& url) {
     return addresses;
 }
 
-std::chrono::milliseconds EffectiveDiscoveryTimeout(const Config& config) {
+std::chrono::milliseconds ShorterPositiveTimeout(
+    std::chrono::milliseconds left,
+    std::chrono::milliseconds right) {
+    if (left <= std::chrono::milliseconds::zero()) {
+        return right;
+    }
+    if (right <= std::chrono::milliseconds::zero()) {
+        return left;
+    }
+    return std::min(left, right);
+}
+
+std::chrono::milliseconds EffectiveDiscoveryTimeout(
+    const Config& config,
+    std::chrono::milliseconds call_timeout = std::chrono::milliseconds::zero()) {
     const auto request_timeout = config.http_client_timeout;
     const auto safety_timeout = config.discovery_attempt_timeout;
-    if (request_timeout <= std::chrono::milliseconds::zero()) {
-        return safety_timeout;
-    }
-    if (safety_timeout <= std::chrono::milliseconds::zero()) {
-        return request_timeout;
-    }
-    return std::min(request_timeout, safety_timeout);
+    return ShorterPositiveTimeout(
+        ShorterPositiveTimeout(request_timeout, safety_timeout),
+        call_timeout);
 }
+
+#if !SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_CURL
+std::size_t MaxRawDiscoveryResponseBytes(const Config& config) {
+    if (config.max_discovery_response_bytes >
+        std::numeric_limits<std::size_t>::max() -
+            kMaxDiscoveryResponseHeaderBytes) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return config.max_discovery_response_bytes +
+           kMaxDiscoveryResponseHeaderBytes;
+}
+#endif
 
 } // namespace
 
@@ -110,16 +136,40 @@ void EnsureCurlInitialized() {
     });
 }
 
-std::size_t WriteBody(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
-    auto* body = static_cast<std::string*>(userdata);
-    body->append(ptr, size * nmemb);
-    return size * nmemb;
-}
+struct BoundedWriteContext {
+    std::string* output = nullptr;
+    std::size_t limit = 0;
+    bool exceeded = false;
+    bool failed = false;
+};
 
-std::size_t WriteHeader(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
-    auto* headers = static_cast<std::string*>(userdata);
-    headers->append(ptr, size * nmemb);
-    return size * nmemb;
+std::size_t WriteBounded(
+    char* ptr,
+    std::size_t size,
+    std::size_t nmemb,
+    void* userdata) noexcept {
+    auto* context = static_cast<BoundedWriteContext*>(userdata);
+    if (context == nullptr || context->output == nullptr ||
+        (size != 0 && nmemb > std::numeric_limits<std::size_t>::max() / size)) {
+        if (context != nullptr) {
+            context->failed = true;
+        }
+        return 0;
+    }
+
+    const auto bytes = size * nmemb;
+    if (bytes > context->limit ||
+        context->output->size() > context->limit - bytes) {
+        context->exceeded = true;
+        return 0;
+    }
+    try {
+        context->output->append(ptr, bytes);
+    } catch (...) {
+        context->failed = true;
+        return 0;
+    }
+    return bytes;
 }
 
 void SetDuration(CURL* curl, CURLoption option, std::chrono::milliseconds value) {
@@ -165,8 +215,9 @@ void ConfigureCurlForGet(
     const Config& config,
     const std::string& resolved_address,
     bool force_fresh_connection,
-    std::string& body,
-    std::string& response_headers,
+    std::chrono::milliseconds request_timeout,
+    BoundedWriteContext& body_context,
+    BoundedWriteContext& response_headers_context,
     curl_slist*& resolve_entries) {
     curl_easy_reset(curl);
 
@@ -174,10 +225,10 @@ void ConfigureCurlForGet(
     curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteBody);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &WriteHeader);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteBounded);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body_context);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &WriteBounded);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers_context);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_SESSIONID_CACHE, config.tls_session_cache_enabled ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, static_cast<long>(config.max_connections));
@@ -186,6 +237,14 @@ void ConfigureCurlForGet(
         curl,
         CURLOPT_FRESH_CONNECT,
         !config.reuse_discovery_connections || force_fresh_connection ? 1L : 0L);
+
+    // Address-level discovery must connect to the selected DNS result. A
+    // process proxy setting would otherwise send the logical hostname to the
+    // proxy and make every resolved-address attempt use the same proxy
+    // connection instead of resolved_address.
+    if (!resolved_address.empty()) {
+        curl_easy_setopt(curl, CURLOPT_PROXY, "");
+    }
 
     if (!resolved_address.empty() && resolved_address != url.host) {
         auto curl_address = resolved_address;
@@ -200,7 +259,7 @@ void ConfigureCurlForGet(
         curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_entries);
     }
 
-    SetDuration(curl, CURLOPT_TIMEOUT_MS, EffectiveDiscoveryTimeout(config));
+    SetDuration(curl, CURLOPT_TIMEOUT_MS, request_timeout);
     SetDuration(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout);
 
     if (!config.user_agent.empty()) {
@@ -234,9 +293,18 @@ HttpResponse PerformCurlGet(
     const Url& url,
     const Config& config,
     const std::string& resolved_address,
-    bool force_fresh_connection) {
+    bool force_fresh_connection,
+    std::chrono::milliseconds request_timeout) {
     std::string body;
     std::string response_headers;
+    BoundedWriteContext body_context{
+        &body,
+        config.max_discovery_response_bytes,
+    };
+    BoundedWriteContext response_headers_context{
+        &response_headers,
+        kMaxDiscoveryResponseHeaderBytes,
+    };
     curl_slist* resolve_entries = nullptr;
     ConfigureCurlForGet(
         curl,
@@ -244,8 +312,9 @@ HttpResponse PerformCurlGet(
         config,
         resolved_address,
         force_fresh_connection,
-        body,
-        response_headers,
+        request_timeout,
+        body_context,
+        response_headers_context,
         resolve_entries);
 
     curl_slist* headers = nullptr;
@@ -269,6 +338,15 @@ HttpResponse PerformCurlGet(
         curl_slist_free_all(resolve_entries);
     }
     if (code != CURLE_OK) {
+        if (body_context.exceeded) {
+            throw std::runtime_error("HTTP response body exceeds max_discovery_response_bytes");
+        }
+        if (response_headers_context.exceeded) {
+            throw std::runtime_error("HTTP response headers exceed discovery limit");
+        }
+        if (body_context.failed || response_headers_context.failed) {
+            throw std::runtime_error("failed to buffer HTTP response");
+        }
         throw std::runtime_error(curl_easy_strerror(code));
     }
 
@@ -277,7 +355,8 @@ HttpResponse PerformCurlGet(
     body = detail::DecodeHttpResponseBody(
         std::move(body),
         detail::FindHttpHeaderValue(response_headers, "content-encoding"),
-        config.content_encoding_decoders);
+        config.content_encoding_decoders,
+        config.max_discovery_response_bytes);
     return HttpResponse{status_code, std::move(body)};
 }
 
@@ -289,7 +368,7 @@ CurlHttpClient::CurlHttpClient(Config config)
 }
 
 CurlHttpClient::~CurlHttpClient() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     if (reusable_handle_ != nullptr) {
         curl_easy_cleanup(static_cast<CURL*>(reusable_handle_));
         reusable_handle_ = nullptr;
@@ -307,10 +386,45 @@ std::vector<std::string> CurlHttpClient::Resolve(const Url& url) const {
 HttpResponse CurlHttpClient::GetResolved(
     const Url& url,
     const std::string& resolved_address) const {
+    return GetResolvedWithTimeout(
+        url,
+        resolved_address,
+        EffectiveDiscoveryTimeout(config_));
+}
+
+HttpResponse CurlHttpClient::GetResolvedWithTimeout(
+    const Url& url,
+    const std::string& resolved_address,
+    std::chrono::milliseconds timeout) const {
     EnsureCurlInitialized();
+    const auto request_timeout = EffectiveDiscoveryTimeout(config_, timeout);
+    const auto started = std::chrono::steady_clock::now();
+
+    const auto remaining_timeout = [&]() {
+        if (request_timeout <= std::chrono::milliseconds::zero()) {
+            return request_timeout;
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        if (elapsed >= request_timeout) {
+            throw std::runtime_error("HTTP client wait timed out");
+        }
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            request_timeout - elapsed);
+        if (remaining <= std::chrono::milliseconds::zero()) {
+            remaining = std::chrono::milliseconds{1};
+        }
+        return remaining;
+    };
 
     if (config_.reuse_discovery_connections) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+        if (request_timeout > std::chrono::milliseconds::zero()) {
+            if (!lock.try_lock_for(request_timeout)) {
+                throw std::runtime_error("HTTP client wait timed out");
+            }
+        } else {
+            lock.lock();
+        }
         if (reusable_handle_ == nullptr) {
             reusable_handle_ = curl_easy_init();
             if (reusable_handle_ == nullptr) {
@@ -326,7 +440,8 @@ HttpResponse CurlHttpClient::GetResolved(
             url,
             config_,
             resolved_address,
-            force_fresh_connection);
+            force_fresh_connection,
+            remaining_timeout());
     }
 
     CURL* raw = curl_easy_init();
@@ -334,7 +449,13 @@ HttpResponse CurlHttpClient::GetResolved(
         throw std::runtime_error("curl_easy_init failed");
     }
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(raw, &curl_easy_cleanup);
-    return PerformCurlGet(curl.get(), url, config_, resolved_address, false);
+    return PerformCurlGet(
+        curl.get(),
+        url,
+        config_,
+        resolved_address,
+        false,
+        remaining_timeout());
 }
 
 #else
@@ -448,7 +569,10 @@ void SetNonBlocking(int fd) {
     }
 }
 
-std::string ReadAll(int fd, const IoDeadline& deadline) {
+std::string ReadAll(
+    int fd,
+    const IoDeadline& deadline,
+    std::size_t maximum_size) {
     std::string data;
     char buffer[4096];
     while (true) {
@@ -466,7 +590,11 @@ std::string ReadAll(int fd, const IoDeadline& deadline) {
             }
             throw std::runtime_error("recv failed: " + std::string(std::strerror(errno)));
         }
-        data.append(buffer, static_cast<std::size_t>(n));
+        const auto received = static_cast<std::size_t>(n);
+        if (received > maximum_size || data.size() > maximum_size - received) {
+            throw std::runtime_error("HTTP response exceeds discovery size limit");
+        }
+        data.append(buffer, received);
     }
     return data;
 }
@@ -568,7 +696,8 @@ FdGuard ConnectTcp(
 
 HttpResponse ParseHttpResponse(
     const std::string& raw,
-    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders) {
+    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders,
+    std::size_t maximum_decoded_size) {
     const auto header_end = raw.find("\r\n\r\n");
     if (header_end == std::string::npos) {
         throw std::runtime_error("invalid HTTP response");
@@ -592,7 +721,8 @@ HttpResponse ParseHttpResponse(
     body = detail::DecodeHttpResponseBody(
         std::move(body),
         detail::FindHttpHeaderValue(raw.substr(0, header_end), "content-encoding"),
-        content_encoding_decoders);
+        content_encoding_decoders,
+        maximum_decoded_size);
     return HttpResponse{status_code, std::move(body)};
 }
 
@@ -614,6 +744,16 @@ std::vector<std::string> CurlHttpClient::Resolve(const Url& url) const {
 HttpResponse CurlHttpClient::GetResolved(
     const Url& url,
     const std::string& resolved_address) const {
+    return GetResolvedWithTimeout(
+        url,
+        resolved_address,
+        EffectiveDiscoveryTimeout(config_));
+}
+
+HttpResponse CurlHttpClient::GetResolvedWithTimeout(
+    const Url& url,
+    const std::string& resolved_address,
+    std::chrono::milliseconds timeout) const {
     if (url.scheme != "http") {
         throw std::runtime_error("alternator_client_cpp was built without libcurl support; https is unavailable");
     }
@@ -634,15 +774,22 @@ HttpResponse CurlHttpClient::GetResolved(
     request << "\r\n";
 
     const auto started = IoClock::now();
-    const auto request_deadline = MakeDeadline(started, EffectiveDiscoveryTimeout(config_));
+    const auto request_deadline = MakeDeadline(
+        started,
+        EffectiveDiscoveryTimeout(config_, timeout));
     const auto connect_deadline = EarlierDeadline(
         MakeDeadline(started, config_.connect_timeout),
         request_deadline);
     auto fd = ConnectTcp(url, resolved_address, connect_deadline);
     SendAll(fd.get(), request.str(), request_deadline);
-    return ParseHttpResponse(
-        ReadAll(fd.get(), request_deadline),
-        config_.content_encoding_decoders);
+    auto response = ParseHttpResponse(
+        ReadAll(
+            fd.get(),
+            request_deadline,
+            MaxRawDiscoveryResponseBytes(config_)),
+        config_.content_encoding_decoders,
+        config_.max_discovery_response_bytes);
+    return response;
 }
 
 #endif
@@ -655,6 +802,13 @@ HttpResponse HttpClient::GetResolved(
     const Url& url,
     const std::string&) const {
     return Get(url);
+}
+
+HttpResponse HttpClient::GetResolvedWithTimeout(
+    const Url& url,
+    const std::string& resolved_address,
+    std::chrono::milliseconds) const {
+    return GetResolved(url, resolved_address);
 }
 
 std::shared_ptr<HttpClient> NewDefaultHttpClient(const Config& config) {

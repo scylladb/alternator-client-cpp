@@ -46,6 +46,8 @@ TEST(Config, DefaultDiscoveryTimeoutsAreFiniteWithoutChangingHttpTimeoutCompatib
     EXPECT_EQ(config.http_client_timeout, std::chrono::milliseconds::zero());
     EXPECT_EQ(config.connect_timeout, std::chrono::seconds{1});
     EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
+    EXPECT_EQ(config.max_discovery_response_bytes, 1024U * 1024U);
+    EXPECT_EQ(config.discovery_cycle_timeout, std::chrono::seconds{5});
 }
 
 TEST(Config, DiscoveryTimeoutRemainsAfterLegacyAggregateMembers) {
@@ -81,4 +83,13 @@ TEST(Config, DiscoveryTimeoutRemainsAfterLegacyAggregateMembers) {
     EXPECT_EQ(config.max_connections, 17U);
     EXPECT_EQ(config.user_agent, "aggregate-agent");
     EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
+    EXPECT_EQ(config.max_discovery_response_bytes, 1024U * 1024U);
+    EXPECT_EQ(config.discovery_cycle_timeout, std::chrono::seconds{5});
+}
+
+TEST(Config, RejectsZeroDiscoveryResponseLimit) {
+    Config config;
+    config.max_discovery_response_bytes = 0;
+
+    EXPECT_THROW(ValidateConfig(config), std::invalid_argument);
 }

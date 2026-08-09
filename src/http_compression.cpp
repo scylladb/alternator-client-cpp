@@ -25,9 +25,7 @@
 #include <array>
 #endif
 #include <cctype>
-#if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
-#endif
 #include <istream>
 #include <ostream>
 #include <sstream>
@@ -64,6 +62,12 @@ struct ContentEncodingDecoderEntry {
     }
     return static_cast<uInt>(size);
 }
+
+class DecodedBodyTooLargeError final : public std::runtime_error {
+public:
+    DecodedBodyTooLargeError()
+        : std::runtime_error("decoded HTTP response body exceeds configured limit") {}
+};
 
 void DeflateBody(std::istream& input, std::ostream& output, int window_bits) {
     z_stream stream{};
@@ -125,7 +129,10 @@ void DeflateBody(std::istream& input, std::ostream& output, int window_bits) {
     }
 }
 
-[[nodiscard]] std::string InflateBody(const std::string& body, int window_bits) {
+[[nodiscard]] std::string InflateBody(
+    const std::string& body,
+    int window_bits,
+    std::size_t maximum_decoded_size) {
     z_stream stream{};
     const auto init_code = inflateInit2(&stream, window_bits);
     if (init_code != Z_OK) {
@@ -152,6 +159,10 @@ void DeflateBody(std::istream& input, std::ostream& output, int window_bits) {
 
         const auto code = inflate(&stream, Z_NO_FLUSH);
         const auto produced = buffer.size() - stream.avail_out;
+        if (produced > maximum_decoded_size ||
+            output.size() > maximum_decoded_size - produced) {
+            throw DecodedBodyTooLargeError();
+        }
         output.append(buffer.data(), produced);
 
         if (code == Z_STREAM_END) {
@@ -166,11 +177,15 @@ void DeflateBody(std::istream& input, std::ostream& output, int window_bits) {
     }
 }
 
-[[nodiscard]] std::string InflateDeflateBody(const std::string& body) {
+[[nodiscard]] std::string InflateDeflateBody(
+    const std::string& body,
+    std::size_t maximum_decoded_size) {
     try {
-        return InflateBody(body, MAX_WBITS);
+        return InflateBody(body, MAX_WBITS, maximum_decoded_size);
+    } catch (const DecodedBodyTooLargeError&) {
+        throw;
     } catch (const std::runtime_error&) {
-        return InflateBody(body, -MAX_WBITS);
+        return InflateBody(body, -MAX_WBITS, maximum_decoded_size);
     }
 }
 #endif
@@ -367,18 +382,29 @@ std::vector<std::string> ZlibContentEncodingDecoder::AcceptedResponseEncodings()
 }
 
 std::string ZlibContentEncodingDecoder::Decode(std::string body, const std::string& content_encoding) const {
+    return DecodeBounded(
+        std::move(body),
+        content_encoding,
+        std::numeric_limits<std::size_t>::max());
+}
+
+std::string ZlibContentEncodingDecoder::DecodeBounded(
+    std::string body,
+    const std::string& content_encoding,
+    std::size_t maximum_decoded_size) const {
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
     const auto normalized = detail::NormalizeResponseEncoding(content_encoding);
     if (normalized == "gzip") {
-        return detail::InflateBody(body, MAX_WBITS + 16);
+        return detail::InflateBody(body, MAX_WBITS + 16, maximum_decoded_size);
     }
     if (normalized == "deflate") {
-        return detail::InflateDeflateBody(body);
+        return detail::InflateDeflateBody(body, maximum_decoded_size);
     }
     throw std::runtime_error("unsupported HTTP content encoding: " + normalized);
 #else
     (void)body;
     (void)content_encoding;
+    (void)maximum_decoded_size;
     throw std::runtime_error("zlib response decoding is not available");
 #endif
 }
@@ -390,7 +416,11 @@ namespace scylladb::alternator::detail {
 std::string DecodeHttpResponseBody(
     std::string body,
     const std::string& content_encoding,
-    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders) {
+    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders,
+    std::size_t maximum_decoded_size) {
+    if (body.size() > maximum_decoded_size) {
+        throw std::runtime_error("HTTP response body exceeds configured limit");
+    }
     auto encodings = ParseContentEncodings(content_encoding);
     if (encodings.empty()) {
         return body;
@@ -405,7 +435,20 @@ std::string DecodeHttpResponseBody(
         if (decoder_entry == nullptr) {
             throw std::runtime_error("unexpected HTTP content encoding: " + *it);
         }
-        body = decoder_entry->decoder->Decode(std::move(body), *it);
+        const auto* zlib_decoder = dynamic_cast<const ZlibContentEncodingDecoder*>(
+            decoder_entry->decoder.get());
+        if (zlib_decoder != nullptr) {
+            body = zlib_decoder->DecodeBounded(
+                std::move(body),
+                *it,
+                maximum_decoded_size);
+        } else {
+            body = decoder_entry->decoder->Decode(std::move(body), *it);
+            if (body.size() > maximum_decoded_size) {
+                throw std::runtime_error(
+                    "decoded HTTP response body exceeds configured limit");
+            }
+        }
     }
 
     return body;

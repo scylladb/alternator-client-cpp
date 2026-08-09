@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,6 +36,10 @@ class HttpClient {
 public:
     virtual ~HttpClient() = default;
 
+    // A timed-out non-cooperative call may remain on a bounded worker while a
+    // fallback starts, so custom implementations must make these const methods
+    // safe for concurrent use.
+
     [[nodiscard]] virtual HttpResponse Get(const Url& url) const = 0;
 
     // Resolve every address for a logical endpoint. Discovery calls this for
@@ -49,6 +54,16 @@ public:
     [[nodiscard]] virtual HttpResponse GetResolved(
         const Url& url,
         const std::string& resolved_address) const;
+
+    // Like GetResolved(), with an additional per-call ceiling. The discovery
+    // caller also bounds this call in a fixed worker pool. The default
+    // preserves source compatibility by delegating to GetResolved(); custom
+    // transports should still override this method so timed-out work releases
+    // its shared worker promptly.
+    [[nodiscard]] virtual HttpResponse GetResolvedWithTimeout(
+        const Url& url,
+        const std::string& resolved_address,
+        std::chrono::milliseconds timeout) const;
 };
 
 class CurlHttpClient final : public HttpClient {
@@ -61,10 +76,14 @@ public:
     [[nodiscard]] HttpResponse GetResolved(
         const Url& url,
         const std::string& resolved_address) const override;
+    [[nodiscard]] HttpResponse GetResolvedWithTimeout(
+        const Url& url,
+        const std::string& resolved_address,
+        std::chrono::milliseconds timeout) const override;
 
 private:
     Config config_;
-    mutable std::mutex mutex_;
+    mutable std::timed_mutex mutex_;
     mutable void* reusable_handle_ = nullptr;
     mutable std::string reusable_resolved_address_;
 };

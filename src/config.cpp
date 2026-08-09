@@ -63,6 +63,9 @@ void ValidateConfig(const Config& config) {
     if (config.max_connections == 0) {
         throw std::invalid_argument("max_connections must be > 0");
     }
+    if (config.max_discovery_response_bytes == 0) {
+        throw std::invalid_argument("max_discovery_response_bytes must be > 0");
+    }
     (void)detail::BuildRequestContentEncodingValue(config.request_compressor);
     (void)detail::BuildAcceptEncodingValue(config.content_encoding_decoders);
     if (config.key_route_affinity.partition_key_discovery_attempts == 0) {

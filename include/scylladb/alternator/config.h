@@ -17,6 +17,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
@@ -65,6 +66,10 @@ public:
 
     [[nodiscard]] std::vector<std::string> AcceptedResponseEncodings() const override;
     [[nodiscard]] std::string Decode(std::string body, const std::string& content_encoding) const override;
+    [[nodiscard]] std::string DecodeBounded(
+        std::string body,
+        const std::string& content_encoding,
+        std::size_t maximum_decoded_size) const;
 
 private:
     std::vector<std::string> accepted_response_encodings_;
@@ -150,11 +155,20 @@ struct Config {
     NodeHealthStoreConfig node_health;
     KeyRouteAffinityConfig key_route_affinity;
 
-    // Kept last to preserve the positional ordering of legacy aggregate
-    // initialization. This bounds each default discovery address and DNS wait;
+    // Kept after every legacy field to preserve positional aggregate
+    // initialization. This bounds each discovery address and DNS caller wait;
     // the shorter positive value wins when http_client_timeout is configured.
     // Non-positive values disable this additional ceiling.
     std::chrono::milliseconds discovery_attempt_timeout{5000};
+    // Maximum compressed or decoded /localnodes response body. The default
+    // admits tens of thousands of normal node names while bounding memory and
+    // validation work from a broken endpoint.
+    std::size_t max_discovery_response_bytes = 1024U * 1024U;
+    // Positive values bound a complete discovery cycle across fallback scopes,
+    // seed endpoints, DNS waits, and resolved addresses. The remaining budget
+    // is divided fairly so one multi-address seed cannot starve later seeds.
+    // Non-positive values disable the whole-cycle ceiling.
+    std::chrono::milliseconds discovery_cycle_timeout{5000};
 };
 
 void ValidateConfig(const Config& config);

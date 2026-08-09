@@ -31,10 +31,12 @@ nodes.UpdateLiveNodes();
 auto next = nodes.NextNode();
 ```
 
-For cluster-wide routing, the client queries bare `/localnodes` on every configured initial node and merges
-the returned node lists. Some ScyllaDB versions return only the contacted node's datacenter from
-`/localnodes`, even with cluster scope. In multi-datacenter deployments, configure at least one working
-initial node from every datacenter that should receive traffic:
+For cluster-wide routing, each refresh queries bare `/localnodes` on a bounded,
+deduplicated set of learned nodes followed by the retained initial nodes, then
+merges the returned node lists. Some ScyllaDB versions return only the contacted
+node's datacenter from `/localnodes`, even with cluster scope. In
+multi-datacenter deployments, configure at least one working initial node from
+every datacenter that should receive traffic:
 
 ```cpp
 AlternatorLiveNodes nodes({
@@ -314,39 +316,94 @@ whenever discovery falls back to them. Connection failures, non-200 responses,
 malformed JSON, and empty or unusable `/localnodes` data cause discovery to
 continue with the next address or configured seed. Requests still use the
 configured hostname for the HTTP `Host` header and, with libcurl HTTPS, TLS SNI
-and certificate verification. A failed refresh keeps the last complete learned
-node set. When every learned node is down, `NextNode()` performs one serialized
-recovery attempt through responsive nodes and retained seeds before returning no
-endpoint.
+and certificate verification. Explicit resolved-address requests bypass process
+proxy settings so the selected address is the connection target. A failed
+refresh keeps the last-known-good learned-node set. A partially successful
+Cluster refresh publishes a bounded union that prioritizes freshly confirmed
+nodes and retains nodes from unavailable partitions; only a complete Cluster
+pass replaces the previous snapshot outright.
+
+Datacenter and rack entrypoints remain discovery-only until a successful
+`/localnodes` response proves the routed nodes belong to the configured scope or
+one of its strict fallbacks. A valid fallback chain ending in `Cluster()`
+explicitly authorizes cluster-wide routing, so its initial nodes are routable
+before discovery. An authoritative empty strict scope clears only a snapshot
+published by that exact scope; failed fallbacks, invalid fallback graphs, and
+empty Cluster responses retain snapshots published by another scope. When
+strict-only scoped routing is empty, `GetNodes()` therefore returns an empty
+routable snapshot; validated seeds are retained separately for later discovery
+and feature probes. Feature detection retries a bounded learned-then-seed
+candidate set within the discovery-cycle deadline. Configured seeds and
+discovered hosts must be IPv4, IPv6, or ASCII DNS names with valid label
+boundaries (internationalized names must use their ASCII IDNA form). Ambiguous
+legacy IPv4 spellings such as shortened, single-integer, hexadecimal,
+octal-looking, or trailing-dot numeric forms are rejected; canonical IPv4 and
+IPv6 literals bypass DNS resolution. Discovery JSON uses strict JSON
+whitespace, control character, Unicode escape, and UTF-8 validation. When
+every learned node is down, `NextNode()` performs one serialized recovery
+attempt through retained seeds, then probes learned nodes if seed discovery
+fails. Cyclic or excessively deep custom fallback chains fail clearly.
+Concurrent callers share the result of a recovery generation instead of
+repeating the same failed cycle.
 
 The default client bounds each DNS wait and resolved-address discovery request with
 `discovery_attempt_timeout` (5 seconds by default). This safety ceiling applies
 even though `http_client_timeout` defaults to zero for compatibility. If both
 values are positive, the shorter value wins; setting
-`discovery_attempt_timeout` to zero disables the extra ceiling. With both values
-zero, a stalled DNS operation or a peer that accepts a connection but never
-responds can block a foreground discovery caller indefinitely.
+`discovery_attempt_timeout` to zero disables the per-attempt safety ceiling.
+`discovery_cycle_timeout` additionally bounds the complete discovery pass (5 seconds by
+default) and divides its remaining time across seed endpoints and their unique
+resolved addresses. This prevents a multi-address seed from consuming the whole
+budget before later seeds are attempted. Set all three request, attempt, and
+cycle timeouts to zero only when unbounded foreground discovery is intended.
 `connect_timeout` defaults to 1 second and separately bounds the connection
-phase. `Stop()` still cancels a background resolver wait, but it cannot
-interrupt an in-flight HTTP request. Setting both request timeouts to zero is
-therefore an explicit opt-out from prompt HTTP shutdown: `Stop()` or destruction
-can wait indefinitely for a stalled HTTP peer.
+phase. `Stop()` cancels background resolver and transport waits immediately.
+An already-running non-cooperative resolver or custom transport may continue on
+its process-lifetime worker after `Stop()`, but it cannot delay the background
+thread join or publish a late node set. Setting all request ceilings to zero is
+therefore an explicit opt-out from bounded foreground discovery, while
+background shutdown remains prompt.
+
+`max_discovery_response_bytes` bounds both compressed and decoded discovery
+response bodies and defaults to 1 MiB. Oversized data from one address is treated
+as an invalid response, so discovery can continue through later addresses or
+seeds. It also bounds each learned/seed discovery-candidate group and the
+JSON-equivalent size of the unique node union assembled across Cluster
+responses; an oversized fresh union fails atomically and preserves the previous
+snapshot. The default transports bound response buffering
+while data is received, and the built-in zlib decoder enforces the decoded limit
+while inflating. Custom
+content decoders are responsible for bounding their own temporary allocations;
+their returned output is checked against the same limit.
 
 Hostname resolution runs the platform's synchronous `getaddrinfo()` call in a
-process-lifetime pool of two workers. Concurrent calls for the same client and
-endpoint are coalesced, and at most 64 additional operations can be queued; a
-full queue fails fast. The discovery caller stops waiting at its configured
-deadline, and stopping background discovery cancels that wait immediately.
+process-lifetime pool of two general workers plus an independent two-worker
+lane reserved for retained seed candidates. One stuck seed therefore cannot
+block a later seed after learned lookups consume the general pool. Concurrent
+calls for the same client and endpoint within a lane are coalesced, and at most
+64 additional operations can be queued in each lane; a full queue fails fast.
+Canonical IP literals bypass both resolver lanes. The discovery caller stops
+waiting at its configured deadline, and stopping background discovery cancels
+that wait immediately.
 POSIX does not provide a portable way to interrupt a `getaddrinfo()` call that is
-already running, so a stalled operating-system resolver can occupy one of the
-two workers after its caller leaves. The fixed pool keeps that cost bounded and
-does not create per-request threads. Resolver operations retain their HTTP
+already running, so a stalled operating-system resolver can occupy a worker
+after its caller leaves. The fixed pools keep that cost bounded and do not
+create per-request threads. Resolver operations retain their HTTP
 client until the worker finishes, avoiding access to destroyed client objects.
 
 Custom `HttpClient` implementations can override `Resolve()` and
-`GetResolved()` to provide the same address-level behavior. Their default
-implementations preserve compatibility by returning the logical host and
-delegating to `Get()`.
+`GetResolved()` to provide the same address-level behavior. Override
+`GetResolvedWithTimeout()` as well to enforce fair per-call deadlines inside a
+custom transport and release capacity promptly. All resolved-address calls run
+in fixed process-lifetime pools of four general workers plus two workers
+reserved for seeds, with at most 64 queued operations per lane. This lets the
+caller enforce its deadline and keeps `Stop()` prompt even when the
+source-compatible default delegates to a blocking `GetResolved()`; the stuck
+custom call can retain one worker until it returns, but cannot create
+per-request threads or exhaust the seed recovery lane. The default methods
+preserve compatibility by returning the logical host and delegating to `Get()`.
+Because a timed-out non-cooperative call can overlap a later fallback, custom
+clients must make their const discovery methods safe for concurrent use.
 
 When libcurl is available, the default discovery client reuses HTTP connections by default. It keeps
 a libcurl connection cache bounded by `max_connections` and can be disabled for debugging or
@@ -455,7 +512,7 @@ auto batch_plan = helper.NewBatchWriteQueryPlan({
 
 - `/localnodes` discovery with cluster, datacenter, and rack scopes.
 - Scope fallback chains such as rack -> datacenter -> cluster.
-- Cluster scope merge across configured initial nodes.
+- Bounded Cluster scope merge across learned nodes and retained initial nodes.
 - DNS re-resolution, per-address discovery fallback, and seed recovery after all learned nodes fail.
 - Active and idle `/localnodes` refresh cadence.
 - Reused libcurl discovery HTTP connections with an opt-out switch.
