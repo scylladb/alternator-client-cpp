@@ -47,3 +47,38 @@ TEST(Config, DefaultDiscoveryTimeoutsAreFiniteWithoutChangingHttpTimeoutCompatib
     EXPECT_EQ(config.connect_timeout, std::chrono::seconds{1});
     EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
 }
+
+TEST(Config, DiscoveryTimeoutRemainsAfterLegacyAggregateMembers) {
+    const Config config{
+        8043,
+        "https",
+        NewClusterScope(),
+        "aggregate-region",
+        Credentials{"access", "secret"},
+        std::chrono::milliseconds{11},
+        std::chrono::milliseconds{12},
+        std::chrono::milliseconds{13},
+        std::chrono::milliseconds{14},
+        false,
+        "ca.pem",
+        "client.pem",
+        "client.key",
+        false,
+        15,
+        std::chrono::seconds{16},
+        17,
+        false,
+        nullptr,
+        {},
+        "aggregate-agent",
+        nullptr,
+        {},
+        {},
+    };
+
+    EXPECT_EQ(config.connect_timeout, std::chrono::milliseconds{14});
+    EXPECT_FALSE(config.verify_ssl);
+    EXPECT_EQ(config.max_connections, 17U);
+    EXPECT_EQ(config.user_agent, "aggregate-agent");
+    EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
+}

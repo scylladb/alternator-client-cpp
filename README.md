@@ -270,7 +270,7 @@ active/quarantined/down state:
 - connection failures mark a node down immediately;
 - consecutive 5xx responses mark a node down;
 - down nodes are probed in the background with `GET /localnodes`;
-- a non-5xx probe response moves a down node into quarantine;
+- a responsive non-5xx probe response, including 4xx, moves a down node into quarantine;
 - quarantined nodes are sampled into routing once every configured number of attempts;
 - enough consecutive non-5xx responses from a quarantined node promote it back to active.
 
@@ -319,21 +319,26 @@ node set. When every learned node is down, `NextNode()` performs one serialized
 recovery attempt through responsive nodes and retained seeds before returning no
 endpoint.
 
-The default client bounds each resolved-address discovery request with
+The default client bounds each DNS wait and resolved-address discovery request with
 `discovery_attempt_timeout` (5 seconds by default). This safety ceiling applies
 even though `http_client_timeout` defaults to zero for compatibility. If both
 values are positive, the shorter value wins; setting
 `discovery_attempt_timeout` to zero disables the extra ceiling. With both values
-zero, a peer that accepts a connection but never responds can block discovery
-indefinitely. `connect_timeout` defaults to 1 second and separately bounds the
-connection phase.
+zero, a stalled DNS operation or a peer that accepts a connection but never
+responds can block a foreground discovery caller indefinitely.
+`connect_timeout` defaults to 1 second and separately bounds the connection
+phase. `Stop()` still cancels a background resolver wait.
 
-Hostname resolution uses the platform's synchronous `getaddrinfo()` call. POSIX
-does not provide a portable deadline or cancellation API for that call, so its
-timing follows the operating system resolver configuration. The client does not
-launch detached resolver threads, which avoids accumulating unbounded threads
-when a resolver stalls. Applications that require an application-owned DNS
-deadline can supply an `HttpClient` that overrides `Resolve()`.
+Hostname resolution runs the platform's synchronous `getaddrinfo()` call in a
+process-lifetime pool of two workers. Concurrent calls for the same client and
+endpoint are coalesced, and at most 64 additional operations can be queued; a
+full queue fails fast. The discovery caller stops waiting at its configured
+deadline, and stopping background discovery cancels that wait immediately.
+POSIX does not provide a portable way to interrupt a `getaddrinfo()` call that is
+already running, so a stalled operating-system resolver can occupy one of the
+two workers after its caller leaves. The fixed pool keeps that cost bounded and
+does not create per-request threads. Resolver operations retain their HTTP
+client until the worker finishes, avoiding access to destroyed client objects.
 
 Custom `HttpClient` implementations can override `Resolve()` and
 `GetResolved()` to provide the same address-level behavior. Their default

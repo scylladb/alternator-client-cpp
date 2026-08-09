@@ -64,10 +64,18 @@ public:
 
 private:
     void RecoverLiveNodesIfNeeded();
-    void UpdateLiveNodesLocked();
-    [[nodiscard]] std::vector<Url> FetchLiveNodes();
-    [[nodiscard]] std::vector<Url> GetNodesForScope(const RoutingScope& scope);
-    [[nodiscard]] std::vector<Url> GetNodesFromEndpoint(const Url& endpoint) const;
+    void UpdateLiveNodesLocked(const std::atomic<bool>* resolution_cancellation = nullptr);
+    [[nodiscard]] std::vector<Url> FetchLiveNodes(
+        const std::atomic<bool>* resolution_cancellation = nullptr);
+    [[nodiscard]] std::vector<Url> GetNodesForScope(
+        const RoutingScope& scope,
+        const std::atomic<bool>* resolution_cancellation = nullptr);
+    [[nodiscard]] std::vector<Url> GetNodesFromEndpoint(
+        const Url& endpoint,
+        const std::atomic<bool>* resolution_cancellation = nullptr) const;
+    std::vector<Url> ProbeDownNodesInternal(
+        const std::atomic<bool>* resolution_cancellation);
+    void ObserveNodeResult(const Url& node, NodeHealthObservation observation);
     [[nodiscard]] Url NextKnownNode();
     [[nodiscard]] bool ShouldTryQuarantinedNode(bool active_nodes_empty) const;
     [[nodiscard]] Url NextQuarantinedNode() const;
@@ -95,6 +103,7 @@ private:
     std::mutex update_mutex_;
     std::mutex background_mutex_;
     std::condition_variable background_cv_;
+    std::atomic<bool> cancel_background_resolutions_{false};
     bool background_started_ = false;
     bool stopping_ = false;
     std::thread background_thread_;

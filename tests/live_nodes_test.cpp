@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -77,6 +78,73 @@ public:
 private:
     Resolver resolver_;
     Handler handler_;
+};
+
+class ResolverGate {
+public:
+    std::vector<std::string> Resolve() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++calls_;
+        condition_.notify_all();
+        condition_.wait(lock, [this] { return released_; });
+        ++finished_;
+        condition_.notify_all();
+        return {"127.0.0.1"};
+    }
+
+    [[nodiscard]] bool WaitForCalls(
+        std::size_t expected,
+        std::chrono::milliseconds timeout = std::chrono::seconds{1}) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [this, expected] {
+            return calls_ >= expected;
+        });
+    }
+
+    [[nodiscard]] bool WaitForFinished(
+        std::size_t expected,
+        std::chrono::milliseconds timeout = std::chrono::seconds{1}) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [this, expected] {
+            return finished_ >= expected;
+        });
+    }
+
+    [[nodiscard]] std::size_t Calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_;
+    }
+
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        condition_.notify_all();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::size_t calls_ = 0;
+    std::size_t finished_ = 0;
+    bool released_ = false;
+};
+
+class ResolverReleaseGuard {
+public:
+    explicit ResolverReleaseGuard(std::shared_ptr<ResolverGate> gate)
+        : gate_(std::move(gate)) {}
+
+    ~ResolverReleaseGuard() {
+        gate_->Release();
+    }
+
+    ResolverReleaseGuard(const ResolverReleaseGuard&) = delete;
+    ResolverReleaseGuard& operator=(const ResolverReleaseGuard&) = delete;
+
+private:
+    std::shared_ptr<ResolverGate> gate_;
 };
 
 class PassthroughContentEncodingDecoder final : public HttpContentEncodingDecoder {
@@ -454,6 +522,264 @@ TEST(AlternatorLiveNodes, EmptyResolutionFailsClearlyWithoutDiscardingSeed) {
         EXPECT_NE(std::string(error.what()).find("no usable addresses"), std::string::npos);
     }
     EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"seed.example"}));
+}
+
+TEST(AlternatorLiveNodes, StalledResolverReturnsByDiscoveryTimeout) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    cfg.http_client_timeout = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::milliseconds{60};
+
+    auto gate = std::make_shared<ResolverGate>();
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [gate](const Url&) { return gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["unexpected.internal"])"};
+        });
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+
+    const auto started_at = std::chrono::steady_clock::now();
+    auto update = std::async(std::launch::async, [&] {
+        try {
+            nodes.UpdateLiveNodes();
+            return std::string{};
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+    });
+    ResolverReleaseGuard release_on_exit(gate);
+    const bool resolver_started = gate->WaitForCalls(1);
+    const auto status = update.wait_for(std::chrono::seconds{1});
+    const auto elapsed = std::chrono::steady_clock::now() - started_at;
+    gate->Release();
+    update.wait();
+    const auto error = update.get();
+
+    EXPECT_TRUE(resolver_started);
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_NE(error.find("DNS resolution timed out"), std::string::npos);
+    EXPECT_GE(elapsed, std::chrono::milliseconds{30});
+    EXPECT_LT(elapsed, std::chrono::milliseconds{500});
+    EXPECT_TRUE(gate->WaitForFinished(1));
+}
+
+TEST(AlternatorLiveNodes, ZeroDiscoveryTimeoutWaitsForResolverCompletion) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    cfg.http_client_timeout = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::milliseconds::zero();
+
+    auto gate = std::make_shared<ResolverGate>();
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [gate](const Url&) { return gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["resolved.internal"])"};
+        });
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    auto update = std::async(std::launch::async, [&] {
+        nodes.UpdateLiveNodes();
+    });
+    ResolverReleaseGuard release_on_exit(gate);
+    const bool resolver_started = gate->WaitForCalls(1);
+    const auto status_while_blocked = update.wait_for(std::chrono::milliseconds{50});
+    gate->Release();
+    update.wait();
+
+    EXPECT_TRUE(resolver_started);
+    EXPECT_EQ(status_while_blocked, std::future_status::timeout);
+    EXPECT_NO_THROW(update.get());
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"resolved.internal"}));
+}
+
+TEST(AlternatorLiveNodes, ConcurrentStalledResolutionsAreCoalesced) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::milliseconds{100};
+
+    auto gate = std::make_shared<ResolverGate>();
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [gate](const Url&) { return gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["unexpected.internal"])"};
+        });
+    AlternatorLiveNodes first({"seed.example"}, cfg, http);
+    AlternatorLiveNodes second({"seed.example"}, cfg, http);
+    std::promise<void> start_updates;
+    const auto start_signal = start_updates.get_future().share();
+    auto first_update = std::async(std::launch::async, [&] {
+        start_signal.wait();
+        try {
+            first.UpdateLiveNodes();
+            return std::string{};
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+    });
+    auto second_update = std::async(std::launch::async, [&] {
+        start_signal.wait();
+        try {
+            second.UpdateLiveNodes();
+            return std::string{};
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+    });
+    ResolverReleaseGuard release_on_exit(gate);
+
+    start_updates.set_value();
+    const bool resolver_started = gate->WaitForCalls(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds{30});
+    const auto resolver_calls = gate->Calls();
+    const auto first_status = first_update.wait_for(std::chrono::seconds{1});
+    const auto second_status = second_update.wait_for(std::chrono::seconds{1});
+    gate->Release();
+    first_update.wait();
+    second_update.wait();
+    const auto first_error = first_update.get();
+    const auto second_error = second_update.get();
+
+    EXPECT_TRUE(resolver_started);
+    EXPECT_EQ(resolver_calls, 1U);
+    EXPECT_EQ(first_status, std::future_status::ready);
+    EXPECT_EQ(second_status, std::future_status::ready);
+    EXPECT_NE(first_error.find("DNS resolution timed out"), std::string::npos);
+    EXPECT_NE(second_error.find("DNS resolution timed out"), std::string::npos);
+    EXPECT_TRUE(gate->WaitForFinished(1));
+}
+
+TEST(AlternatorLiveNodes, TimedOutQueuedResolutionIsRemovedBeforeWorkerRuns) {
+    Config blocking_cfg;
+    blocking_cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    blocking_cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    blocking_cfg.discovery_attempt_timeout = std::chrono::seconds{5};
+    Config queued_cfg = blocking_cfg;
+    queued_cfg.discovery_attempt_timeout = std::chrono::milliseconds{60};
+
+    auto first_gate = std::make_shared<ResolverGate>();
+    auto second_gate = std::make_shared<ResolverGate>();
+    auto queued_gate = std::make_shared<ResolverGate>();
+    auto first_http = std::make_shared<ResolvedFakeHttpClient>(
+        [first_gate](const Url&) { return first_gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["first.internal"])"};
+        });
+    auto second_http = std::make_shared<ResolvedFakeHttpClient>(
+        [second_gate](const Url&) { return second_gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["second.internal"])"};
+        });
+    auto queued_http = std::make_shared<ResolvedFakeHttpClient>(
+        [queued_gate](const Url&) { return queued_gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["queued.internal"])"};
+        });
+    AlternatorLiveNodes first({"first.example"}, blocking_cfg, first_http);
+    AlternatorLiveNodes second({"second.example"}, blocking_cfg, second_http);
+    AlternatorLiveNodes queued({"queued.example"}, queued_cfg, queued_http);
+
+    auto first_update = std::async(std::launch::async, [&] {
+        EXPECT_NO_THROW(first.UpdateLiveNodes());
+    });
+    auto second_update = std::async(std::launch::async, [&] {
+        EXPECT_NO_THROW(second.UpdateLiveNodes());
+    });
+    ResolverReleaseGuard release_first(first_gate);
+    ResolverReleaseGuard release_second(second_gate);
+    ResolverReleaseGuard release_queued(queued_gate);
+    const bool first_started = first_gate->WaitForCalls(1);
+    const bool second_started = second_gate->WaitForCalls(1);
+
+    std::string queued_error;
+    try {
+        queued.UpdateLiveNodes();
+    } catch (const std::exception& error) {
+        queued_error = error.what();
+    }
+    const auto queued_calls_at_timeout = queued_gate->Calls();
+    first_gate->Release();
+    second_gate->Release();
+    first_update.wait();
+    second_update.wait();
+    first_update.get();
+    second_update.get();
+    const bool queued_ran_later = queued_gate->WaitForCalls(
+        1,
+        std::chrono::milliseconds{100});
+
+    EXPECT_TRUE(first_started);
+    EXPECT_TRUE(second_started);
+    EXPECT_NE(queued_error.find("DNS resolution timed out"), std::string::npos);
+    EXPECT_EQ(queued_calls_at_timeout, 0U);
+    EXPECT_FALSE(queued_ran_later);
+}
+
+TEST(AlternatorLiveNodes, StopCancelsStalledBackgroundResolverPromptly) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{1};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::milliseconds::zero();
+
+    auto gate = std::make_shared<ResolverGate>();
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [gate](const Url&) { return gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["unexpected.internal"])"};
+        });
+    AlternatorLiveNodes nodes({"seed.example"}, cfg, http);
+    nodes.Start();
+    const bool resolver_started = gate->WaitForCalls(1);
+
+    const auto started_at = std::chrono::steady_clock::now();
+    nodes.Stop();
+    const auto elapsed = std::chrono::steady_clock::now() - started_at;
+    gate->Release();
+
+    EXPECT_TRUE(resolver_started);
+    EXPECT_LT(elapsed, std::chrono::milliseconds{250});
+    EXPECT_TRUE(gate->WaitForFinished(1));
+}
+
+TEST(AlternatorLiveNodes, DestructionCancelsResolverWithoutClientUseAfterFree) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{1};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    cfg.discovery_attempt_timeout = std::chrono::milliseconds::zero();
+
+    auto gate = std::make_shared<ResolverGate>();
+    auto http = std::make_shared<ResolvedFakeHttpClient>(
+        [gate](const Url&) { return gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["unexpected.internal"])"};
+        });
+    std::weak_ptr<HttpClient> client_lifetime = http;
+    auto nodes = std::make_unique<AlternatorLiveNodes>(
+        std::vector<std::string>{"seed.example"},
+        cfg,
+        http);
+    nodes->Start();
+    const bool resolver_started = gate->WaitForCalls(1);
+
+    const auto started_at = std::chrono::steady_clock::now();
+    nodes.reset();
+    const auto elapsed = std::chrono::steady_clock::now() - started_at;
+    http.reset();
+    const bool worker_kept_client_alive = !client_lifetime.expired();
+    gate->Release();
+    const bool resolver_finished = gate->WaitForFinished(1);
+    for (int attempt = 0; attempt < 50 && !client_lifetime.expired(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+
+    EXPECT_TRUE(resolver_started);
+    EXPECT_LT(elapsed, std::chrono::milliseconds{250});
+    EXPECT_TRUE(worker_kept_client_alive);
+    EXPECT_TRUE(resolver_finished);
+    EXPECT_TRUE(client_lifetime.expired());
 }
 
 TEST(AlternatorLiveNodes, EmptyClusterResponsesFailClearly) {
@@ -942,6 +1268,26 @@ TEST(AlternatorLiveNodes, ProbeDownNodesMovesResponsiveNodeToQuarantine) {
     EXPECT_TRUE(nodes.GetDownNodes().empty());
 }
 
+TEST(AlternatorLiveNodes, ProbeDownNodesTreats4xxAsResponsive) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.quarantine_success_threshold = 2;
+
+    auto http = std::make_shared<FakeHttpClient>([](const Url&) {
+        return HttpResponse{404, ""};
+    });
+
+    AlternatorLiveNodes nodes({"recovering.local"}, cfg, http);
+    const Url recovering("http", "recovering.local", 8080);
+    nodes.ReportNodeResult(recovering, NodeHealthObservation::ConnectionFailure);
+
+    const auto responsive = nodes.ProbeDownNodes();
+
+    EXPECT_EQ(responsive, std::vector<Url>({recovering}));
+    EXPECT_EQ(nodes.GetQuarantinedNodes(), std::vector<Url>({recovering}));
+    EXPECT_TRUE(nodes.GetDownNodes().empty());
+}
+
 TEST(AlternatorLiveNodes, ProbeDownNodesRejectsEmptyLocalNodesResponse) {
     Config cfg;
     cfg.nodes_list_update_period = std::chrono::milliseconds{0};
@@ -1124,6 +1470,68 @@ TEST(AlternatorLiveNodes, BackgroundRefreshUsesActivePeriodOnlyAfterActivity) {
 
     EXPECT_GT(requests.load(), 0);
     EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"node2.local"}));
+}
+
+TEST(AlternatorLiveNodes, PublicHealthReportMarksApplicationActivity) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{10};
+    cfg.idle_nodes_list_update_period = std::chrono::hours{1};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::atomic<int> requests{0};
+    auto http = std::make_shared<FakeHttpClient>([&](const Url&) {
+        ++requests;
+        return HttpResponse{200, "[\"node1.local\"]"};
+    });
+    AlternatorLiveNodes nodes({"node1.local"}, cfg, http);
+    nodes.Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds{30});
+    EXPECT_EQ(requests.load(), 0);
+
+    nodes.ReportNodeResult(
+        Url("http", "node1.local", 8080),
+        NodeHealthObservation::Success);
+    for (int attempt = 0; attempt < 50 && requests.load() == 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    nodes.Stop();
+
+    EXPECT_GT(requests.load(), 0);
+}
+
+TEST(AlternatorLiveNodes, BackgroundDiscoveryHealthKeepsIdleRefreshCadence) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{5};
+    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{80};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::mutex request_mutex;
+    std::condition_variable request_cv;
+    std::vector<std::chrono::steady_clock::time_point> request_times;
+    auto http = std::make_shared<FakeHttpClient>([&](const Url&) {
+        {
+            std::lock_guard<std::mutex> lock(request_mutex);
+            request_times.push_back(std::chrono::steady_clock::now());
+        }
+        request_cv.notify_all();
+        return HttpResponse{200, "[\"node1.local\"]"};
+    });
+
+    AlternatorLiveNodes nodes({"node1.local"}, cfg, http);
+    nodes.Start();
+    bool observed_two_refreshes = false;
+    {
+        std::unique_lock<std::mutex> lock(request_mutex);
+        observed_two_refreshes = request_cv.wait_for(
+            lock,
+            std::chrono::seconds{1},
+            [&] { return request_times.size() >= 2; });
+    }
+    nodes.Stop();
+
+    ASSERT_TRUE(observed_two_refreshes);
+    ASSERT_GE(request_times.size(), 2U);
+    EXPECT_GE(request_times[1] - request_times[0], std::chrono::milliseconds{55});
 }
 
 TEST(AlternatorLiveNodes, RejectsInvalidTlsSessionCacheConfig) {

@@ -131,10 +131,6 @@ struct Config {
     // respectively. Non-positive values disable the corresponding limit.
     std::chrono::milliseconds http_client_timeout{0};
     std::chrono::milliseconds connect_timeout{1000};
-    // Per-resolved-address safety ceiling used by the default discovery HTTP
-    // client. The shorter positive value wins when http_client_timeout is also
-    // configured. Non-positive values disable this additional ceiling.
-    std::chrono::milliseconds discovery_attempt_timeout{5000};
 
     bool verify_ssl = true;
     std::string ca_file;
@@ -153,6 +149,12 @@ struct Config {
 
     NodeHealthStoreConfig node_health;
     KeyRouteAffinityConfig key_route_affinity;
+
+    // Kept last to preserve the positional ordering of legacy aggregate
+    // initialization. This bounds each default discovery address and DNS wait;
+    // the shorter positive value wins when http_client_timeout is configured.
+    // Non-positive values disable this additional ceiling.
+    std::chrono::milliseconds discovery_attempt_timeout{5000};
 };
 
 void ValidateConfig(const Config& config);

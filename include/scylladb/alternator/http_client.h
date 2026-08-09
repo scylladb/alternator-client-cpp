@@ -38,9 +38,9 @@ public:
     [[nodiscard]] virtual HttpResponse Get(const Url& url) const = 0;
 
     // Resolve every address for a logical endpoint. Discovery calls this for
-    // each refresh so DNS entrypoints can change without pinning stale answers.
-    // Custom clients may keep the default behavior and let Get() resolve the
-    // hostname itself.
+    // each refresh through a fixed, deadline-aware worker pool so DNS
+    // entrypoints can change without pinning stale answers. Custom clients may
+    // keep the default behavior and let Get() resolve the hostname itself.
     [[nodiscard]] virtual std::vector<std::string> Resolve(const Url& url) const;
 
     // Connect to one resolved address while retaining url as the logical

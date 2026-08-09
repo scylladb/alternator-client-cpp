@@ -19,13 +19,238 @@
 #include <arpa/inet.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <condition_variable>
+#include <deque>
 #include <exception>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace scylladb::alternator {
 namespace {
+
+constexpr std::size_t kResolverWorkerCount = 2;
+constexpr std::size_t kResolverQueueCapacity = 64;
+
+class ResolutionCanceledError final : public std::runtime_error {
+public:
+    explicit ResolutionCanceledError(const std::string& host)
+        : std::runtime_error("DNS resolution canceled for " + host) {}
+};
+
+struct ResolverKey {
+    const HttpClient* client = nullptr;
+    std::string endpoint;
+
+    bool operator<(const ResolverKey& other) const {
+        const auto pointer_less = std::less<const HttpClient*>{};
+        if (client != other.client) {
+            return pointer_less(client, other.client);
+        }
+        return endpoint < other.endpoint;
+    }
+};
+
+enum class ResolverOperationState {
+    Queued,
+    Running,
+    Completed,
+    Abandoned,
+};
+
+struct ResolverOperation {
+    ResolverKey key;
+    std::shared_ptr<HttpClient> client;
+    Url endpoint;
+    ResolverOperationState state = ResolverOperationState::Queued;
+    std::size_t waiters = 0;
+    std::vector<std::string> addresses;
+    std::exception_ptr error;
+};
+
+class DiscoveryResolverPool {
+public:
+    DiscoveryResolverPool() {
+        for (std::size_t index = 0; index < kResolverWorkerCount; ++index) {
+            try {
+                std::thread worker([this] { WorkerLoop(); });
+                worker.detach();
+                ++worker_count_;
+            } catch (...) {
+                // A smaller fixed pool remains safe. Resolve() fails fast if
+                // the platform cannot create any resolver worker.
+            }
+        }
+    }
+
+    [[nodiscard]] std::vector<std::string> Resolve(
+        std::shared_ptr<HttpClient> client,
+        const Url& endpoint,
+        std::chrono::milliseconds timeout,
+        const std::atomic<bool>* cancellation) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (cancellation != nullptr && cancellation->load(std::memory_order_acquire)) {
+            throw ResolutionCanceledError(endpoint.host);
+        }
+        if (worker_count_ == 0) {
+            throw std::runtime_error("DNS resolver worker pool is unavailable");
+        }
+
+        ResolverKey key{client.get(), endpoint.ToString()};
+        std::shared_ptr<ResolverOperation> operation;
+        const auto existing = operations_.find(key);
+        if (existing != operations_.end()) {
+            operation = existing->second;
+        } else {
+            if (queue_.size() >= kResolverQueueCapacity) {
+                throw std::runtime_error("DNS resolver queue is full");
+            }
+            operation = std::make_shared<ResolverOperation>();
+            operation->key = std::move(key);
+            operation->client = std::move(client);
+            operation->endpoint = endpoint;
+            operations_.emplace(operation->key, operation);
+            try {
+                queue_.push_back(operation);
+            } catch (...) {
+                operations_.erase(operation->key);
+                throw;
+            }
+            work_cv_.notify_one();
+        }
+        ++operation->waiters;
+
+        const auto finished = [&] {
+            return operation->state == ResolverOperationState::Completed ||
+                   (cancellation != nullptr &&
+                    cancellation->load(std::memory_order_acquire));
+        };
+        bool woke_before_timeout = true;
+        if (timeout > std::chrono::milliseconds::zero()) {
+            woke_before_timeout = completion_cv_.wait_for(lock, timeout, finished);
+        } else {
+            completion_cv_.wait(lock, finished);
+        }
+
+        const bool completed = operation->state == ResolverOperationState::Completed;
+        const bool canceled =
+            !completed && cancellation != nullptr &&
+            cancellation->load(std::memory_order_acquire);
+        const bool timed_out = !completed && !canceled && !woke_before_timeout;
+        --operation->waiters;
+        if ((canceled || timed_out) && operation->waiters == 0 &&
+            operation->state == ResolverOperationState::Queued) {
+            AbandonQueuedOperation(operation);
+        }
+
+        if (canceled) {
+            throw ResolutionCanceledError(endpoint.host);
+        }
+        if (timed_out) {
+            throw std::runtime_error("DNS resolution timed out for " + endpoint.host);
+        }
+        if (!completed) {
+            throw std::runtime_error("DNS resolution interrupted for " + endpoint.host);
+        }
+
+        auto addresses = operation->addresses;
+        auto error = operation->error;
+        lock.unlock();
+        if (error) {
+            std::rethrow_exception(error);
+        }
+        return addresses;
+    }
+
+    void NotifyCancellation() {
+        // Synchronize with the wait transition so a cancellation notification
+        // cannot be lost between the predicate check and sleeping.
+        std::lock_guard<std::mutex> lock(mutex_);
+        completion_cv_.notify_all();
+    }
+
+private:
+    void AbandonQueuedOperation(const std::shared_ptr<ResolverOperation>& operation) {
+        const auto queued = std::find(queue_.begin(), queue_.end(), operation);
+        if (queued != queue_.end()) {
+            queue_.erase(queued);
+        }
+        const auto active = operations_.find(operation->key);
+        if (active != operations_.end() && active->second == operation) {
+            operations_.erase(active);
+        }
+        operation->state = ResolverOperationState::Abandoned;
+        operation->client.reset();
+    }
+
+    void WorkerLoop() {
+        while (true) {
+            std::shared_ptr<ResolverOperation> operation;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_cv_.wait(lock, [this] { return !queue_.empty(); });
+                operation = queue_.front();
+                queue_.pop_front();
+                if (operation->state != ResolverOperationState::Queued) {
+                    continue;
+                }
+                operation->state = ResolverOperationState::Running;
+            }
+
+            std::vector<std::string> addresses;
+            std::exception_ptr error;
+            try {
+                addresses = operation->client->Resolve(operation->endpoint);
+            } catch (...) {
+                error = std::current_exception();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                operation->addresses = std::move(addresses);
+                operation->error = std::move(error);
+                operation->state = ResolverOperationState::Completed;
+                const auto active = operations_.find(operation->key);
+                if (active != operations_.end() && active->second == operation) {
+                    operations_.erase(active);
+                }
+                operation->client.reset();
+            }
+            completion_cv_.notify_all();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable work_cv_;
+    std::condition_variable completion_cv_;
+    std::deque<std::shared_ptr<ResolverOperation>> queue_;
+    std::map<ResolverKey, std::shared_ptr<ResolverOperation>> operations_;
+    std::size_t worker_count_ = 0;
+};
+
+DiscoveryResolverPool& ResolverPool() {
+    // POSIX getaddrinfo() has no portable cancellation API. A deliberately
+    // process-lifetime pool keeps stuck resolver calls and their resources
+    // strictly bounded without making process shutdown join those calls.
+    static auto* pool = new DiscoveryResolverPool();
+    return *pool;
+}
+
+std::chrono::milliseconds EffectiveDiscoveryTimeout(const Config& config) {
+    if (config.http_client_timeout <= std::chrono::milliseconds::zero()) {
+        return config.discovery_attempt_timeout;
+    }
+    if (config.discovery_attempt_timeout <= std::chrono::milliseconds::zero()) {
+        return config.http_client_timeout;
+    }
+    return std::min(config.http_client_timeout, config.discovery_attempt_timeout);
+}
 
 class HttpStatusError final : public std::runtime_error {
 public:
@@ -313,10 +538,11 @@ void AlternatorLiveNodes::RecoverLiveNodesIfNeeded() {
     UpdateLiveNodesLocked();
 }
 
-void AlternatorLiveNodes::UpdateLiveNodesLocked() {
-    auto new_nodes = FetchLiveNodes();
+void AlternatorLiveNodes::UpdateLiveNodesLocked(
+    const std::atomic<bool>* resolution_cancellation) {
+    auto new_nodes = FetchLiveNodes(resolution_cancellation);
     if (new_nodes.empty()) {
-        ProbeDownNodes();
+        ProbeDownNodesInternal(resolution_cancellation);
         return;
     }
 
@@ -335,7 +561,7 @@ void AlternatorLiveNodes::UpdateLiveNodesLocked() {
         RemoveQuarantineHashAssignmentsForNode(node);
     }
 
-    ProbeDownNodes();
+    ProbeDownNodesInternal(resolution_cancellation);
 }
 
 void AlternatorLiveNodes::Start() {
@@ -343,6 +569,7 @@ void AlternatorLiveNodes::Start() {
     if (background_started_) {
         return;
     }
+    cancel_background_resolutions_.store(false, std::memory_order_release);
     stopping_ = false;
     background_started_ = true;
     background_thread_ = std::thread(&AlternatorLiveNodes::BackgroundLoop, this);
@@ -355,8 +582,10 @@ void AlternatorLiveNodes::Stop() {
             return;
         }
         stopping_ = true;
+        cancel_background_resolutions_.store(true, std::memory_order_release);
     }
     background_cv_.notify_all();
+    ResolverPool().NotifyCancellation();
     if (background_thread_.joinable()) {
         background_thread_.join();
     }
@@ -367,6 +596,12 @@ void AlternatorLiveNodes::Stop() {
 
 void AlternatorLiveNodes::ReportNodeResult(const Url& node, NodeHealthObservation observation) {
     MarkActivity();
+    ObserveNodeResult(node, observation);
+}
+
+void AlternatorLiveNodes::ObserveNodeResult(
+    const Url& node,
+    NodeHealthObservation observation) {
     health_store_->ReportNodeResult(node, observation);
     auto status = health_store_->GetNodeStatus(node);
     if (!status || status->state != NodeHealthState::Quarantined) {
@@ -375,16 +610,27 @@ void AlternatorLiveNodes::ReportNodeResult(const Url& node, NodeHealthObservatio
 }
 
 std::vector<Url> AlternatorLiveNodes::ProbeDownNodes() {
-    return health_store_->ProbeDownNodes([this](const Url& node, const NodeHealthStatus&) {
+    return ProbeDownNodesInternal(nullptr);
+}
+
+std::vector<Url> AlternatorLiveNodes::ProbeDownNodesInternal(
+    const std::atomic<bool>* resolution_cancellation) {
+    return health_store_->ProbeDownNodes([this, resolution_cancellation](
+                                            const Url& node,
+                                            const NodeHealthStatus&) {
         try {
-            const auto discovered = GetNodesFromEndpoint(node.WithPathAndQuery("/localnodes"));
+            const auto discovered = GetNodesFromEndpoint(
+                node.WithPathAndQuery("/localnodes"),
+                resolution_cancellation);
             return discovered.empty()
                 ? NodeHealthObservation::ConnectionFailure
                 : NodeHealthObservation::Success;
         } catch (const HttpStatusError& error) {
             return error.status_code >= 500
                 ? NodeHealthObservation::ServerError
-                : NodeHealthObservation::ConnectionFailure;
+                : NodeHealthObservation::Success;
+        } catch (const ResolutionCanceledError&) {
+            throw;
         } catch (...) {
             return NodeHealthObservation::ConnectionFailure;
         }
@@ -436,10 +682,11 @@ const Config& AlternatorLiveNodes::GetConfig() const {
     return config_;
 }
 
-std::vector<Url> AlternatorLiveNodes::FetchLiveNodes() {
+std::vector<Url> AlternatorLiveNodes::FetchLiveNodes(
+    const std::atomic<bool>* resolution_cancellation) {
     auto scope = config_.routing_scope;
     while (scope) {
-        auto nodes = GetNodesForScope(*scope);
+        auto nodes = GetNodesForScope(*scope, resolution_cancellation);
         if (!nodes.empty()) {
             return nodes;
         }
@@ -448,7 +695,9 @@ std::vector<Url> AlternatorLiveNodes::FetchLiveNodes() {
     return {};
 }
 
-std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope) {
+std::vector<Url> AlternatorLiveNodes::GetNodesForScope(
+    const RoutingScope& scope,
+    const std::atomic<bool>* resolution_cancellation) {
     const bool cluster_scope = scope.IsCluster();
     auto preferred_nodes = cluster_scope ? initial_nodes_ : GetQueryPlanNodes();
     std::vector<Url> fallback_nodes;
@@ -470,8 +719,8 @@ std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope
     for (Url node = plan.Next(); !node.Empty(); node = plan.Next()) {
         auto endpoint = node.WithPathAndQuery("/localnodes", scope.LocalNodesQuery());
         try {
-            auto nodes = GetNodesFromEndpoint(endpoint);
-            ReportNodeResult(node, NodeHealthObservation::Success);
+            auto nodes = GetNodesFromEndpoint(endpoint, resolution_cancellation);
+            ObserveNodeResult(node, NodeHealthObservation::Success);
             if (nodes.empty()) {
                 saw_empty_response = true;
                 continue;
@@ -480,16 +729,18 @@ std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope
                 return nodes;
             }
             discovered.insert(discovered.end(), nodes.begin(), nodes.end());
+        } catch (const ResolutionCanceledError&) {
+            throw;
         } catch (const HttpStatusError& error) {
-            ReportNodeResult(
+            ObserveNodeResult(
                 node,
                 error.status_code >= 500 ? NodeHealthObservation::ServerError : NodeHealthObservation::Success);
             last_error = std::current_exception();
         } catch (const InvalidHttpResponseError&) {
-            ReportNodeResult(node, NodeHealthObservation::Success);
+            ObserveNodeResult(node, NodeHealthObservation::Success);
             last_error = std::current_exception();
         } catch (...) {
-            ReportNodeResult(node, NodeHealthObservation::ConnectionFailure);
+            ObserveNodeResult(node, NodeHealthObservation::ConnectionFailure);
             last_error = std::current_exception();
         }
     }
@@ -511,8 +762,14 @@ std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope
     return {};
 }
 
-std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) const {
-    auto addresses = http_client_->Resolve(endpoint);
+std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(
+    const Url& endpoint,
+    const std::atomic<bool>* resolution_cancellation) const {
+    auto addresses = ResolverPool().Resolve(
+        http_client_,
+        endpoint,
+        EffectiveDiscoveryTimeout(config_),
+        resolution_cancellation);
     std::vector<std::string> unique_addresses;
     unique_addresses.reserve(addresses.size());
     for (auto& address : addresses) {
@@ -765,10 +1022,11 @@ void AlternatorLiveNodes::BackgroundLoop() {
         lock.unlock();
         try {
             if (should_update) {
-                UpdateLiveNodes();
+                std::lock_guard<std::mutex> update_lock(update_mutex_);
+                UpdateLiveNodesLocked(&cancel_background_resolutions_);
             }
             if (should_probe_down) {
-                ProbeDownNodes();
+                ProbeDownNodesInternal(&cancel_background_resolutions_);
             }
         } catch (...) {
             // Background refresh is best-effort.
