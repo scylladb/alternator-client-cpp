@@ -144,18 +144,25 @@ public:
             cancellation->load(std::memory_order_acquire);
         const bool timed_out = !completed && !canceled && !woke_before_timeout;
         --operation->waiters;
+        std::shared_ptr<HttpClient> client_to_release;
         if ((canceled || timed_out) && operation->waiters == 0 &&
             operation->state == ResolverOperationState::Queued) {
-            AbandonQueuedOperation(operation);
+            client_to_release = AbandonQueuedOperation(operation);
         }
 
         if (canceled) {
+            lock.unlock();
+            client_to_release.reset();
             throw ResolutionCanceledError(endpoint.host);
         }
         if (timed_out) {
+            lock.unlock();
+            client_to_release.reset();
             throw std::runtime_error("DNS resolution timed out for " + endpoint.host);
         }
         if (!completed) {
+            lock.unlock();
+            client_to_release.reset();
             throw std::runtime_error("DNS resolution interrupted for " + endpoint.host);
         }
 
@@ -176,7 +183,8 @@ public:
     }
 
 private:
-    void AbandonQueuedOperation(const std::shared_ptr<ResolverOperation>& operation) {
+    [[nodiscard]] std::shared_ptr<HttpClient> AbandonQueuedOperation(
+        const std::shared_ptr<ResolverOperation>& operation) {
         const auto queued = std::find(queue_.begin(), queue_.end(), operation);
         if (queued != queue_.end()) {
             queue_.erase(queued);
@@ -186,7 +194,7 @@ private:
             operations_.erase(active);
         }
         operation->state = ResolverOperationState::Abandoned;
-        operation->client.reset();
+        return std::move(operation->client);
     }
 
     void WorkerLoop() {
@@ -211,6 +219,7 @@ private:
                 error = std::current_exception();
             }
 
+            std::shared_ptr<HttpClient> client_to_release;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 operation->addresses = std::move(addresses);
@@ -220,9 +229,10 @@ private:
                 if (active != operations_.end() && active->second == operation) {
                     operations_.erase(active);
                 }
-                operation->client.reset();
+                client_to_release = std::move(operation->client);
             }
             completion_cv_.notify_all();
+            client_to_release.reset();
         }
     }
 

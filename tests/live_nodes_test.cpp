@@ -147,6 +147,90 @@ private:
     std::shared_ptr<ResolverGate> gate_;
 };
 
+class DestructorGate {
+public:
+    void Block() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        entered_ = true;
+        condition_.notify_all();
+        condition_.wait(lock, [this] { return released_; });
+        finished_ = true;
+        condition_.notify_all();
+    }
+
+    [[nodiscard]] bool WaitForEntered(
+        std::chrono::milliseconds timeout = std::chrono::seconds{1}) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [this] { return entered_; });
+    }
+
+    [[nodiscard]] bool WaitForFinished(
+        std::chrono::milliseconds timeout = std::chrono::seconds{1}) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [this] { return finished_; });
+    }
+
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        condition_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool entered_ = false;
+    bool released_ = false;
+    bool finished_ = false;
+};
+
+class DestructorReleaseGuard {
+public:
+    explicit DestructorReleaseGuard(std::shared_ptr<DestructorGate> gate)
+        : gate_(std::move(gate)) {}
+
+    ~DestructorReleaseGuard() {
+        gate_->Release();
+    }
+
+    DestructorReleaseGuard(const DestructorReleaseGuard&) = delete;
+    DestructorReleaseGuard& operator=(const DestructorReleaseGuard&) = delete;
+
+private:
+    std::shared_ptr<DestructorGate> gate_;
+};
+
+class BlockingDestructorHttpClient final : public HttpClient {
+public:
+    BlockingDestructorHttpClient(
+        std::shared_ptr<ResolverGate> resolver_gate,
+        std::shared_ptr<DestructorGate> destructor_gate)
+        : resolver_gate_(std::move(resolver_gate))
+        , destructor_gate_(std::move(destructor_gate)) {}
+
+    ~BlockingDestructorHttpClient() override {
+        destructor_gate_->Block();
+    }
+
+    std::vector<std::string> Resolve(const Url&) const override {
+        return resolver_gate_->Resolve();
+    }
+
+    HttpResponse Get(const Url&) const override {
+        return {200, R"(["resolved.internal"])"};
+    }
+
+    HttpResponse GetResolved(const Url&, const std::string&) const override {
+        return {200, R"(["resolved.internal"])"};
+    }
+
+private:
+    std::shared_ptr<ResolverGate> resolver_gate_;
+    std::shared_ptr<DestructorGate> destructor_gate_;
+};
+
 class PassthroughContentEncodingDecoder final : public HttpContentEncodingDecoder {
 public:
     explicit PassthroughContentEncodingDecoder(std::vector<std::string> accepted_encodings = {"br"})
@@ -780,6 +864,96 @@ TEST(AlternatorLiveNodes, DestructionCancelsResolverWithoutClientUseAfterFree) {
     EXPECT_TRUE(worker_kept_client_alive);
     EXPECT_TRUE(resolver_finished);
     EXPECT_TRUE(client_lifetime.expired());
+}
+
+TEST(AlternatorLiveNodes, BlockingClientDestructorDoesNotHoldResolverPoolMutex) {
+    Config blocking_cfg;
+    blocking_cfg.nodes_list_update_period = std::chrono::milliseconds::zero();
+    blocking_cfg.idle_nodes_list_update_period = std::chrono::milliseconds{1};
+    blocking_cfg.node_health.down_node_probe_period = std::chrono::milliseconds::zero();
+    blocking_cfg.http_client_timeout = std::chrono::milliseconds::zero();
+    blocking_cfg.discovery_attempt_timeout = std::chrono::milliseconds::zero();
+
+    auto resolver_gate = std::make_shared<ResolverGate>();
+    auto destructor_gate = std::make_shared<DestructorGate>();
+    DestructorReleaseGuard release_destructor_on_exit(destructor_gate);
+    auto blocking_http = std::make_shared<BlockingDestructorHttpClient>(
+        resolver_gate,
+        destructor_gate);
+    auto blocked_nodes = std::make_unique<AlternatorLiveNodes>(
+        std::vector<std::string>{"blocked.example"},
+        blocking_cfg,
+        blocking_http);
+    blocked_nodes->Start();
+    const bool blocked_resolver_started = resolver_gate->WaitForCalls(1);
+    if (!blocked_resolver_started) {
+        resolver_gate->Release();
+        destructor_gate->Release();
+        blocked_nodes.reset();
+        blocking_http.reset();
+        FAIL() << "blocking resolver did not start";
+        return;
+    }
+
+    blocked_nodes.reset();
+    blocking_http.reset();
+    resolver_gate->Release();
+    const bool destructor_entered = destructor_gate->WaitForEntered();
+    if (!destructor_entered) {
+        destructor_gate->Release();
+        FAIL() << "client destructor did not run on resolver completion";
+        return;
+    }
+
+    Config foreground_cfg = blocking_cfg;
+    foreground_cfg.idle_nodes_list_update_period = std::chrono::milliseconds::zero();
+    foreground_cfg.discovery_attempt_timeout = std::chrono::seconds{5};
+    auto foreground_http = std::make_shared<ResolvedFakeHttpClient>(
+        [](const Url&) { return std::vector<std::string>{"127.0.0.1"}; },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["foreground.internal"])"};
+        });
+    AlternatorLiveNodes foreground_nodes(
+        {"foreground.example"},
+        foreground_cfg,
+        foreground_http);
+    auto foreground_update = std::async(std::launch::async, [&] {
+        try {
+            foreground_nodes.UpdateLiveNodes();
+            return std::string{};
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+    });
+    const auto foreground_status = foreground_update.wait_for(std::chrono::seconds{1});
+
+    auto stop_resolver_gate = std::make_shared<ResolverGate>();
+    ResolverReleaseGuard release_stop_resolver_on_exit(stop_resolver_gate);
+    auto stop_http = std::make_shared<ResolvedFakeHttpClient>(
+        [stop_resolver_gate](const Url&) { return stop_resolver_gate->Resolve(); },
+        [](const Url&, const std::string&) {
+            return HttpResponse{200, R"(["unexpected.internal"])"};
+        });
+    AlternatorLiveNodes stopping_nodes({"stopping.example"}, blocking_cfg, stop_http);
+    stopping_nodes.Start();
+    const bool stop_resolver_started = stop_resolver_gate->WaitForCalls(
+        1,
+        std::chrono::seconds{1});
+    auto stop = std::async(std::launch::async, [&] { stopping_nodes.Stop(); });
+    const auto stop_status = stop.wait_for(std::chrono::seconds{1});
+
+    destructor_gate->Release();
+    stop_resolver_gate->Release();
+    foreground_update.wait();
+    stop.wait();
+    const auto foreground_error = foreground_update.get();
+    stop.get();
+
+    EXPECT_EQ(foreground_status, std::future_status::ready);
+    EXPECT_TRUE(foreground_error.empty()) << foreground_error;
+    EXPECT_TRUE(stop_resolver_started);
+    EXPECT_EQ(stop_status, std::future_status::ready);
+    EXPECT_TRUE(destructor_gate->WaitForFinished());
 }
 
 TEST(AlternatorLiveNodes, EmptyClusterResponsesFailClearly) {

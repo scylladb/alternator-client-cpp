@@ -327,7 +327,10 @@ values are positive, the shorter value wins; setting
 zero, a stalled DNS operation or a peer that accepts a connection but never
 responds can block a foreground discovery caller indefinitely.
 `connect_timeout` defaults to 1 second and separately bounds the connection
-phase. `Stop()` still cancels a background resolver wait.
+phase. `Stop()` still cancels a background resolver wait, but it cannot
+interrupt an in-flight HTTP request. Setting both request timeouts to zero is
+therefore an explicit opt-out from prompt HTTP shutdown: `Stop()` or destruction
+can wait indefinitely for a stalled HTTP peer.
 
 Hostname resolution runs the platform's synchronous `getaddrinfo()` call in a
 process-lifetime pool of two workers. Concurrent calls for the same client and
