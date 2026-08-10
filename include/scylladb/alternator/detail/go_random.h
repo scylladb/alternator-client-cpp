@@ -35,7 +35,7 @@ private:
 
     int tap_ = 0;
     int feed_ = 0;
-    std::array<std::uint64_t, 607> vec_{};
+    std::array<std::int64_t, 607> vec_{};
 };
 
 } // namespace scylladb::alternator::detail

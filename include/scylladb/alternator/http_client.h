@@ -16,11 +16,9 @@
 
 #pragma once
 
-#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include <scylladb/alternator/config.h>
 #include <scylladb/alternator/uri.h>
@@ -36,34 +34,7 @@ class HttpClient {
 public:
     virtual ~HttpClient() = default;
 
-    // A timed-out non-cooperative call may remain on a bounded worker while a
-    // fallback starts, so custom implementations must make these const methods
-    // safe for concurrent use.
-
     [[nodiscard]] virtual HttpResponse Get(const Url& url) const = 0;
-
-    // Resolve every address for a logical endpoint. Discovery calls this for
-    // each refresh through a fixed, deadline-aware worker pool so DNS
-    // entrypoints can change without pinning stale answers. Custom clients may
-    // keep the default behavior and let Get() resolve the hostname itself.
-    [[nodiscard]] virtual std::vector<std::string> Resolve(const Url& url) const;
-
-    // Connect to one resolved address while retaining url as the logical
-    // endpoint. Implementations must preserve its Host header and, for HTTPS,
-    // TLS SNI and certificate verification semantics.
-    [[nodiscard]] virtual HttpResponse GetResolved(
-        const Url& url,
-        const std::string& resolved_address) const;
-
-    // Like GetResolved(), with an additional per-call ceiling. The discovery
-    // caller also bounds this call in a fixed worker pool. The default
-    // preserves source compatibility by delegating to GetResolved(); custom
-    // transports should still override this method so timed-out work releases
-    // its shared worker promptly.
-    [[nodiscard]] virtual HttpResponse GetResolvedWithTimeout(
-        const Url& url,
-        const std::string& resolved_address,
-        std::chrono::milliseconds timeout) const;
 };
 
 class CurlHttpClient final : public HttpClient {
@@ -72,20 +43,11 @@ public:
     ~CurlHttpClient() override;
 
     [[nodiscard]] HttpResponse Get(const Url& url) const override;
-    [[nodiscard]] std::vector<std::string> Resolve(const Url& url) const override;
-    [[nodiscard]] HttpResponse GetResolved(
-        const Url& url,
-        const std::string& resolved_address) const override;
-    [[nodiscard]] HttpResponse GetResolvedWithTimeout(
-        const Url& url,
-        const std::string& resolved_address,
-        std::chrono::milliseconds timeout) const override;
 
 private:
     Config config_;
-    mutable std::timed_mutex mutex_;
+    mutable std::mutex mutex_;
     mutable void* reusable_handle_ = nullptr;
-    mutable std::string reusable_resolved_address_;
 };
 
 std::shared_ptr<HttpClient> NewDefaultHttpClient(const Config& config);

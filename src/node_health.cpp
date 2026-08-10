@@ -91,26 +91,6 @@ void NodeHealthStore::RemoveNode(const Url& node) {
     statuses_.erase(node);
 }
 
-void NodeHealthStore::ReplaceNodes(const std::vector<Url>& nodes) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& node : nodes) {
-        if (statuses_.find(node) == statuses_.end()) {
-            statuses_.emplace(node, NodeHealthStatus{
-                NodeHealthState::Active,
-                0,
-                config_.quarantine_success_threshold,
-                std::chrono::steady_clock::now()});
-        }
-    }
-    for (auto it = statuses_.begin(); it != statuses_.end();) {
-        if (std::find(nodes.begin(), nodes.end(), it->first) == nodes.end()) {
-            it = statuses_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 void NodeHealthStore::ReportNodeResult(const Url& node, NodeHealthObservation observation) {
     if (config_.disabled) {
         return;

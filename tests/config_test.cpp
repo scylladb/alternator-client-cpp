@@ -18,7 +18,6 @@
 
 #include <gtest/gtest.h>
 
-#include <chrono>
 #include <string>
 
 using namespace scylladb::alternator;
@@ -38,58 +37,4 @@ TEST(Config, UserAgentCanBeCleared) {
     config.user_agent.clear();
 
     EXPECT_TRUE(config.user_agent.empty());
-}
-
-TEST(Config, DefaultDiscoveryTimeoutsAreFiniteWithoutChangingHttpTimeoutCompatibility) {
-    const Config config;
-
-    EXPECT_EQ(config.http_client_timeout, std::chrono::milliseconds::zero());
-    EXPECT_EQ(config.connect_timeout, std::chrono::seconds{1});
-    EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
-    EXPECT_EQ(config.max_discovery_response_bytes, 1024U * 1024U);
-    EXPECT_EQ(config.discovery_cycle_timeout, std::chrono::seconds{5});
-}
-
-TEST(Config, DiscoveryTimeoutRemainsAfterLegacyAggregateMembers) {
-    const Config config{
-        8043,
-        "https",
-        NewClusterScope(),
-        "aggregate-region",
-        Credentials{"access", "secret"},
-        std::chrono::milliseconds{11},
-        std::chrono::milliseconds{12},
-        std::chrono::milliseconds{13},
-        std::chrono::milliseconds{14},
-        false,
-        "ca.pem",
-        "client.pem",
-        "client.key",
-        false,
-        15,
-        std::chrono::seconds{16},
-        17,
-        false,
-        nullptr,
-        {},
-        "aggregate-agent",
-        nullptr,
-        {},
-        {},
-    };
-
-    EXPECT_EQ(config.connect_timeout, std::chrono::milliseconds{14});
-    EXPECT_FALSE(config.verify_ssl);
-    EXPECT_EQ(config.max_connections, 17U);
-    EXPECT_EQ(config.user_agent, "aggregate-agent");
-    EXPECT_EQ(config.discovery_attempt_timeout, std::chrono::seconds{5});
-    EXPECT_EQ(config.max_discovery_response_bytes, 1024U * 1024U);
-    EXPECT_EQ(config.discovery_cycle_timeout, std::chrono::seconds{5});
-}
-
-TEST(Config, RejectsZeroDiscoveryResponseLimit) {
-    Config config;
-    config.max_discovery_response_bytes = 0;
-
-    EXPECT_THROW(ValidateConfig(config), std::invalid_argument);
 }

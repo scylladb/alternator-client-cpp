@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <cstddef>
-#include <limits>
 #include <string>
 #include <vector>
 
@@ -32,8 +30,7 @@ namespace scylladb::alternator::detail {
 [[nodiscard]] std::string DecodeHttpResponseBody(
     std::string body,
     const std::string& content_encoding,
-    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders,
-    std::size_t maximum_decoded_size = std::numeric_limits<std::size_t>::max());
+    const std::vector<std::shared_ptr<HttpContentEncodingDecoder>>& content_encoding_decoders);
 [[nodiscard]] std::string FindHttpHeaderValue(const std::string& headers, const std::string& name);
 [[nodiscard]] std::string NormalizeResponseEncoding(std::string encoding);
 [[nodiscard]] std::string ToLowerAscii(std::string value);
