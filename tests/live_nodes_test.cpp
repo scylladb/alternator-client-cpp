@@ -248,6 +248,42 @@ TEST(AlternatorLiveNodes, DnsEntrypointDiscoversDnsNodeRecords) {
     EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"localhost", "node-a.internal"}));
 }
 
+TEST(AlternatorLiveNodes, RecoveryRefreshReturnsToOriginalDnsEntrypoint) {
+    // HttpClient's real multi-address fallback is covered by the
+    // DualStackDnsFallsBackToReachable tests. This test verifies that recovery
+    // sends the original logical hostname through that same client again.
+    Config cfg;
+    cfg.scheme = "http";
+    cfg.port = 8043;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{0};
+    cfg.node_health.down_node_probe_period = std::chrono::milliseconds{0};
+
+    std::vector<std::string> requested_hosts;
+    std::size_t refresh_index = 0;
+    auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
+        requested_hosts.push_back(url.host);
+        const auto body = refresh_index++ == 0
+            ? R"(["learned-old.local"])"
+            : R"(["learned-new.local"])";
+        return HttpResponse{200, body};
+    });
+
+    AlternatorLiveNodes nodes({"entrypoint.test"}, cfg, http);
+    nodes.UpdateLiveNodes();
+    const Url learned_old(cfg.scheme, "learned-old.local", cfg.port);
+    EXPECT_EQ(nodes.GetNodes(), std::vector<Url>({learned_old}));
+
+    nodes.ReportNodeResult(learned_old, NodeHealthObservation::ConnectionFailure);
+    EXPECT_TRUE(nodes.GetActiveNodes().empty());
+    nodes.UpdateLiveNodes();
+
+    EXPECT_EQ(
+        requested_hosts,
+        std::vector<std::string>({"entrypoint.test", "entrypoint.test"}));
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"learned-new.local"}));
+}
+
 TEST(AlternatorLiveNodes, IPv6LiteralDiscoversIPv6NodeRecords) {
     std::vector<std::string> requested_urls;
     auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
