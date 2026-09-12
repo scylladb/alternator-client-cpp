@@ -36,6 +36,8 @@ jobs:
       AWS_SDK_CPP_INSTALL_DIR: ${{ github.workspace }}/.deps/aws-sdk-cpp
       CMAKE_PREFIX_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp
       LD_LIBRARY_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp/lib:${{ github.workspace }}/.deps/aws-sdk-cpp/lib64
+      SCYLLA_VERSION: release:2025.2.5
+      SCYLLA_INTEGRATION_VERSION: release:2026.1.6
 
     steps:
       - name: Checkout source
@@ -51,9 +53,14 @@ jobs:
             libcurl4-openssl-dev \
             libgtest-dev \
             libssl-dev \
+            libyaml-cpp-dev \
             ninja-build \
             openssl \
+            util-linux \
             zlib1g-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
 
       - name: Check license headers
         uses: korandoru/hawkeye@453bacfa60b19044f1e0b1e6df2826a665fb3623 # v6.0.0
@@ -98,11 +105,21 @@ jobs:
         run: |
           make test-unit
 
+      - name: Cache Scylla relocatable package
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.ccm/scylla-repository
+          key: scylla-ccm-relocatable-${{ runner.os }}-${{ runner.arch }}-release-2025.2.5-release-2026.1.6
+
       - name: Run integration tests
+        timeout-minutes: 30
         run: |
           make test-integration
 
-      - name: Stop Scylla
+      - name: Upload CCM diagnostics
         if: always()
-        run: |
-          make scylla-stop
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ccm-diagnostics
+          path: build/ccm/**
+          if-no-files-found: ignore

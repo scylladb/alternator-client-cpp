@@ -17,6 +17,8 @@
 #include <scylladb/alternator/http_client.h>
 #include <scylladb/alternator/live_nodes.h>
 
+#include "integration_test_config.h"
+
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -25,7 +27,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -37,26 +38,6 @@
 using namespace scylladb::alternator;
 
 namespace {
-
-bool IntegrationEnabled() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION");
-    return value != nullptr && std::string(value) == "1";
-}
-
-std::vector<std::string> IntegrationNodes() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_NODE");
-    return {value != nullptr && std::string(value).size() > 0 ? std::string(value) : "172.41.0.2"};
-}
-
-std::uint16_t IntegrationHttpPort() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_HTTP_PORT");
-    return static_cast<std::uint16_t>(value != nullptr ? std::stoi(value) : 9998);
-}
-
-std::uint16_t IntegrationHttpsPort() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_HTTPS_PORT");
-    return static_cast<std::uint16_t>(value != nullptr ? std::stoi(value) : 9999);
-}
 
 std::vector<std::string> Hosts(const std::vector<Url>& nodes) {
     std::vector<std::string> out;
@@ -151,19 +132,15 @@ private:
     std::thread worker_;
 };
 
-Config IntegrationConfig(std::uint16_t port) {
-    Config cfg;
-    cfg.port = port;
-    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
-    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{0};
-    cfg.node_health.disabled = true;
-    return cfg;
-}
-
 std::string FetchIntegrationLocalNodesBody() {
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
     auto client = NewDefaultHttpClient(cfg);
-    auto url = Url::FromHostPort("http", IntegrationNodes()[0], IntegrationHttpPort())
+    auto url = Url::FromHostPort(
+                   "http",
+                   scylladb::alternator::testing::IntegrationNodes()[0],
+                   scylladb::alternator::testing::IntegrationPort(
+                       testinfra::AlternatorTransport::Http))
         .WithPathAndQuery("/localnodes");
     auto response = client->Get(url);
     if (response.status_code != 200) {
@@ -176,7 +153,7 @@ std::string FetchIntegrationLocalNodesBody() {
 
 #define REQUIRE_INTEGRATION()                                                                    \
     do {                                                                                         \
-        if (!IntegrationEnabled()) {                                                             \
+        if (!scylladb::alternator::testing::IntegrationEnabled()) {                              \
             GTEST_SKIP() << "set ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION=1 to run live Alternator integration tests"; \
         }                                                                                        \
     } while (false)
@@ -184,16 +161,19 @@ std::string FetchIntegrationLocalNodesBody() {
 TEST(AlternatorLiveNodesIntegration, RoutingFallbackLearnsNodes) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
-    cfg.routing_scope = NewDCScope("wrongDC", NewDCScope("datacenter1"));
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
+    cfg.routing_scope = NewDCScope(
+        "wrongDC",
+        NewDCScope(scylladb::alternator::testing::IntegrationDatacenter()));
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.CheckIfRackAndDatacenterSetCorrectly());
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
 
     const auto discovered = Hosts(nodes.GetNodes());
     ASSERT_FALSE(discovered.empty());
-    EXPECT_NE(discovered, IntegrationNodes());
+    EXPECT_NE(discovered, scylladb::alternator::testing::IntegrationNodes());
 }
 
 TEST(AlternatorLiveNodesIntegration, CompressedHttpDiscoveryWorks) {
@@ -202,10 +182,11 @@ TEST(AlternatorLiveNodesIntegration, CompressedHttpDiscoveryWorks) {
     GTEST_SKIP() << "zlib support is not enabled";
 #endif
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
     cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
     EXPECT_FALSE(nodes.GetNodes().empty());
 }
@@ -214,7 +195,9 @@ TEST(AlternatorLiveNodesIntegration, DnsEntrypointDiscoversLiveClusterNodes) {
     REQUIRE_INTEGRATION();
 
     LocalDnsEntrypointServer server(FetchIntegrationLocalNodesBody());
-    auto cfg = IntegrationConfig(server.Port());
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
+    cfg.port = server.Port();
 
     AlternatorLiveNodes nodes({"localhost"}, cfg);
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
@@ -229,62 +212,73 @@ TEST(AlternatorLiveNodesIntegration, DnsEntrypointDiscoversLiveClusterNodes) {
 TEST(AlternatorLiveNodesIntegration, RejectsWrongDatacenter) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
     cfg.routing_scope = NewDCScope("wrongDC");
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_THROW(nodes.CheckIfRackAndDatacenterSetCorrectly(), std::runtime_error);
 }
 
 TEST(AlternatorLiveNodesIntegration, AcceptsCorrectDatacenter) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
-    cfg.routing_scope = NewDCScope("datacenter1");
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
+    cfg.routing_scope = NewDCScope(
+        scylladb::alternator::testing::IntegrationDatacenter());
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.CheckIfRackAndDatacenterSetCorrectly());
 }
 
 TEST(AlternatorLiveNodesIntegration, RejectsWrongRack) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
-    cfg.routing_scope = NewRackScope("datacenter1", "wrongRack");
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
+    cfg.routing_scope = NewRackScope(
+        scylladb::alternator::testing::IntegrationDatacenter(), "wrongRack");
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_THROW(nodes.CheckIfRackAndDatacenterSetCorrectly(), std::runtime_error);
 }
 
 TEST(AlternatorLiveNodesIntegration, AcceptsCorrectRack) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
-    cfg.routing_scope = NewRackScope("datacenter1", "rack1");
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
+    cfg.routing_scope = NewRackScope(
+        scylladb::alternator::testing::IntegrationDatacenter(),
+        scylladb::alternator::testing::IntegrationRack());
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.CheckIfRackAndDatacenterSetCorrectly());
 }
 
 TEST(AlternatorLiveNodesIntegration, DetectsRackDatacenterFeatureSupport) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
-    cfg.routing_scope = NewDCScope("datacenter1");
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
+    cfg.routing_scope = NewDCScope(
+        scylladb::alternator::testing::IntegrationDatacenter());
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_TRUE(nodes.CheckIfRackDatacenterFeatureIsSupported());
 }
 
 TEST(AlternatorLiveNodesIntegration, HttpsDiscoveryWorksWhenCertificateVerificationIsDisabled) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpsPort());
-    cfg.scheme = "https";
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Https);
     cfg.verify_ssl = false;
-    cfg.routing_scope = NewDCScope("datacenter1");
+    cfg.routing_scope = NewDCScope(
+        scylladb::alternator::testing::IntegrationDatacenter());
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
     EXPECT_FALSE(nodes.GetNodes().empty());
 }

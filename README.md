@@ -13,6 +13,34 @@ make test
 
 The core target requires C++17. The default discovery HTTP client uses libcurl when CMake can find the libcurl development package; otherwise it falls back to a small POSIX plain-HTTP client. HTTPS discovery requires libcurl or a caller-provided `HttpClient`. Built-in gzip and deflate response decoding is available when CMake finds zlib; callers can provide a custom decoder for other content encodings or for builds without zlib. Tests use GoogleTest when it is installed. The AWS adapter target is built only when CMake can find `AWSSDK` with the `dynamodb` component. `make test-integration` requires the AWS adapter and its tests by configuring with `ALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON`.
 
+## Integration testing with CCM
+
+Integration tests provision native Scylla clusters with
+[scylla-ccm](https://github.com/scylladb/scylla-ccm) and relocatable packages. Docker and Docker
+Compose are not required. Linux, Python 3.9 or newer, OpenSSL, yaml-cpp, `setsid`, and
+[`uv`](https://docs.astral.sh/uv/) are required. Linux runtime must permit `pidfd_open(2)` and
+`pidfd_send_signal(2)` so stale-process recovery cannot signal a reused process ID.
+
+```console
+make ccm-install
+make test-integration
+```
+
+Default cluster uses Scylla `release:2025.2.5`, three nodes in one datacenter/rack, HTTP and HTTPS,
+two processing units, and 1,024 MiB per node. `SCYLLA_VERSION` selects another package;
+the existing client integration suite uses `release:2026.1.6` by default because its compressed-request
+coverage requires that newer server feature, selectable with `SCYLLA_INTEGRATION_VERSION`.
+`SCYLLA_CCM_PATH` selects another CCM executable; `SCYLLA_CCM_MAX_NODES` may lower nine-node limit;
+`SCYLLA_CCM_ROOT` selects private live-state/address-reservation root; and
+`SCYLLA_CCM_DIAGNOSTICS_DIR` selects external diagnostics directory.
+
+Ordinary tests use `TestClusters::AcquireReusable()` and receive independent table namespaces on
+matching shared cluster. Tests that change process state or topology use exclusive
+`TestClusters::ProvisionPrivate()` leases. Both are RAII APIs. C++ harness owns readiness,
+diagnostics, normal cleanup, and next-start recovery after hard termination. See
+[generic contract](feature-specs/ccm-integration.md) and
+[C++ implementation map](feature-specs/implementation/ccm-integration.md).
+
 ## Core Usage
 
 ```cpp
