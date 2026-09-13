@@ -167,7 +167,7 @@ struct SequencedHttpResponse {
     std::string reason = "OK";
     std::string body;
     std::chrono::milliseconds delay{0};
-    std::vector<std::pair<std::string, std::string>> headers;
+    std::vector<std::pair<std::string, std::string>> headers{};
 };
 
 class KeepAliveSequenceHttpServer {

@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-MAKEFILE_PATH := $(abspath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+SHELL := bash
+.ONESHELL:
+.SHELLFLAGS := -eo pipefail -c
+
+# GNU Make pathname functions treat spaces as separators between pathnames.
+MAKEFILE_PATH := $(CURDIR)
 
 CMAKE ?= cmake
 CTEST ?= ctest
@@ -24,17 +29,26 @@ CHECK_CXX_FLAGS ?= -Wall -Wextra -Werror
 BUILD_CMAKE_FLAGS ?= -DALTERNATOR_CLIENT_CPP_REQUIRE_AWS=OFF
 INTEGRATION_CMAKE_FLAGS ?= -DALTERNATOR_CLIENT_CPP_ENABLE_AWS=ON -DALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON
 
-COMPOSE := docker compose -f $(MAKEFILE_PATH)/test/docker-compose.yml
+SCYLLA_CCM_COMMIT := d15a2fab9d22fffad8a30c806a7c8e1632e58aae
+SCYLLA_CCM_VENV := $(MAKEFILE_PATH)/.deps/scylla-ccm-$(SCYLLA_CCM_COMMIT)
+PINNED_SCYLLA_CCM_PATH := $(SCYLLA_CCM_VENV)/bin/ccm
+SCYLLA_CCM_INSTALL_LOCK := $(SCYLLA_CCM_VENV).install.lock
+SCYLLA_CCM_INSTALL_MARKER := $(SCYLLA_CCM_VENV)/.install-complete
+SCYLLA_CCM_PATH ?= $(PINNED_SCYLLA_CCM_PATH)
+SCYLLA_VERSION ?= release:2025.2.5
+SCYLLA_INTEGRATION_VERSION ?= release:2026.1.6
+SCYLLA_CCM_DIAGNOSTICS_DIR ?= $(BUILD_DIR)/ccm
+SCYLLA_CCM_NO_PROXY := localhost,127.0.0.1
 
 .PHONY: build
 build:
-	$(CMAKE) -S . -B $(BUILD_DIR) $(BUILD_CMAKE_FLAGS)
-	$(CMAKE) --build $(BUILD_DIR) --parallel
+	$(CMAKE) -S . -B "$(BUILD_DIR)" $(BUILD_CMAKE_FLAGS)
+	$(CMAKE) --build "$(BUILD_DIR)" --parallel
 
 .PHONY: check
 check: check-license-headers
-	$(CMAKE) -S . -B $(CHECK_BUILD_DIR) -DCMAKE_CXX_FLAGS="$(CHECK_CXX_FLAGS)" -DALTERNATOR_CLIENT_CPP_ENABLE_AWS=OFF
-	$(CMAKE) --build $(CHECK_BUILD_DIR) --parallel
+	$(CMAKE) -S . -B "$(CHECK_BUILD_DIR)" -DCMAKE_CXX_FLAGS="$(CHECK_CXX_FLAGS)" -DALTERNATOR_CLIENT_CPP_ENABLE_AWS=OFF
+	$(CMAKE) --build "$(CHECK_BUILD_DIR)" --parallel
 
 .PHONY: check-license-headers
 check-license-headers:
@@ -45,43 +59,107 @@ test: build check test-unit test-integration
 
 .PHONY: test-unit
 test-unit:
-	$(CMAKE) -S . -B $(BUILD_DIR) $(BUILD_CMAKE_FLAGS)
-	$(CMAKE) --build $(BUILD_DIR) --parallel
-	$(CTEST) --test-dir $(BUILD_DIR) --output-on-failure -E Integration
+	$(CMAKE) -S . -B "$(BUILD_DIR)" $(BUILD_CMAKE_FLAGS)
+	$(CMAKE) --build "$(BUILD_DIR)" --parallel
+	$(CTEST) --test-dir "$(BUILD_DIR)" --output-on-failure -LE '^(Integration|CcmProvisioning)$$'
 
 .PHONY: build-integration
 build-integration:
-	$(CMAKE) -S . -B $(BUILD_DIR) $(INTEGRATION_CMAKE_FLAGS)
-	$(CMAKE) --build $(BUILD_DIR) --parallel
-	$(CTEST) --test-dir $(BUILD_DIR) --output-on-failure -R "alternator_client_cpp_aws_.*tests_present"
+	$(CMAKE) -S . -B "$(BUILD_DIR)" $(INTEGRATION_CMAKE_FLAGS)
+	$(CMAKE) --build "$(BUILD_DIR)" --parallel
+	$(CTEST) --test-dir "$(BUILD_DIR)" --output-on-failure -R "alternator_client_cpp_aws_.*tests_present"
 
 .PHONY: test-integration
-test-integration: build-integration scylla-start
+test-integration: build-integration ccm-install
+	@for command in openssl setsid; do
+		executable=$$(type -P -- "$$command" || true)
+		[[ -n "$$executable" && -x "$$executable" ]] || {
+			echo "An external $$command executable is required for CCM integration tests" >&2
+			exit 1
+		}
+	done
+	ccm_executable="$(SCYLLA_CCM_PATH)"
+	[[ "$$ccm_executable" == */* ]] \
+		|| ccm_executable=$$(type -P -- "$$ccm_executable")
+	[[ "$$ccm_executable" == /* ]] \
+		|| ccm_executable="$$(pwd -P)/$$ccm_executable"
+	ccm_diagnostics_dir="$(SCYLLA_CCM_DIAGNOSTICS_DIR)"
+	[[ -z "$$ccm_diagnostics_dir" || "$$ccm_diagnostics_dir" == /* ]] \
+		|| ccm_diagnostics_dir="$$(pwd -P)/$$ccm_diagnostics_dir"
+	ccm_no_proxy="$(SCYLLA_CCM_NO_PROXY)"
+	for ccm_id in {1..99}; do
+		for node_id in {1..9}; do
+			ccm_no_proxy+=",127.0.$$ccm_id.$$node_id"
+		done
+	done
+	[[ -z "$${NO_PROXY:-}" ]] || ccm_no_proxy+=",$$NO_PROXY"
+	[[ -z "$${no_proxy:-}" ]] || ccm_no_proxy+=",$$no_proxy"
+	NO_PROXY="$$ccm_no_proxy" \
+	no_proxy="$$ccm_no_proxy" \
 	ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION=1 \
-	ALTERNATOR_CLIENT_CPP_CA_FILE=$(MAKEFILE_PATH)/test/scylla/db.crt \
-	$(CTEST) --test-dir $(BUILD_DIR) --output-on-failure -R Integration
+	SCYLLA_VERSION="$(SCYLLA_VERSION)" \
+	SCYLLA_CCM_PATH="$$ccm_executable" \
+	SCYLLA_CCM_DIAGNOSTICS_DIR="$$ccm_diagnostics_dir" \
+	$(CTEST) --test-dir "$(BUILD_DIR)" --output-on-failure --no-tests=error -L '^CcmProvisioning$$'
+	NO_PROXY="$$ccm_no_proxy" \
+	no_proxy="$$ccm_no_proxy" \
+	ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION=1 \
+	SCYLLA_VERSION="$(SCYLLA_INTEGRATION_VERSION)" \
+	SCYLLA_CCM_PATH="$$ccm_executable" \
+	SCYLLA_CCM_DIAGNOSTICS_DIR="$$ccm_diagnostics_dir" \
+	$(CTEST) --test-dir "$(BUILD_DIR)" --output-on-failure --no-tests=error -L '^Integration$$'
 
-.PHONY: .prepare-cert
-.prepare-cert:
-	@[ -f "$(MAKEFILE_PATH)/test/scylla/db.key" ] || (echo "Prepare certificate" && cd "$(MAKEFILE_PATH)/test/scylla" && openssl req -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=www.example.com" -addext "subjectAltName=IP:172.41.0.2,IP:172.41.0.3,IP:172.41.0.4" -x509 -newkey rsa:4096 -keyout db.key -out db.crt -days 3650 -nodes && chmod 644 db.key)
-
-.PHONY: scylla-start
-scylla-start: .prepare-cert
-	@sudo sysctl -w fs.aio-max-nr=10485760
-	$(COMPOSE) up -d --wait
-
-.PHONY: scylla-stop
-scylla-stop:
-	$(COMPOSE) down
-
-.PHONY: scylla-kill
-scylla-kill:
-	$(COMPOSE) kill
-
-.PHONY: scylla-rm
-scylla-rm:
-	$(COMPOSE) rm -f
+.PHONY: ccm-install
+ccm-install:
+	@ccm_works() {
+		local executable=$$1
+		[[ "$$executable" == */* ]] || executable=$$(type -P -- "$$executable" || true)
+		[[ -n "$$executable" && -f "$$executable" && -x "$$executable" ]] \
+			&& "$$executable" create --help >/dev/null 2>&1
+	}
+	install_complete() {
+		[[ -f "$(SCYLLA_CCM_INSTALL_MARKER)" \
+			&& ! -L "$(SCYLLA_CCM_INSTALL_MARKER)" ]] || return 1
+		[[ "$$(< "$(SCYLLA_CCM_INSTALL_MARKER)")" == "$(SCYLLA_CCM_COMMIT)" ]] || return 1
+		ccm_works "$(PINNED_SCYLLA_CCM_PATH)"
+	}
+	ccm_executable="$(SCYLLA_CCM_PATH)"
+	if [[ "$$ccm_executable" != "$(PINNED_SCYLLA_CCM_PATH)" ]]; then
+		ccm_works "$$ccm_executable" || {
+			echo "SCYLLA_CCM_PATH is not a working CCM executable: $$ccm_executable" >&2
+			exit 1
+		}
+		echo "Using CCM executable: $$ccm_executable"
+		exit 0
+	fi
+	command -v flock >/dev/null 2>&1 || {
+		echo "flock is required to install scylla-ccm" >&2
+		exit 1
+	}
+	mkdir -p -- "$(MAKEFILE_PATH)/.deps"
+	exec {install_lock_fd}>"$(SCYLLA_CCM_INSTALL_LOCK)"
+	flock -x "$$install_lock_fd"
+	if install_complete; then
+		echo "Using CCM executable: $(PINNED_SCYLLA_CCM_PATH)"
+		exit 0
+	fi
+	command -v uv >/dev/null 2>&1 || {
+		echo "uv is required to install scylla-ccm: https://docs.astral.sh/uv/" >&2
+		exit 1
+	}
+	uv venv --clear "$(SCYLLA_CCM_VENV)"
+	uv pip install --python "$(SCYLLA_CCM_VENV)/bin/python" \
+		"git+https://github.com/scylladb/scylla-ccm.git@$(SCYLLA_CCM_COMMIT)"
+	ccm_works "$(PINNED_SCYLLA_CCM_PATH)" || {
+		echo "Installed CCM entry point failed its launch check" >&2
+		exit 1
+	}
+	temporary_marker=$$(mktemp "$(SCYLLA_CCM_VENV)/.install-complete.XXXXXXXX")
+	printf '%s\n' "$(SCYLLA_CCM_COMMIT)" > "$$temporary_marker"
+	chmod 600 -- "$$temporary_marker"
+	mv -fT -- "$$temporary_marker" "$(SCYLLA_CCM_INSTALL_MARKER)"
+	echo "Using CCM executable: $(PINNED_SCYLLA_CCM_PATH)"
 
 .PHONY: clean
 clean:
-	$(CMAKE) -E rm -rf $(BUILD_DIR) $(CHECK_BUILD_DIR)
+	$(CMAKE) -E rm -rf "$(BUILD_DIR)" "$(CHECK_BUILD_DIR)"

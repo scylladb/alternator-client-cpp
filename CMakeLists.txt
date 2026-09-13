@@ -38,6 +38,14 @@ find_package(CURL QUIET)
 find_package(OpenSSL QUIET)
 find_package(Threads REQUIRED)
 find_package(ZLIB QUIET)
+find_package(yaml-cpp QUIET)
+
+set(ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET "")
+if(TARGET yaml-cpp::yaml-cpp)
+    set(ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+elseif(TARGET yaml-cpp)
+    set(ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET yaml-cpp)
+endif()
 
 add_library(alternator_client_cpp
     src/attribute_value.cpp
@@ -121,28 +129,113 @@ if(ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
     if(GTest_FOUND)
         include(GoogleTest)
 
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+            include(CheckCXXSourceRuns)
+            check_cxx_source_runs([=[
+                #include <sys/syscall.h>
+                #include <unistd.h>
+
+                int main() {
+                #if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+                    const int pid_fd = static_cast<int>(::syscall(SYS_pidfd_open, ::getpid(), 0));
+                    if (pid_fd < 0) {
+                        return 1;
+                    }
+                    const long result = ::syscall(
+                        SYS_pidfd_send_signal, pid_fd, 0, nullptr, 0);
+                    ::close(pid_fd);
+                    return result == 0 ? 0 : 1;
+                #else
+                    return 1;
+                #endif
+                }
+            ]=] ALTERNATOR_CLIENT_CPP_WORKING_PIDFD)
+        else()
+            set(ALTERNATOR_CLIENT_CPP_WORKING_PIDFD OFF)
+        endif()
+
         set(ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
             tests/attribute_value_test.cpp
             tests/config_test.cpp
             tests/header_optimization_test.cpp
             tests/http_client_test.cpp
             tests/key_route_affinity_test.cpp
-            tests/live_nodes_integration_test.cpp
             tests/live_nodes_test.cpp
             tests/node_health_test.cpp
             tests/query_plan_test.cpp
             tests/routing_scope_test.cpp)
 
+        if(ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET)
+            list(APPEND ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
+                tests/cluster_spec_test.cpp
+                tests/testinfra/cluster_spec.cpp)
+        else()
+            list(REMOVE_ITEM ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
+                tests/cluster_spec_test.cpp)
+            message(STATUS "Cluster-spec tests require yaml-cpp")
+        endif()
+
+        set(ALTERNATOR_CLIENT_CPP_CCM_TESTINFRA_AVAILABLE OFF)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+                AND CURL_FOUND
+                AND OpenSSL_FOUND
+                AND ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET
+                AND ALTERNATOR_CLIENT_CPP_WORKING_PIDFD)
+            add_executable(alternator_client_cpp_ccm_fake_command
+                tests/ccm_fake_command.cpp)
+            target_compile_features(alternator_client_cpp_ccm_fake_command PRIVATE cxx_std_17)
+
+            add_library(alternator_client_cpp_testinfra
+                tests/testinfra/ccm_provisioner.cpp
+                tests/testinfra/ccm_run_state.cpp
+                tests/testinfra/cluster_spec.cpp
+                tests/testinfra/dynamodb_test_client.cpp
+                tests/testinfra/test_cluster.cpp)
+            target_compile_features(alternator_client_cpp_testinfra PUBLIC cxx_std_17)
+            target_include_directories(alternator_client_cpp_testinfra
+                PUBLIC
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/testinfra)
+            target_link_libraries(alternator_client_cpp_testinfra
+                PUBLIC
+                    alternator_client_cpp
+                    CURL::libcurl
+                    OpenSSL::Crypto
+                    OpenSSL::SSL
+                    ${ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET})
+            set(ALTERNATOR_CLIENT_CPP_CCM_TESTINFRA_AVAILABLE ON)
+            list(APPEND ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
+                tests/ccm_provisioner_test.cpp
+                tests/ccm_run_state_test.cpp
+                tests/test_cluster_pool_test.cpp)
+            list(REMOVE_ITEM ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES
+                tests/testinfra/cluster_spec.cpp)
+        else()
+            message(STATUS
+                "Native CCM test infrastructure requires Linux, libcurl, OpenSSL, yaml-cpp, and working pidfd syscalls")
+        endif()
+
         add_executable(alternator_client_cpp_tests
             ${ALTERNATOR_CLIENT_CPP_CORE_TEST_SOURCES})
+        if(ALTERNATOR_CLIENT_CPP_CCM_TESTINFRA_AVAILABLE)
+            add_dependencies(
+                alternator_client_cpp_tests
+                alternator_client_cpp_ccm_fake_command)
+        endif()
         target_link_libraries(alternator_client_cpp_tests
             PRIVATE
                 alternator_client_cpp
                 GTest::gtest_main)
+        if(ALTERNATOR_CLIENT_CPP_CCM_TESTINFRA_AVAILABLE)
+            target_link_libraries(alternator_client_cpp_tests
+                PRIVATE alternator_client_cpp_testinfra)
+        elseif(ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET)
+            target_link_libraries(alternator_client_cpp_tests
+                PRIVATE ${ALTERNATOR_CLIENT_CPP_YAML_CPP_TARGET})
+        endif()
         gtest_discover_tests(alternator_client_cpp_tests)
 
         set(ALTERNATOR_CLIENT_CPP_AWS_TEST_SOURCES
-            tests/aws_integration_test.cpp
             tests/aws_dynamodb_helper_test.cpp)
 
         if(TARGET alternator_client_cpp_aws)
@@ -163,12 +256,51 @@ if(ALTERNATOR_CLIENT_CPP_BUILD_TESTS)
                 COMMAND ${CMAKE_COMMAND}
                     -DTEST_EXECUTABLE=$<TARGET_FILE:alternator_client_cpp_aws_tests>
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RequireGTestTests.cmake)
-            add_test(
-                NAME alternator_client_cpp_aws_integration_tests_present
-                COMMAND ${CMAKE_COMMAND}
-                    -DTEST_EXECUTABLE=$<TARGET_FILE:alternator_client_cpp_aws_tests>
-                    -DREQUIRED_TEST_REGEX=AwsDynamoDBIntegration\\.
-                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RequireGTestTests.cmake)
+            if(ALTERNATOR_CLIENT_CPP_CCM_TESTINFRA_AVAILABLE)
+                add_executable(alternator_client_cpp_integration_tests
+                    tests/aws_integration_test.cpp
+                    tests/integration_test_config.cpp
+                    tests/integration_test_main.cpp
+                    tests/live_nodes_integration_test.cpp)
+                target_link_libraries(alternator_client_cpp_integration_tests
+                    PRIVATE
+                        alternator_client_cpp_aws
+                        alternator_client_cpp_testinfra
+                        GTest::gtest)
+                add_test(
+                    NAME alternator_client_cpp_integration_suite
+                    COMMAND alternator_client_cpp_integration_tests)
+                set_tests_properties(alternator_client_cpp_integration_suite
+                    PROPERTIES
+                        LABELS Integration
+                        TIMEOUT 1200)
+
+                add_executable(alternator_client_cpp_ccm_provisioning_tests
+                    tests/cluster_provisioning_integration_test.cpp
+                    tests/integration_test_config.cpp
+                    tests/integration_test_main.cpp)
+                target_link_libraries(alternator_client_cpp_ccm_provisioning_tests
+                    PRIVATE
+                        alternator_client_cpp_aws
+                        alternator_client_cpp_testinfra
+                        GTest::gtest)
+                add_test(
+                    NAME alternator_client_cpp_ccm_provisioning_integration
+                    COMMAND alternator_client_cpp_ccm_provisioning_tests)
+                set_tests_properties(alternator_client_cpp_ccm_provisioning_integration
+                    PROPERTIES
+                        LABELS CcmProvisioning
+                        TIMEOUT 1200)
+                add_test(
+                    NAME alternator_client_cpp_aws_integration_tests_present
+                    COMMAND ${CMAKE_COMMAND}
+                        -DTEST_EXECUTABLE=$<TARGET_FILE:alternator_client_cpp_integration_tests>
+                        -DREQUIRED_TEST_REGEX=AwsDynamoDBIntegration\\.
+                        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RequireGTestTests.cmake)
+            elseif(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS)
+                message(FATAL_ERROR
+                    "ALTERNATOR_CLIENT_CPP_REQUIRE_AWS integration tests require native CCM test infrastructure")
+            endif()
         endif()
 
         if(ALTERNATOR_CLIENT_CPP_REQUIRE_AWS AND NOT TARGET alternator_client_cpp_aws_tests)

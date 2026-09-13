@@ -16,6 +16,8 @@
 
 #include <scylladb/alternator/aws/dynamodb_helper.h>
 
+#include "integration_test_config.h"
+
 #include <aws/core/Aws.h>
 #include <aws/dynamodb/model/AttributeDefinition.h>
 #include <aws/dynamodb/model/CreateTableRequest.h>
@@ -28,8 +30,6 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -58,47 +58,13 @@ private:
     Aws::SDKOptions& options_;
 };
 
-bool IntegrationEnabled() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION");
-    return value != nullptr && std::string(value) == "1";
-}
-
-std::vector<std::string> IntegrationNodes() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_NODE");
-    return {value != nullptr && std::string(value).size() > 0 ? std::string(value) : "172.41.0.2"};
-}
-
-std::uint16_t IntegrationHttpPort() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_HTTP_PORT");
-    return static_cast<std::uint16_t>(value != nullptr ? std::stoi(value) : 9998);
-}
-
-std::uint16_t IntegrationHttpsPort() {
-    const char* value = std::getenv("ALTERNATOR_CLIENT_CPP_HTTPS_PORT");
-    return static_cast<std::uint16_t>(value != nullptr ? std::stoi(value) : 9999);
-}
-
-Config IntegrationConfig(std::uint16_t port, std::string scheme = "http") {
-    Config cfg;
-    cfg.port = port;
-    cfg.scheme = std::move(scheme);
-    cfg.aws_region = "us-east-1";
-    cfg.credentials = {"whatever", "secret"};
-    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
-    cfg.idle_nodes_list_update_period = std::chrono::milliseconds{0};
-    cfg.node_health.disabled = true;
-    cfg.http_client_timeout = std::chrono::milliseconds{5000};
-    cfg.connect_timeout = std::chrono::milliseconds{1000};
-    return cfg;
-}
-
-void DeleteTableIfExists(Aws::DynamoDB::DynamoDBClient& client, const char* table_name) {
+void DeleteTableIfExists(Aws::DynamoDB::DynamoDBClient& client, const std::string& table_name) {
     Aws::DynamoDB::Model::DeleteTableRequest request;
     request.SetTableName(table_name);
     (void)client.DeleteTable(request);
 }
 
-void CreateTable(Aws::DynamoDB::DynamoDBClient& client, const char* table_name) {
+void CreateTable(Aws::DynamoDB::DynamoDBClient& client, const std::string& table_name) {
     Aws::DynamoDB::Model::AttributeDefinition attr;
     attr.SetAttributeName("ID");
     attr.SetAttributeType(Aws::DynamoDB::Model::ScalarAttributeType::S);
@@ -121,7 +87,7 @@ void CreateTable(Aws::DynamoDB::DynamoDBClient& client, const char* table_name) 
     ASSERT_TRUE(outcome.IsSuccess()) << outcome.GetError().GetMessage();
 }
 
-void PutGetDeleteItem(Aws::DynamoDB::DynamoDBClient& client, const char* table_name) {
+void PutGetDeleteItem(Aws::DynamoDB::DynamoDBClient& client, const std::string& table_name) {
     Aws::DynamoDB::Model::AttributeValue id;
     id.SetS("123");
     Aws::DynamoDB::Model::AttributeValue name;
@@ -148,11 +114,13 @@ void PutGetDeleteItem(Aws::DynamoDB::DynamoDBClient& client, const char* table_n
     ASSERT_TRUE(del_outcome.IsSuccess()) << del_outcome.GetError().GetMessage();
 }
 
-void RunDynamoDBOperations(Config cfg, const char* table_name) {
+void RunDynamoDBOperations(Config cfg, const std::string& table_name) {
     Aws::SDKOptions sdk_options;
-    aws::DynamoDBHelper helper(IntegrationNodes(), cfg);
+    std::unique_ptr<AwsApiGuard> api;
+    aws::DynamoDBHelper helper(
+        scylladb::alternator::testing::IntegrationNodes(), cfg);
     helper.ApplyToSDKOptions(sdk_options);
-    AwsApiGuard api(sdk_options);
+    api = std::make_unique<AwsApiGuard>(sdk_options);
 
     helper.UpdateLiveNodes();
     auto client = helper.NewDynamoDB();
@@ -167,14 +135,16 @@ void RunDynamoDBOperations(Config cfg, const char* table_name) {
 
 #define REQUIRE_INTEGRATION()                                                                    \
     do {                                                                                         \
-        if (!IntegrationEnabled()) {                                                             \
+        if (!scylladb::alternator::testing::IntegrationEnabled()) {                              \
             GTEST_SKIP() << "set ALTERNATOR_CLIENT_CPP_RUN_INTEGRATION=1 to run live Alternator integration tests"; \
         }                                                                                        \
     } while (false)
 
 TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttp) {
     REQUIRE_INTEGRATION();
-    RunDynamoDBOperations(IntegrationConfig(IntegrationHttpPort()), "cpp_integration_http");
+    RunDynamoDBOperations(
+        scylladb::alternator::testing::IntegrationConfig(testinfra::AlternatorTransport::Http),
+        scylladb::alternator::testing::IntegrationTableName("http"));
 }
 
 TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttpWithRequestCompressionAndHeaderOptimization) {
@@ -183,36 +153,38 @@ TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttpWithRequestCompressionAndHead
     GTEST_SKIP() << "zlib support is not enabled";
 #endif
 
-    auto cfg = IntegrationConfig(IntegrationHttpPort());
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Http);
     cfg.request_compressor = std::make_shared<GzipRequestCompressor>(0);
+    cfg.content_encoding_decoders = {std::make_shared<ZlibContentEncodingDecoder>()};
     cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(std::vector<std::string>{
         "Host",
         "X-Amz-Target",
         "Content-Length",
     });
-    RunDynamoDBOperations(std::move(cfg), "cpp_integration_http_gzip_request");
+    RunDynamoDBOperations(
+        std::move(cfg),
+        scylladb::alternator::testing::IntegrationTableName("http_gzip_request"));
 }
 
 TEST(AwsDynamoDBIntegration, DynamoDBOperationsHttpsWithoutCertificateVerification) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpsPort(), "https");
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Https);
     cfg.verify_ssl = false;
-    RunDynamoDBOperations(std::move(cfg), "cpp_integration_https_noverify");
+    RunDynamoDBOperations(
+        std::move(cfg),
+        scylladb::alternator::testing::IntegrationTableName("https_noverify"));
 }
 
 TEST(AwsDynamoDBIntegration, HttpsDiscoveryTrustsConfiguredCAFile) {
     REQUIRE_INTEGRATION();
 
-    const char* ca_file = std::getenv("ALTERNATOR_CLIENT_CPP_CA_FILE");
-    if (ca_file == nullptr || std::string(ca_file).empty()) {
-        GTEST_SKIP() << "set ALTERNATOR_CLIENT_CPP_CA_FILE to test trusted HTTPS discovery";
-    }
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Https);
 
-    auto cfg = IntegrationConfig(IntegrationHttpsPort(), "https");
-    cfg.ca_file = ca_file;
-
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_NO_THROW(nodes.UpdateLiveNodes());
     EXPECT_FALSE(nodes.GetNodes().empty());
 }
@@ -220,9 +192,11 @@ TEST(AwsDynamoDBIntegration, HttpsDiscoveryTrustsConfiguredCAFile) {
 TEST(AwsDynamoDBIntegration, HttpsDiscoveryRejectsUntrustedCertificate) {
     REQUIRE_INTEGRATION();
 
-    auto cfg = IntegrationConfig(IntegrationHttpsPort(), "https");
+    auto cfg = scylladb::alternator::testing::IntegrationConfig(
+        testinfra::AlternatorTransport::Https);
     cfg.verify_ssl = true;
+    cfg.ca_file.clear();
 
-    AlternatorLiveNodes nodes(IntegrationNodes(), cfg);
+    AlternatorLiveNodes nodes(scylladb::alternator::testing::IntegrationNodes(), cfg);
     EXPECT_THROW(nodes.UpdateLiveNodes(), std::runtime_error);
 }

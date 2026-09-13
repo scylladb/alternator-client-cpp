@@ -2,8 +2,6 @@ build/
 build-*/
 cmake-build-*/
 .deps/
-test/scylla/db.crt
-test/scylla/db.key
 *.o
 *.a
 *.so
