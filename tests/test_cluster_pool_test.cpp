@@ -23,6 +23,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -66,20 +67,27 @@ public:
                         "dc" + std::to_string(dc + 1),
                         "RAC" + std::to_string(rack + 1),
                     });
+                    node_running[data.nodes.back().name] = true;
                 }
             }
+        }
+        if (throw_after_cluster_started) {
+            throw std::runtime_error("post-provision handoff failed");
         }
         return data;
     }
 
-    void Start(const PhysicalTestCluster&) override {
+    void Start(const PhysicalTestCluster& cluster) override {
         ++start_count;
         if (fail_start_recovery) {
             throw RecoveryRequiredError("start process group remains alive");
         }
+        for (const auto& node : cluster.Nodes()) {
+            node_running[node.name] = true;
+        }
     }
 
-    void Stop(const PhysicalTestCluster&) override {
+    void Stop(const PhysicalTestCluster& cluster) override {
         ++stop_count;
         {
             std::unique_lock<std::mutex> lock(stop_mutex);
@@ -92,14 +100,19 @@ public:
         if (fail_stop) {
             throw std::runtime_error("ambiguous stop");
         }
+        for (const auto& node : cluster.Nodes()) {
+            node_running[node.name] = false;
+        }
     }
 
-    void StartNode(const PhysicalTestCluster&, const TestClusterNode&) override {
+    void StartNode(const PhysicalTestCluster&, const TestClusterNode& node) override {
         ++start_node_count;
+        node_running[node.name] = true;
     }
 
-    void StopNode(const PhysicalTestCluster&, const TestClusterNode&) override {
+    void StopNode(const PhysicalTestCluster&, const TestClusterNode& node) override {
         ++stop_node_count;
+        node_running[node.name] = false;
     }
 
     TestClusterNode AddNode(
@@ -120,20 +133,24 @@ public:
         })) {
             ++index;
         }
-        return TestClusterNode{
+        TestClusterNode node{
             "node" + std::to_string(index),
             "127.0." + std::to_string(cluster.CcmId()) + "." + std::to_string(index),
             datacenter,
             rack,
         };
+        node_running[node.name] = true;
+        return node;
     }
 
-    void DecommissionNode(const PhysicalTestCluster&, const TestClusterNode&) override {
+    void DecommissionNode(const PhysicalTestCluster&, const TestClusterNode& node) override {
         ++decommission_count;
+        node_running[node.name] = false;
     }
 
-    void DeleteNodeState(const PhysicalTestCluster&, const TestClusterNode&) override {
+    void DeleteNodeState(const PhysicalTestCluster&, const TestClusterNode& node) override {
         ++delete_node_count;
+        node_running.erase(node.name);
     }
 
     bool IsHealthy(const PhysicalTestCluster&) override {
@@ -141,8 +158,10 @@ public:
         return healthy;
     }
 
-    bool IsNodeRunning(const PhysicalTestCluster&, const TestClusterNode&) override {
-        return true;
+    bool IsNodeRunning(const PhysicalTestCluster&, const TestClusterNode& node) override {
+        ++node_running_check_count;
+        const auto found = node_running.find(node.name);
+        return found != node_running.end() && found->second;
     }
 
     void Remove(const PhysicalTestCluster&) override {
@@ -183,6 +202,7 @@ public:
     int add_node_count = 0;
     int decommission_count = 0;
     int delete_node_count = 0;
+    int node_running_check_count = 0;
     bool healthy = true;
     bool fail_stop = false;
     bool fail_start_recovery = false;
@@ -192,7 +212,9 @@ public:
     bool fail_provision = false;
     bool provision_cleanup_proven = false;
     bool provision_recovery_required = false;
+    bool throw_after_cluster_started = false;
     bool fail_remove = false;
+    std::map<std::string, bool> node_running;
     std::mutex stop_mutex;
     std::condition_variable stop_condition;
     bool block_stop = false;
@@ -297,6 +319,22 @@ TEST(TestClusterPoolTest, PrivateLeaseExposesSerializedLifecycleAndTopologyContr
     EXPECT_EQ(fixture.provisioner->remove_count, 1);
 }
 
+TEST(TestClusterPoolTest, AddNodeRejectsClusterWithoutLiveSeedBeforeMutation) {
+    PoolFixture fixture;
+    auto lease = fixture.pool->ProvisionPrivate(
+        ClusterSpec{}.WithTopology(ClusterTopology::SingleDatacenter(1)));
+    const auto original = lease.Cluster().Nodes().front();
+
+    lease.Control().Stop();
+    EXPECT_THROW((void)lease.Control().AddNode("dc1", "RAC1"), std::logic_error);
+    EXPECT_EQ(fixture.provisioner->add_node_count, 0);
+    EXPECT_EQ(fixture.provisioner->node_running_check_count, 1);
+
+    EXPECT_NO_THROW(lease.Control().StartNode(original));
+    EXPECT_NO_THROW((void)lease.Control().AddNode("dc1", "RAC1"));
+    lease.Close();
+}
+
 TEST(TestClusterPoolTest, RemoveNodeRejectsMissingVoterQuorumBeforeMutation) {
     PoolFixture fixture;
     auto lease = fixture.pool->ProvisionPrivate(
@@ -330,6 +368,27 @@ TEST(TestClusterPoolTest, RemoveNodeRejectsMissingProjectedVoterQuorumBeforeMuta
     EXPECT_EQ(fixture.provisioner->delete_node_count, 0);
 
     EXPECT_NO_THROW(lease.Control().StartNode(nodes[2]));
+    EXPECT_NO_THROW(lease.Control().RemoveNode(nodes[0]));
+    EXPECT_EQ(fixture.provisioner->decommission_count, 1);
+    EXPECT_EQ(fixture.provisioner->delete_node_count, 1);
+    lease.Close();
+}
+
+TEST(TestClusterPoolTest, RemoveNodeRefreshesLiveVotersBeforeQuorumGuard) {
+    PoolFixture fixture;
+    auto lease = fixture.pool->ProvisionPrivate(
+        ClusterSpec{}.WithTopology(ClusterTopology::SingleDatacenter(3)));
+    const auto nodes = lease.Cluster().Nodes();
+    ASSERT_EQ(nodes.size(), 3U);
+
+    fixture.provisioner->node_running[nodes[2].name] = false;
+    EXPECT_THROW(lease.Control().RemoveNode(nodes[0]), std::logic_error);
+    EXPECT_EQ(fixture.provisioner->node_running_check_count, 3);
+    EXPECT_EQ(fixture.provisioner->start_node_count, 0);
+    EXPECT_EQ(fixture.provisioner->decommission_count, 0);
+    EXPECT_EQ(fixture.provisioner->delete_node_count, 0);
+
+    fixture.provisioner->node_running[nodes[2].name] = true;
     EXPECT_NO_THROW(lease.Control().RemoveNode(nodes[0]));
     EXPECT_EQ(fixture.provisioner->decommission_count, 1);
     EXPECT_EQ(fixture.provisioner->delete_node_count, 1);
@@ -377,6 +436,16 @@ TEST(TestClusterPoolTest, FailedProvisioningWithUnprovenRollbackIsRetriedOnPoolC
     fixture.provisioner->fail_provision = true;
     EXPECT_THROW(fixture.pool->AcquireReusable(ClusterSpec{}), ClusterProvisioningError);
     fixture.provisioner->fail_provision = false;
+    EXPECT_NO_THROW(fixture.pool->Close());
+    EXPECT_EQ(fixture.provisioner->remove_count, 1);
+}
+
+TEST(TestClusterPoolTest, UnexpectedPostProvisionFailureIsRetainedForPoolClose) {
+    PoolFixture fixture;
+    fixture.provisioner->throw_after_cluster_started = true;
+
+    EXPECT_THROW(fixture.pool->AcquireReusable(ClusterSpec{}), std::runtime_error);
+    fixture.provisioner->throw_after_cluster_started = false;
     EXPECT_NO_THROW(fixture.pool->Close());
     EXPECT_EQ(fixture.provisioner->remove_count, 1);
 }

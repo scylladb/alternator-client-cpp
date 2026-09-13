@@ -1691,11 +1691,20 @@ void PrepareDiagnosticDirectoryTree(const fs::path &root,
 
 void CopyDiagnosticFile(const fs::path &source,
                         const fs::path &destination_root,
-                        const fs::path &relative) {
-  if (!fs::exists(source)) {
+                        const fs::path &relative,
+                        bool tolerate_source_disappearance = false) {
+  std::error_code source_error;
+  const auto source_status = fs::symlink_status(source, source_error);
+  if (source_error == std::errc::no_such_file_or_directory ||
+      (!source_error &&
+       source_status.type() == fs::file_type::not_found)) {
     return;
   }
-  const auto source_status = fs::symlink_status(source);
+  if (source_error) {
+    throw std::system_error(source_error,
+                            "Unable to inspect diagnostic source " +
+                                source.string());
+  }
   if (fs::is_symlink(source_status) || !fs::is_regular_file(source_status)) {
     throw std::runtime_error("Refusing unsafe diagnostic source " +
                              source.string());
@@ -1718,7 +1727,35 @@ void CopyDiagnosticFile(const fs::path &source,
       target.parent_path() / (".ccm-diagnostic-" + std::to_string(::getpid()) +
                               '-' + target.filename().string());
   fs::remove(temporary);
-  fs::copy_file(source, temporary, fs::copy_options::overwrite_existing);
+  try {
+    fs::copy_file(source, temporary, fs::copy_options::overwrite_existing);
+  } catch (const fs::filesystem_error &failure) {
+    if (!tolerate_source_disappearance ||
+        failure.code() != std::errc::no_such_file_or_directory) {
+      throw;
+    }
+
+    std::error_code current_source_error;
+    const auto current_source_status =
+        fs::symlink_status(source, current_source_error);
+    const bool source_disappeared =
+        current_source_error == std::errc::no_such_file_or_directory ||
+        (!current_source_error &&
+         current_source_status.type() == fs::file_type::not_found);
+    if (!source_disappeared) {
+      throw;
+    }
+    if (!ExistsWithoutFollowingLinks(target.parent_path())) {
+      throw;
+    }
+    ValidateOwnedDirectory(target.parent_path(), "CCM diagnostic");
+
+    // Live logs can be rotated between inspection and copy. Remove any
+    // partial temporary and leave target-side ENOENT failures visible.
+    std::error_code ignored;
+    fs::remove(temporary, ignored);
+    return;
+  }
   fs::permissions(temporary, fs::perms::owner_read | fs::perms::owner_write,
                   fs::perm_options::replace);
   fs::rename(temporary, target);
@@ -1727,19 +1764,31 @@ void CopyDiagnosticFile(const fs::path &source,
 void CopyDiagnosticLogTree(const fs::path &logs_directory,
                            const fs::path &destination,
                            const fs::path &relative) {
-  if (!fs::exists(logs_directory)) {
+  if (!ExistsWithoutFollowingLinks(logs_directory)) {
     return;
   }
   ValidateOwnedDirectory(logs_directory, "CCM logs");
   for (const auto &entry : fs::recursive_directory_iterator(logs_directory)) {
-    const auto status = entry.symlink_status();
+    std::error_code status_error;
+    const auto status = entry.symlink_status(status_error);
+    if (status_error == std::errc::no_such_file_or_directory ||
+        (!status_error && status.type() == fs::file_type::not_found)) {
+      continue;
+    }
+    if (status_error) {
+      throw std::system_error(status_error,
+                              "Unable to inspect CCM log entry " +
+                                  entry.path().string());
+    }
     if (fs::is_symlink(status)) {
       throw std::runtime_error("Refusing symbolic link in CCM logs: " +
                                entry.path().string());
     }
     if (fs::is_regular_file(status) && !IsPrivateKeyFile(entry.path())) {
       CopyDiagnosticFile(entry.path(), destination,
-                         relative / fs::relative(entry.path(), logs_directory));
+                         relative /
+                             entry.path().lexically_relative(logs_directory),
+                         true);
     }
   }
 }

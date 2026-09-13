@@ -568,6 +568,23 @@ TestClusterNode PhysicalTestCluster::AddNode(
         }
     }
     try {
+        RefreshNodeStates();
+    } catch (const RecoveryRequiredError&) {
+        MarkRecoveryRequired();
+        throw;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto has_running_seed = std::any_of(
+            node_states_.begin(), node_states_.end(), [](const auto& entry) {
+                return entry.second == NodeState::Running;
+            });
+        if (!has_running_seed) {
+            throw std::logic_error(
+                "cannot add a node without a running seed; start an existing node first");
+        }
+    }
+    try {
         auto node = provisioner_->AddNode(*this, datacenter, rack);
         std::lock_guard<std::mutex> lock(mutex_);
         node.identity_ = NextNodeIdentity();
@@ -600,6 +617,15 @@ void PhysicalTestCluster::RemoveNode(const TestClusterNode& requested) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureMutable();
         node = FindNode(requested);
+    }
+    try {
+        RefreshNodeStates();
+    } catch (const RecoveryRequiredError&) {
+        MarkRecoveryRequired();
+        throw;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         state = node_states_.at(node.name);
         std::size_t active_nodes = 0;
         std::size_t running_nodes = 0;
@@ -651,6 +677,32 @@ void PhysicalTestCluster::RemoveNode(const TestClusterNode& requested) {
     } catch (...) {
         MarkDirty();
         throw;
+    }
+}
+
+void PhysicalTestCluster::RefreshNodeStates() {
+    std::vector<TestClusterNode> active_nodes;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_nodes.reserve(nodes_.size());
+        for (const auto& node : nodes_) {
+            if (node_states_.at(node.name) != NodeState::Decommissioned) {
+                active_nodes.push_back(node);
+            }
+        }
+    }
+
+    std::vector<std::pair<std::string, NodeState>> refreshed_states;
+    refreshed_states.reserve(active_nodes.size());
+    for (const auto& node : active_nodes) {
+        refreshed_states.emplace_back(
+            node.name,
+            provisioner_->IsNodeRunning(*this, node) ? NodeState::Running : NodeState::Stopped);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& entry : refreshed_states) {
+        node_states_.at(entry.first) = entry.second;
     }
 }
 
@@ -1058,7 +1110,7 @@ ReusableClusterLease TestClusterPool::AcquireReusable(const ClusterSpec& spec) {
         RetireCurrent();
     }
 
-    current_ = Provision(spec, false);
+    Provision(spec, false);
     current_->references = 1;
     auto validity = current_->RegisterLease();
     auto resources = CreateResourceScope(current_->cluster, validity);
@@ -1080,7 +1132,7 @@ PrivateClusterLease TestClusterPool::ProvisionPrivate(const ClusterSpec& spec) {
         }
         RetireCurrent();
     }
-    current_ = Provision(spec, true);
+    Provision(spec, true);
     auto validity = current_->RegisterLease();
     auto resources = CreateResourceScope(current_->cluster, validity);
     return PrivateClusterLease(std::make_unique<PrivateClusterLease::Impl>(
@@ -1134,44 +1186,57 @@ void TestClusterPool::Close() {
     }
 }
 
-std::unique_ptr<TestClusterPool::Slot> TestClusterPool::Provision(
+void TestClusterPool::Provision(
     const ClusterSpec& spec,
     bool private_cluster) {
     const auto instance_id = CreateInstanceId();
+    auto slot = std::make_unique<Slot>();
+    slot->generation = ++generation_;
+    slot->reuse_key = private_cluster ? std::string{} : spec.ReuseKey();
+    slot->private_cluster = true;
+    slot->poisoned = true;
+
+    ProvisionedClusterData retained;
+    retained.ccm_directory = provisioner_->RunDirectory() / "clusters" / instance_id;
     auto ownership = ReserveOwnership(spec, instance_id);
+    retained.ccm_id = ownership.ccm_id;
     try {
-        auto data = provisioner_->Provision(spec, instance_id, ownership.ccm_id);
-        auto slot = std::make_unique<Slot>();
-        slot->generation = ++generation_;
-        slot->reuse_key = private_cluster ? std::string{} : spec.ReuseKey();
-        slot->private_cluster = private_cluster;
         slot->cluster = std::make_shared<PhysicalTestCluster>(
-            provisioner_, instance_id, spec, std::move(data));
+            provisioner_, instance_id, spec, std::move(retained));
         slot->ownership = std::move(ownership);
-        return slot;
+        current_ = std::move(slot);
+    } catch (...) {
+        const auto preparation_failure = std::current_exception();
+        try {
+            CompleteOwnership(ownership);
+        } catch (...) {
+            terminal_failure_ = std::current_exception();
+            throw;
+        }
+        std::rethrow_exception(preparation_failure);
+    }
+
+    try {
+        auto data = provisioner_->Provision(spec, instance_id, current_->ownership.ccm_id);
+        auto cluster = std::make_shared<PhysicalTestCluster>(
+            provisioner_, instance_id, spec, std::move(data));
+        current_->cluster = std::move(cluster);
+        current_->private_cluster = private_cluster;
+        current_->poisoned = false;
+        return;
     } catch (const ClusterProvisioningError& failure) {
         if (failure.CleanupProven()) {
             try {
-                CompleteOwnership(ownership);
+                CompleteOwnership(current_->ownership);
+                current_.reset();
             } catch (...) {
                 terminal_failure_ = std::current_exception();
                 throw;
             }
         } else {
             terminal_failure_ = std::current_exception();
-            if (!failure.RecoveryRequired()) {
-                ProvisionedClusterData retained;
-                retained.ccm_id = ownership.ccm_id;
-                retained.ccm_directory =
-                    provisioner_->RunDirectory() / "clusters" / instance_id;
-                auto slot = std::make_unique<Slot>();
-                slot->generation = ++generation_;
-                slot->private_cluster = true;
-                slot->poisoned = true;
-                slot->cluster = std::make_shared<PhysicalTestCluster>(
-                    provisioner_, instance_id, spec, std::move(retained));
-                slot->ownership = std::move(ownership);
-                current_ = std::move(slot);
+            if (failure.RecoveryRequired()) {
+                current_->cluster->MarkRecoveryRequired();
             }
         }
         throw;

@@ -330,6 +330,7 @@ private:
     bool recovery_required_ = false;
 
     [[nodiscard]] TestClusterNode FindNode(const TestClusterNode& requested) const;
+    void RefreshNodeStates();
     void EnsureMutable() const;
 };
 
@@ -370,7 +371,7 @@ private:
     std::exception_ptr terminal_failure_;
     bool closed_ = false;
 
-    [[nodiscard]] std::unique_ptr<Slot> Provision(const ClusterSpec& spec, bool private_cluster);
+    void Provision(const ClusterSpec& spec, bool private_cluster);
     [[nodiscard]] Ownership ReserveOwnership(
         const ClusterSpec& spec,
         const std::string& instance_id);

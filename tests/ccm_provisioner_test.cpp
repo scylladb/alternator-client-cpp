@@ -242,6 +242,75 @@ private:
   ScopedEnvironment mode_;
 };
 
+class AssumeNodesRunningProvisioner final : public ClusterProvisioner {
+public:
+  explicit AssumeNodesRunningProvisioner(
+      std::shared_ptr<ClusterProvisioner> delegate)
+      : delegate_(std::move(delegate)) {}
+
+  fs::path RunDirectory() const override { return delegate_->RunDirectory(); }
+
+  bool RequiresJmxPortReservation(const ClusterSpec &spec) const override {
+    return delegate_->RequiresJmxPortReservation(spec);
+  }
+
+  ProvisionedClusterData Provision(const ClusterSpec &spec,
+                                   const std::string &instance_id,
+                                   int ccm_id) override {
+    return delegate_->Provision(spec, instance_id, ccm_id);
+  }
+
+  void Start(const PhysicalTestCluster &cluster) override {
+    delegate_->Start(cluster);
+  }
+
+  void Stop(const PhysicalTestCluster &cluster) override {
+    delegate_->Stop(cluster);
+  }
+
+  void StartNode(const PhysicalTestCluster &cluster,
+                 const TestClusterNode &node) override {
+    delegate_->StartNode(cluster, node);
+  }
+
+  void StopNode(const PhysicalTestCluster &cluster,
+                const TestClusterNode &node) override {
+    delegate_->StopNode(cluster, node);
+  }
+
+  TestClusterNode AddNode(const PhysicalTestCluster &cluster,
+                          const std::string &datacenter,
+                          const std::string &rack) override {
+    return delegate_->AddNode(cluster, datacenter, rack);
+  }
+
+  void DecommissionNode(const PhysicalTestCluster &cluster,
+                        const TestClusterNode &node) override {
+    delegate_->DecommissionNode(cluster, node);
+  }
+
+  void DeleteNodeState(const PhysicalTestCluster &cluster,
+                       const TestClusterNode &node) override {
+    delegate_->DeleteNodeState(cluster, node);
+  }
+
+  bool IsHealthy(const PhysicalTestCluster &cluster) override {
+    return delegate_->IsHealthy(cluster);
+  }
+
+  bool IsNodeRunning(const PhysicalTestCluster &,
+                     const TestClusterNode &) override {
+    return true;
+  }
+
+  void Remove(const PhysicalTestCluster &cluster) override {
+    delegate_->Remove(cluster);
+  }
+
+private:
+  std::shared_ptr<ClusterProvisioner> delegate_;
+};
+
 bool ProcessAlive(pid_t pid) {
   if (::kill(pid, 0) != 0 && errno != EPERM) {
     return false;
@@ -510,8 +579,10 @@ TEST(CcmProvisionerTest,
   FakeMode mode(paths.observations, "fail-add");
   ScopedEnvironment cluster_name("ALTERNATOR_CLIENT_CPP_CCM_FAKE_CLUSTER",
                                  "cluster");
-  const auto provisioner = std::make_shared<CcmProvisioner>(
+  const auto ccm = std::make_shared<CcmProvisioner>(
       paths.run, paths.diagnostics, FakeCommandPath().string());
+  const auto provisioner =
+      std::make_shared<AssumeNodesRunningProvisioner>(ccm);
   const auto ccm_directory = paths.run / "clusters" / "config";
   fs::create_directory(ccm_directory);
   CreateMinimalCluster(ccm_directory, "cluster", false);
@@ -626,8 +697,10 @@ TEST(CcmProvisionerTest, NodeRemovalClearsDirectoryAndClusterMembership) {
   FakeMode mode(paths.observations, "remove-success");
   ScopedEnvironment cluster_name("ALTERNATOR_CLIENT_CPP_CCM_FAKE_CLUSTER",
                                  "cluster");
-  const auto provisioner = std::make_shared<CcmProvisioner>(
+  const auto ccm = std::make_shared<CcmProvisioner>(
       paths.run, paths.diagnostics, FakeCommandPath().string());
+  const auto provisioner =
+      std::make_shared<AssumeNodesRunningProvisioner>(ccm);
   const auto ccm_directory = paths.run / "clusters" / "config";
   fs::create_directory(ccm_directory);
   CreateMinimalCluster(ccm_directory, "cluster", false);
@@ -663,8 +736,10 @@ TEST(CcmProvisionerTest,
   FakeMode mode(paths.observations, "partial-node-remove");
   ScopedEnvironment cluster_name("ALTERNATOR_CLIENT_CPP_CCM_FAKE_CLUSTER",
                                  "cluster");
-  const auto provisioner = std::make_shared<CcmProvisioner>(
+  const auto ccm = std::make_shared<CcmProvisioner>(
       paths.run, paths.diagnostics, FakeCommandPath().string());
+  const auto provisioner =
+      std::make_shared<AssumeNodesRunningProvisioner>(ccm);
   const auto ccm_directory = paths.run / "clusters" / "config";
   fs::create_directory(ccm_directory);
   CreateMinimalCluster(ccm_directory, "cluster", false);
@@ -773,6 +848,100 @@ TEST(CcmProvisionerTest, DiagnosticsExcludePrivateKeys) {
   EXPECT_FALSE(
       fs::exists(destination / instance_id / "node1" / "logs" / "client.pem"));
   EXPECT_FALSE(fs::exists(ccm_directory / instance_id));
+}
+
+TEST(CcmProvisionerTest, DiagnosticsRejectSymlinkedLogEntries) {
+  HarnessPaths paths("ccm-provisioner-symlinked-log");
+  FakeMode mode(paths.observations, "remove-success");
+  CcmProvisioner provisioner(paths.run, paths.diagnostics,
+                             FakeCommandPath().string());
+  const std::string instance_id = "symlinked-log-cluster";
+  const auto ccm_directory = paths.run / "clusters" / instance_id;
+  fs::create_directory(ccm_directory);
+  CreateMinimalCluster(ccm_directory, instance_id, false);
+
+  const auto outside_log = paths.temporary.Path() / "outside.log";
+  WriteFile(outside_log, "must not be copied\n");
+  const auto linked_log = ccm_directory / instance_id / "node1" / "logs" /
+                          "linked-system.log";
+  fs::create_symlink(outside_log, linked_log);
+
+  try {
+    provisioner.CleanupStaleCluster(instance_id, 86, ccm_directory);
+    FAIL() << "cleanup unexpectedly accepted a symlinked live log";
+  } catch (const std::runtime_error &failure) {
+    const std::string message = failure.what();
+    EXPECT_NE(message.find("Refusing symbolic link in CCM logs"),
+              std::string::npos);
+  }
+
+  EXPECT_TRUE(fs::is_symlink(fs::symlink_status(linked_log)));
+  EXPECT_TRUE(fs::is_regular_file(outside_log));
+  EXPECT_TRUE(fs::exists(ccm_directory / instance_id));
+  EXPECT_FALSE(fs::exists(paths.diagnostics / instance_id / instance_id /
+                          "node1" / "logs" / "linked-system.log"));
+  EXPECT_FALSE(fs::exists(paths.observations / "invocations.log"));
+}
+
+TEST(CcmProvisionerTest, DiagnosticsRejectDanglingNodeConfigurationFile) {
+  HarnessPaths paths("ccm-provisioner-dangling-node-conf");
+  FakeMode mode(paths.observations, "remove-success");
+  CcmProvisioner provisioner(paths.run, paths.diagnostics,
+                             FakeCommandPath().string());
+  const std::string instance_id = "dangling-node-conf-cluster";
+  const auto ccm_directory = paths.run / "clusters" / instance_id;
+  fs::create_directory(ccm_directory);
+  CreateMinimalCluster(ccm_directory, instance_id, false);
+
+  const auto node_configuration =
+      ccm_directory / instance_id / "node1" / "node.conf";
+  fs::remove(node_configuration);
+  fs::create_symlink(paths.temporary.Path() / "missing-node.conf",
+                     node_configuration);
+
+  try {
+    provisioner.CleanupStaleCluster(instance_id, 85, ccm_directory);
+    FAIL() << "cleanup unexpectedly accepted a dangling diagnostic source";
+  } catch (const std::runtime_error &failure) {
+    const std::string message = failure.what();
+    EXPECT_NE(message.find("Refusing unsafe diagnostic source"),
+              std::string::npos);
+  }
+
+  EXPECT_TRUE(fs::is_symlink(fs::symlink_status(node_configuration)));
+  EXPECT_TRUE(fs::exists(ccm_directory / instance_id));
+  EXPECT_FALSE(fs::exists(paths.diagnostics / instance_id / instance_id /
+                          "node1" / "node.conf"));
+  EXPECT_FALSE(fs::exists(paths.observations / "invocations.log"));
+}
+
+TEST(CcmProvisionerTest, DiagnosticsRejectDanglingLogDirectory) {
+  HarnessPaths paths("ccm-provisioner-dangling-log-directory");
+  FakeMode mode(paths.observations, "remove-success");
+  CcmProvisioner provisioner(paths.run, paths.diagnostics,
+                             FakeCommandPath().string());
+  const std::string instance_id = "dangling-log-directory-cluster";
+  const auto ccm_directory = paths.run / "clusters" / instance_id;
+  fs::create_directory(ccm_directory);
+  CreateMinimalCluster(ccm_directory, instance_id, false);
+
+  const auto logs_directory =
+      ccm_directory / instance_id / "node1" / "logs";
+  fs::remove(logs_directory);
+  fs::create_symlink(paths.temporary.Path() / "missing-logs", logs_directory);
+
+  try {
+    provisioner.CleanupStaleCluster(instance_id, 87, ccm_directory);
+    FAIL() << "cleanup unexpectedly accepted a dangling log directory";
+  } catch (const std::runtime_error &failure) {
+    const std::string message = failure.what();
+    EXPECT_NE(message.find("Refusing unsafe CCM logs directory"),
+              std::string::npos);
+  }
+
+  EXPECT_TRUE(fs::is_symlink(fs::symlink_status(logs_directory)));
+  EXPECT_TRUE(fs::exists(ccm_directory / instance_id));
+  EXPECT_FALSE(fs::exists(paths.observations / "invocations.log"));
 }
 
 TEST(CcmProvisionerTest,
