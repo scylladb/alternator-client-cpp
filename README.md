@@ -360,6 +360,11 @@ auto plan = helper.NewPartitionKeyQueryPlan(
 auto preferred = plan.Next();
 ```
 
+When key-route affinity is combined with rack or datacenter routing, affinity takes precedence for eligible writes: the
+preferred coordinator is selected from the cluster-wide healthy node set. Non-affinity requests continue to use the
+configured rack or datacenter scope. This keeps clients in different racks on the same coordinator for the same partition
+key instead of hashing independently over different rack-local node sets.
+
 The AWS helper can discover missing table partition-key names automatically. When an affinity plan needs metadata that is
 not cached yet, the helper starts one background `DescribeTable` lookup for that table and returns a normal non-affinity
 query plan for the current request. Later requests use the discovered HASH key name once the lookup completes. Configure
