@@ -282,6 +282,8 @@ std::vector<Url> AlternatorLiveNodes::GetDownNodes() const {
 }
 
 void AlternatorLiveNodes::UpdateLiveNodes() {
+    std::lock_guard<std::mutex> refresh_lock(refresh_mutex_);
+
     auto new_nodes = FetchLiveNodes();
     if (new_nodes.empty()) {
         ProbeDownNodes();

@@ -24,9 +24,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -303,6 +305,74 @@ TEST(AlternatorLiveNodes, KeyRouteAffinityUsesClusterNodesAcrossRackScopes) {
     EXPECT_EQ(Hosts(rack1_nodes.GetActiveKeyRouteAffinityNodes()),
               std::vector<std::string>({"rack1-node.local", "rack2-node.local"}));
     EXPECT_EQ(Hosts(rack1_nodes.GetQueryPlanNodes()), std::vector<std::string>({"rack1-node.local"}));
+}
+
+TEST(AlternatorLiveNodes, SerializesConcurrentRefreshReconciliation) {
+    Config cfg;
+    cfg.nodes_list_update_period = std::chrono::milliseconds{0};
+
+    std::mutex request_mutex;
+    std::condition_variable request_cv;
+    int request_count = 0;
+    int in_flight = 0;
+    int max_in_flight = 0;
+    bool second_refresh_started = false;
+    bool release_first_request = false;
+    auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
+        EXPECT_EQ(url.path, "/localnodes");
+
+        std::unique_lock<std::mutex> lock(request_mutex);
+        const auto request_number = ++request_count;
+        ++in_flight;
+        max_in_flight = std::max(max_in_flight, in_flight);
+        request_cv.notify_all();
+        if (request_number == 1) {
+            request_cv.wait(lock, [&] { return release_first_request; });
+        }
+        --in_flight;
+        lock.unlock();
+
+        if (request_number == 1) {
+            return HttpResponse{200, "[\"node1.local\"]"};
+        }
+        return HttpResponse{200, "[\"node1.local\",\"node2.local\"]"};
+    });
+
+    AlternatorLiveNodes nodes({"seed.local"}, cfg, http);
+    std::thread first_refresh([&] { nodes.UpdateLiveNodes(); });
+    {
+        std::unique_lock<std::mutex> lock(request_mutex);
+        request_cv.wait(lock, [&] { return request_count == 1; });
+    }
+
+    std::thread second_refresh([&] {
+        {
+            std::lock_guard<std::mutex> lock(request_mutex);
+            second_refresh_started = true;
+        }
+        request_cv.notify_all();
+        nodes.UpdateLiveNodes();
+    });
+
+    bool requests_overlapped = false;
+    {
+        std::unique_lock<std::mutex> lock(request_mutex);
+        request_cv.wait(lock, [&] { return second_refresh_started; });
+        requests_overlapped = request_cv.wait_for(
+            lock,
+            std::chrono::milliseconds{100},
+            [&] { return request_count > 1; });
+        release_first_request = true;
+    }
+    request_cv.notify_all();
+    first_refresh.join();
+    second_refresh.join();
+
+    EXPECT_FALSE(requests_overlapped);
+    EXPECT_EQ(max_in_flight, 1);
+    EXPECT_EQ(request_count, 2);
+    EXPECT_EQ(Hosts(nodes.GetNodes()), std::vector<std::string>({"node1.local", "node2.local"}));
+    EXPECT_EQ(Hosts(nodes.GetActiveNodes()), std::vector<std::string>({"node1.local", "node2.local"}));
 }
 
 TEST(AlternatorLiveNodes, DnsEntrypointDiscoversDnsNodeRecords) {

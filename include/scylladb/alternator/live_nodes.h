@@ -85,6 +85,7 @@ private:
     std::shared_ptr<HttpClient> http_client_;
     std::vector<Url> initial_nodes_;
 
+    std::mutex refresh_mutex_;
     mutable std::mutex mutex_;
     std::vector<Url> live_nodes_;
     std::vector<Url> known_affinity_nodes_;
