@@ -45,6 +45,7 @@ public:
     [[nodiscard]] Url NextNode();
     [[nodiscard]] std::vector<Url> GetNodes() const;
     [[nodiscard]] std::vector<Url> GetActiveNodes() const override;
+    [[nodiscard]] std::vector<Url> GetKeyRouteAffinityNodes() const override;
     [[nodiscard]] std::vector<Url> GetQueryPlanNodes() const override;
     [[nodiscard]] std::vector<Url> GetQueryPlanNodesForHash(std::int64_t hash) const override;
     [[nodiscard]] std::vector<Url> GetQuarantinedNodes() const;
@@ -67,9 +68,12 @@ private:
     [[nodiscard]] std::vector<Url> GetNodesForScope(const RoutingScope& scope);
     [[nodiscard]] std::vector<Url> GetDiscoveryNodesForScope(const RoutingScope& scope) const;
     [[nodiscard]] std::vector<Url> GetNodesFromEndpoint(const Url& endpoint) const;
+    [[nodiscard]] std::vector<Url> GetAffinityNodeSet() const;
+    [[nodiscard]] std::vector<Url> GetAffinityQuarantinedNodes() const;
     [[nodiscard]] Url NextKnownNode();
-    [[nodiscard]] bool ShouldTryQuarantinedNode(bool active_nodes_empty) const;
-    [[nodiscard]] Url NextQuarantinedNode() const;
+    [[nodiscard]] bool ShouldTryQuarantinedNode(bool active_nodes_empty,
+                                                const std::vector<Url>& quarantined_nodes) const;
+    [[nodiscard]] Url NextQuarantinedNode(const std::vector<Url>& quarantined_nodes) const;
     [[nodiscard]] Url StickyQuarantinedNodeForHash(std::int64_t hash, const std::vector<Url>& active_nodes) const;
     void RemoveQuarantineHashAssignmentsForNode(const Url& node);
     void MarkActivity();
@@ -83,6 +87,7 @@ private:
 
     mutable std::mutex mutex_;
     std::vector<Url> live_nodes_;
+    std::vector<Url> affinity_nodes_;
     mutable std::map<std::int64_t, Url> quarantine_by_hash_;
     std::unique_ptr<NodeHealthStore> health_store_;
     std::atomic<std::uint64_t> next_node_index_{0};

@@ -85,6 +85,16 @@ static std::int64_t HashWhereFirstNodeIs(const std::vector<Url>& nodes, const Ur
     throw std::runtime_error("failed to find hash for target node");
 }
 
+static std::string KeyWhereFirstNodeIs(const std::vector<Url>& nodes, const Url& target) {
+    for (int i = 0; i < 100000; ++i) {
+        auto key = "key-" + std::to_string(i);
+        if (FirstNodeWithSeed(nodes, AttributeValue::String(key).Hash()) == target) {
+            return key;
+        }
+    }
+    throw std::runtime_error("failed to find key for target node");
+}
+
 class LocalDnsEntrypointServer {
 public:
     explicit LocalDnsEntrypointServer(std::string body)
@@ -227,6 +237,72 @@ TEST(AlternatorLiveNodes, ClusterScopeMergesSeedNodes) {
               }));
     EXPECT_GT(dc1_requests.load(), 0);
     EXPECT_GT(dc2_requests.load(), 0);
+}
+
+TEST(AlternatorLiveNodes, KeyRouteAffinityUsesClusterNodesAcrossRackScopes) {
+    Config rack1_config;
+    rack1_config.routing_scope = NewRackScope("dc1", "rack1");
+    rack1_config.key_route_affinity.mode = KeyRouteAffinityMode::ReadBeforeWrite;
+    rack1_config.nodes_list_update_period = std::chrono::milliseconds{0};
+    Config rack2_config = rack1_config;
+    rack2_config.routing_scope = NewRackScope("dc1", "rack2");
+
+    std::atomic<int> cluster_requests{0};
+    auto http = std::make_shared<FakeHttpClient>([&](const Url& url) {
+        EXPECT_EQ(url.path, "/localnodes");
+        if (url.query == "dc=dc1&rack=rack1") {
+            return HttpResponse{200, "[\"rack1-node.local\"]"};
+        }
+        if (url.query == "dc=dc1&rack=rack2") {
+            return HttpResponse{200, "[\"rack2-node.local\"]"};
+        }
+        if (url.query.empty()) {
+            ++cluster_requests;
+            return HttpResponse{
+                200,
+                "[\"rack1-node.local\",\"rack2-node.local\",\"rack3-node.local\"]"};
+        }
+        return HttpResponse{500, ""};
+    });
+
+    AlternatorLiveNodes rack1_nodes({"seed.local"}, rack1_config, http);
+    AlternatorLiveNodes rack2_nodes({"seed.local"}, rack2_config, http);
+    rack1_nodes.UpdateLiveNodes();
+    rack2_nodes.UpdateLiveNodes();
+
+    EXPECT_EQ(Hosts(rack1_nodes.GetQueryPlanNodes()), std::vector<std::string>({"rack1-node.local"}));
+    EXPECT_EQ(Hosts(rack2_nodes.GetQueryPlanNodes()), std::vector<std::string>({"rack2-node.local"}));
+
+    const std::vector<Url> cluster_nodes{
+        {"http", "rack1-node.local", 8080},
+        {"http", "rack2-node.local", 8080},
+        {"http", "rack3-node.local", 8080},
+    };
+    EXPECT_EQ(rack1_nodes.GetKeyRouteAffinityNodes(), cluster_nodes);
+    EXPECT_EQ(rack2_nodes.GetKeyRouteAffinityNodes(), cluster_nodes);
+    EXPECT_EQ(cluster_requests.load(), 2);
+
+    const auto target = cluster_nodes[2];
+    const auto key = KeyWhereFirstNodeIs(cluster_nodes, target);
+    PartitionKeyMetadata metadata({{"orders", "id"}});
+    auto rack1_plan = QueryPlanForPartitionKey(
+        rack1_nodes,
+        {{"id", AttributeValue::String(key)}},
+        "orders",
+        metadata);
+    auto rack2_plan = QueryPlanForPartitionKey(
+        rack2_nodes,
+        {{"id", AttributeValue::String(key)}},
+        "orders",
+        metadata);
+
+    EXPECT_EQ(rack1_plan.Next(), target);
+    EXPECT_EQ(rack2_plan.Next(), target);
+
+    rack1_nodes.ReportNodeResult(target, NodeHealthObservation::ConnectionFailure);
+    EXPECT_EQ(Hosts(rack1_nodes.GetKeyRouteAffinityNodes()),
+              std::vector<std::string>({"rack1-node.local", "rack2-node.local"}));
+    EXPECT_EQ(Hosts(rack1_nodes.GetQueryPlanNodes()), std::vector<std::string>({"rack1-node.local"}));
 }
 
 TEST(AlternatorLiveNodes, DnsEntrypointDiscoversDnsNodeRecords) {

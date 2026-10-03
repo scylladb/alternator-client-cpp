@@ -30,10 +30,12 @@ class StaticNodes final : public NodesSource {
 public:
     StaticNodes(std::vector<Url> active_nodes,
                 std::vector<Url> down_nodes = {},
-                std::vector<Url> query_plan_nodes = {})
+                std::vector<Url> query_plan_nodes = {},
+                std::vector<Url> affinity_nodes = {})
         : active_nodes_(std::move(active_nodes))
         , down_nodes_(std::move(down_nodes))
-        , query_plan_nodes_(std::move(query_plan_nodes)) {}
+        , query_plan_nodes_(std::move(query_plan_nodes))
+        , affinity_nodes_(std::move(affinity_nodes)) {}
 
     std::vector<Url> GetActiveNodes() const override {
         return active_nodes_;
@@ -46,6 +48,13 @@ public:
         return active_nodes_;
     }
 
+    std::vector<Url> GetKeyRouteAffinityNodes() const override {
+        if (!affinity_nodes_.empty()) {
+            return affinity_nodes_;
+        }
+        return active_nodes_;
+    }
+
     std::vector<Url> GetDownNodes() const override {
         return down_nodes_;
     }
@@ -54,6 +63,7 @@ private:
     std::vector<Url> active_nodes_;
     std::vector<Url> down_nodes_;
     std::vector<Url> query_plan_nodes_;
+    std::vector<Url> affinity_nodes_;
 };
 
 std::vector<Url> BatchWriteTestNodes() {
@@ -192,6 +202,28 @@ TEST(KeyRouteAffinity, PartitionKeyPlanUsesSortedSeed) {
 
     auto plan = QueryPlanForPartitionKey(nodes, KeyWithId(key), "orders", metadata);
     EXPECT_EQ(plan.Next(), BatchWriteSortedTestNodes()[0]);
+}
+
+TEST(KeyRouteAffinity, AffinityPlansOverrideTheNormalRoutingDomain) {
+    const auto affinity_nodes = BatchWriteTestNodes();
+    const auto local_node = BatchWriteSortedTestNodes()[0];
+    const auto remote_node = BatchWriteSortedTestNodes()[2];
+    const auto key = StringKeysForNode(remote_node, 1)[0];
+    StaticNodes nodes({local_node}, {}, {local_node}, affinity_nodes);
+    auto metadata = Metadata({{"orders", "id"}});
+
+    auto normal_plan = QueryPlan::FromNodesSource(nodes);
+    EXPECT_EQ(normal_plan.Next(), local_node);
+    EXPECT_TRUE(normal_plan.Next().Empty());
+
+    auto partition_plan = QueryPlanForPartitionKey(nodes, KeyWithId(key), "orders", metadata);
+    EXPECT_EQ(partition_plan.Next(), remote_node);
+
+    auto batch_plan = QueryPlanForBatchWrite(
+        nodes,
+        {BatchWriteOperation::Put("orders", ItemWithId(key, "payload"))},
+        metadata);
+    EXPECT_EQ(batch_plan.Next(), remote_node);
 }
 
 TEST(KeyRouteAffinity, PartitionKeyPlanKeepsActiveAffinityWhenQuarantineIsSampled) {
