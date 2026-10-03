@@ -278,8 +278,8 @@ TEST(AlternatorLiveNodes, KeyRouteAffinityUsesClusterNodesAcrossRackScopes) {
         {"http", "rack2-node.local", 8080},
         {"http", "rack3-node.local", 8080},
     };
-    EXPECT_EQ(rack1_nodes.GetKeyRouteAffinityNodes(), cluster_nodes);
-    EXPECT_EQ(rack2_nodes.GetKeyRouteAffinityNodes(), cluster_nodes);
+    EXPECT_EQ(rack1_nodes.GetActiveKeyRouteAffinityNodes(), cluster_nodes);
+    EXPECT_EQ(rack2_nodes.GetActiveKeyRouteAffinityNodes(), cluster_nodes);
     EXPECT_EQ(cluster_requests.load(), 2);
 
     const auto target = cluster_nodes[2];
@@ -300,7 +300,7 @@ TEST(AlternatorLiveNodes, KeyRouteAffinityUsesClusterNodesAcrossRackScopes) {
     EXPECT_EQ(rack2_plan.Next(), target);
 
     rack1_nodes.ReportNodeResult(target, NodeHealthObservation::ConnectionFailure);
-    EXPECT_EQ(Hosts(rack1_nodes.GetKeyRouteAffinityNodes()),
+    EXPECT_EQ(Hosts(rack1_nodes.GetActiveKeyRouteAffinityNodes()),
               std::vector<std::string>({"rack1-node.local", "rack2-node.local"}));
     EXPECT_EQ(Hosts(rack1_nodes.GetQueryPlanNodes()), std::vector<std::string>({"rack1-node.local"}));
 }

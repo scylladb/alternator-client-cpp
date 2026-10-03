@@ -31,11 +31,11 @@ public:
     StaticNodes(std::vector<Url> active_nodes,
                 std::vector<Url> down_nodes = {},
                 std::vector<Url> query_plan_nodes = {},
-                std::vector<Url> affinity_nodes = {})
+                std::vector<Url> active_affinity_nodes = {})
         : active_nodes_(std::move(active_nodes))
         , down_nodes_(std::move(down_nodes))
         , query_plan_nodes_(std::move(query_plan_nodes))
-        , affinity_nodes_(std::move(affinity_nodes)) {}
+        , active_affinity_nodes_(std::move(active_affinity_nodes)) {}
 
     std::vector<Url> GetActiveNodes() const override {
         return active_nodes_;
@@ -48,9 +48,9 @@ public:
         return active_nodes_;
     }
 
-    std::vector<Url> GetKeyRouteAffinityNodes() const override {
-        if (!affinity_nodes_.empty()) {
-            return affinity_nodes_;
+    std::vector<Url> GetActiveKeyRouteAffinityNodes() const override {
+        if (!active_affinity_nodes_.empty()) {
+            return active_affinity_nodes_;
         }
         return active_nodes_;
     }
@@ -63,7 +63,7 @@ private:
     std::vector<Url> active_nodes_;
     std::vector<Url> down_nodes_;
     std::vector<Url> query_plan_nodes_;
-    std::vector<Url> affinity_nodes_;
+    std::vector<Url> active_affinity_nodes_;
 };
 
 std::vector<Url> BatchWriteTestNodes() {
@@ -205,11 +205,11 @@ TEST(KeyRouteAffinity, PartitionKeyPlanUsesSortedSeed) {
 }
 
 TEST(KeyRouteAffinity, AffinityPlansOverrideTheNormalRoutingDomain) {
-    const auto affinity_nodes = BatchWriteTestNodes();
+    const auto active_affinity_nodes = BatchWriteTestNodes();
     const auto local_node = BatchWriteSortedTestNodes()[0];
     const auto remote_node = BatchWriteSortedTestNodes()[2];
     const auto key = StringKeysForNode(remote_node, 1)[0];
-    StaticNodes nodes({local_node}, {}, {local_node}, affinity_nodes);
+    StaticNodes nodes({local_node}, {}, {local_node}, active_affinity_nodes);
     auto metadata = Metadata({{"orders", "id"}});
 
     auto normal_plan = QueryPlan::FromNodesSource(nodes);

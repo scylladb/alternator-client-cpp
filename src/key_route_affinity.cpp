@@ -206,7 +206,7 @@ std::vector<Url> QueryPlanNodesForHashes(const NodesSource& nodes, const std::ve
 }
 
 std::vector<Url> AffinityNodes(const NodesSource& nodes) {
-    auto active_nodes = nodes.GetKeyRouteAffinityNodes();
+    auto active_nodes = nodes.GetActiveKeyRouteAffinityNodes();
     if (!active_nodes.empty()) {
         return SortAndDedupeNodes(std::move(active_nodes));
     }
@@ -267,7 +267,7 @@ QueryPlan QueryPlanForPartitionKey(const NodesSource& nodes,
                                    const std::string& table_name,
                                    const PartitionKeyMetadata& metadata) {
     const auto seed = HashPartitionKey(values, table_name, metadata);
-    auto active_nodes = nodes.GetKeyRouteAffinityNodes();
+    auto active_nodes = nodes.GetActiveKeyRouteAffinityNodes();
     auto query_plan_nodes = nodes.GetQueryPlanNodesForHash(seed);
     if (active_nodes.empty()) {
         return QueryPlan::WithSortedSeed(std::move(query_plan_nodes), seed);
@@ -288,7 +288,7 @@ std::vector<Url> SelectBatchWritePreferredNodes(const NodesSource& nodes,
 QueryPlan QueryPlanForBatchWrite(const NodesSource& nodes,
                                  const std::vector<BatchWriteOperation>& operations,
                                  const PartitionKeyMetadata& metadata) {
-    auto active_nodes = nodes.GetKeyRouteAffinityNodes();
+    auto active_nodes = nodes.GetActiveKeyRouteAffinityNodes();
     auto query_plan_nodes = QueryPlanNodesForHashes(nodes, BatchWriteHashes(operations, metadata));
     if (active_nodes.empty()) {
         auto candidate_nodes = std::move(query_plan_nodes);

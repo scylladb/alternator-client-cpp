@@ -194,7 +194,7 @@ AlternatorLiveNodes::AlternatorLiveNodes(std::vector<std::string> initial_nodes,
     }
     initial_nodes_ = SortAndDedupeNodes(std::move(initial_nodes_));
     live_nodes_ = initial_nodes_;
-    affinity_nodes_ = initial_nodes_;
+    known_affinity_nodes_ = initial_nodes_;
     health_store_ = std::make_unique<NodeHealthStore>(config_.node_health, initial_nodes_);
     const auto now = std::chrono::steady_clock::now();
     last_activity_ = std::chrono::steady_clock::time_point::min();
@@ -246,8 +246,8 @@ std::vector<Url> AlternatorLiveNodes::GetActiveNodes() const {
     return KeepNodesPresentIn(health_store_->GetActiveNodes(), GetNodes());
 }
 
-std::vector<Url> AlternatorLiveNodes::GetKeyRouteAffinityNodes() const {
-    return KeepNodesPresentIn(health_store_->GetActiveNodes(), GetAffinityNodeSet());
+std::vector<Url> AlternatorLiveNodes::GetActiveKeyRouteAffinityNodes() const {
+    return KeepNodesPresentIn(health_store_->GetActiveNodes(), GetKnownAffinityNodes());
 }
 
 std::vector<Url> AlternatorLiveNodes::GetQueryPlanNodes() const {
@@ -264,7 +264,7 @@ std::vector<Url> AlternatorLiveNodes::GetQueryPlanNodes() const {
 
 std::vector<Url> AlternatorLiveNodes::GetQueryPlanNodesForHash(std::int64_t hash) const {
     std::vector<Url> candidates;
-    auto active_nodes = SortAndDedupeNodes(GetKeyRouteAffinityNodes());
+    auto active_nodes = SortAndDedupeNodes(GetActiveKeyRouteAffinityNodes());
     auto quarantined = StickyQuarantinedNodeForHash(hash, active_nodes);
     if (!quarantined.Empty()) {
         candidates.push_back(std::move(quarantined));
@@ -289,37 +289,38 @@ void AlternatorLiveNodes::UpdateLiveNodes() {
     }
 
     new_nodes = SortAndDedupeNodes(std::move(new_nodes));
-    auto new_affinity_nodes = new_nodes;
+    auto new_known_affinity_nodes = new_nodes;
     if (NeedsClusterAffinityDiscovery(config_)) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            new_affinity_nodes = MergeNodes(affinity_nodes_, new_nodes);
+            new_known_affinity_nodes = MergeNodes(known_affinity_nodes_, new_nodes);
         }
         try {
             auto cluster_nodes = GetNodesForScope(*NewClusterScope());
             if (!cluster_nodes.empty()) {
-                new_affinity_nodes = std::move(cluster_nodes);
+                new_known_affinity_nodes = std::move(cluster_nodes);
             }
         } catch (...) {
             // Keep the last cluster-wide view while scoped routing remains available.
         }
     }
-    new_affinity_nodes = SortAndDedupeNodes(std::move(new_affinity_nodes));
+    new_known_affinity_nodes = SortAndDedupeNodes(std::move(new_known_affinity_nodes));
 
     std::vector<Url> old_nodes;
-    std::vector<Url> old_affinity_nodes;
+    std::vector<Url> old_known_affinity_nodes;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         old_nodes = live_nodes_;
-        old_affinity_nodes = affinity_nodes_;
+        old_known_affinity_nodes = known_affinity_nodes_;
     }
 
-    const auto old_all_nodes = MergeNodes(old_nodes, old_affinity_nodes);
-    const auto new_all_nodes = MergeNodes(new_nodes, new_affinity_nodes);
-    std::vector<Url> removed_affinity_nodes;
-    for (const auto& node : old_affinity_nodes) {
-        if (std::find(new_affinity_nodes.begin(), new_affinity_nodes.end(), node) == new_affinity_nodes.end()) {
-            removed_affinity_nodes.push_back(node);
+    const auto old_all_nodes = MergeNodes(old_nodes, old_known_affinity_nodes);
+    const auto new_all_nodes = MergeNodes(new_nodes, new_known_affinity_nodes);
+    std::vector<Url> removed_known_affinity_nodes;
+    for (const auto& node : old_known_affinity_nodes) {
+        if (std::find(new_known_affinity_nodes.begin(), new_known_affinity_nodes.end(), node) ==
+            new_known_affinity_nodes.end()) {
+            removed_known_affinity_nodes.push_back(node);
         }
     }
     for (const auto& node : new_all_nodes) {
@@ -328,14 +329,14 @@ void AlternatorLiveNodes::UpdateLiveNodes() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         live_nodes_ = std::move(new_nodes);
-        affinity_nodes_ = std::move(new_affinity_nodes);
+        known_affinity_nodes_ = std::move(new_known_affinity_nodes);
     }
     for (const auto& node : old_all_nodes) {
         if (std::find(new_all_nodes.begin(), new_all_nodes.end(), node) == new_all_nodes.end()) {
             health_store_->RemoveNode(node);
         }
     }
-    for (const auto& node : removed_affinity_nodes) {
+    for (const auto& node : removed_known_affinity_nodes) {
         RemoveQuarantineHashAssignmentsForNode(node);
     }
 
@@ -505,16 +506,16 @@ std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) 
     }
 }
 
-std::vector<Url> AlternatorLiveNodes::GetAffinityNodeSet() const {
+std::vector<Url> AlternatorLiveNodes::GetKnownAffinityNodes() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (affinity_nodes_.empty()) {
+    if (known_affinity_nodes_.empty()) {
         return initial_nodes_;
     }
-    return affinity_nodes_;
+    return known_affinity_nodes_;
 }
 
-std::vector<Url> AlternatorLiveNodes::GetAffinityQuarantinedNodes() const {
-    return KeepNodesPresentIn(health_store_->GetQuarantinedNodes(), GetAffinityNodeSet());
+std::vector<Url> AlternatorLiveNodes::GetQuarantinedKeyRouteAffinityNodes() const {
+    return KeepNodesPresentIn(health_store_->GetQuarantinedNodes(), GetKnownAffinityNodes());
 }
 
 Url AlternatorLiveNodes::NextKnownNode() {
@@ -552,7 +553,7 @@ Url AlternatorLiveNodes::NextQuarantinedNode(const std::vector<Url>& quarantined
 }
 
 Url AlternatorLiveNodes::StickyQuarantinedNodeForHash(std::int64_t hash, const std::vector<Url>& active_nodes) const {
-    auto quarantined_nodes = GetAffinityQuarantinedNodes();
+    auto quarantined_nodes = GetQuarantinedKeyRouteAffinityNodes();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -573,7 +574,7 @@ Url AlternatorLiveNodes::StickyQuarantinedNodeForHash(std::int64_t hash, const s
         return {};
     }
 
-    quarantined_nodes = GetAffinityQuarantinedNodes();
+    quarantined_nodes = GetQuarantinedKeyRouteAffinityNodes();
     if (quarantined_nodes.empty()) {
         return {};
     }

@@ -30,7 +30,7 @@ public:
     virtual ~NodesSource() = default;
 
     [[nodiscard]] virtual std::vector<Url> GetActiveNodes() const = 0;
-    [[nodiscard]] virtual std::vector<Url> GetKeyRouteAffinityNodes() const {
+    [[nodiscard]] virtual std::vector<Url> GetActiveKeyRouteAffinityNodes() const {
         return GetActiveNodes();
     }
     [[nodiscard]] virtual std::vector<Url> GetQueryPlanNodes() const {
