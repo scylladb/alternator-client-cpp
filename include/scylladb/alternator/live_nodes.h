@@ -50,8 +50,11 @@ public:
     [[nodiscard]] std::vector<Url> GetQuarantinedNodes() const;
     [[nodiscard]] std::vector<Url> GetDownNodes() const override;
 
+    // Manual and background refreshes execute serially through reconciliation.
     void UpdateLiveNodes();
     void Start();
+    // Waits for the background thread, including a refresh queued behind a manual
+    // refresh. In-flight discovery is not cancelled by Stop().
     void Stop();
 
     void ReportNodeResult(const Url& node, NodeHealthObservation observation);
@@ -81,6 +84,7 @@ private:
     std::shared_ptr<HttpClient> http_client_;
     std::vector<Url> initial_nodes_;
 
+    std::mutex refresh_mutex_;
     mutable std::mutex mutex_;
     std::vector<Url> live_nodes_;
     mutable std::map<std::int64_t, Url> quarantine_by_hash_;

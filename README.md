@@ -308,6 +308,11 @@ cfg.idle_nodes_list_update_period = std::chrono::minutes(1);
 The AWS helper starts and stops this background refresh automatically. The core `AlternatorLiveNodes`
 type leaves lifecycle control to the caller.
 
+Manual and background refreshes execute serially, including topology and health reconciliation.
+`Stop()` waits for the background thread. If that thread is waiting for a manual refresh,
+the manual refresh must finish before `Stop()` can complete. Stopping does not cancel discovery
+requests, including calls to an injected `HttpClient`.
+
 When libcurl is available, the default discovery client reuses HTTP connections by default. It keeps
 a libcurl connection cache bounded by `max_connections` and can be disabled for debugging or
 compatibility:
