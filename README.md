@@ -381,6 +381,30 @@ failures retain seed/rack fallback before the first usable affinity discovery. A
 failures retain the exact previous affinity snapshot while explicit affinity fallbacks remain available. Ordinary
 membership is never merged into that snapshot. Requests do not wait for affinity readiness.
 
+Custom `NodesSource` implementations that provide a separate affinity domain supply both
+`GetActiveKeyRouteAffinityNodes()` for active hashing and voting membership and
+`GetQueryPlanNodesForHash()` for that hash's affinity candidates. For example, a custom source
+without quarantine sampling can implement the pair as follows:
+
+```cpp
+std::vector<Url> MyNodesSource::GetActiveKeyRouteAffinityNodes() const {
+    return affinity_nodes_;
+}
+
+std::vector<Url> MyNodesSource::GetQueryPlanNodesForHash(std::int64_t hash) const {
+    (void)hash;
+    return affinity_nodes_;
+}
+```
+
+Keep ordinary `GetActiveNodes()` and `GetQueryPlanNodes()` in the ordinary routing domain.
+The per-hash getter may also include eligible quarantined affinity candidates; candidates outside
+the active affinity set are tried before its hashed order. Ordinary fallback applies only when
+both active affinity and hash-specific candidates are empty. Existing sources retain their
+defaults: the active-affinity getter calls `GetActiveNodes()`, while the per-hash getter calls
+`GetQueryPlanNodes()`. Overriding only the active-affinity getter does not replace inherited
+per-hash candidates. `AlternatorLiveNodes` already supplies both affinity getters.
+
 The AWS helper can discover missing table partition-key names automatically. When an affinity plan needs metadata that is
 not cached yet, the helper starts one background `DescribeTable` lookup for that table and returns a normal non-affinity
 query plan for the current request. Later requests use the discovered HASH key name once the lookup completes. Configure

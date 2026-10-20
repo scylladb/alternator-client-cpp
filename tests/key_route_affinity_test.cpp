@@ -55,6 +55,14 @@ public:
         return active_nodes_;
     }
 
+    std::vector<Url> GetQueryPlanNodesForHash(std::int64_t hash) const override {
+        (void)hash;
+        if (!active_affinity_nodes_.empty()) {
+            return active_affinity_nodes_;
+        }
+        return GetQueryPlanNodes();
+    }
+
     std::vector<Url> GetDownNodes() const override {
         return down_nodes_;
     }
@@ -206,7 +214,7 @@ TEST(KeyRouteAffinity, PartitionKeyPlanUsesSortedSeed) {
 
 TEST(KeyRouteAffinity, AffinityPlansOverrideTheNormalRoutingDomain) {
     const auto active_affinity_nodes = BatchWriteTestNodes();
-    const auto local_node = BatchWriteSortedTestNodes()[0];
+    const Url local_node("http", "ordinary-only.example.com", 8000);
     const auto remote_node = BatchWriteSortedTestNodes()[2];
     const auto key = StringKeysForNode(remote_node, 1)[0];
     StaticNodes nodes({local_node}, {}, {local_node}, active_affinity_nodes);
@@ -218,12 +226,18 @@ TEST(KeyRouteAffinity, AffinityPlansOverrideTheNormalRoutingDomain) {
 
     auto partition_plan = QueryPlanForPartitionKey(nodes, KeyWithId(key), "orders", metadata);
     EXPECT_EQ(partition_plan.Next(), remote_node);
+    auto partition_remaining = PlanHosts(std::move(partition_plan));
+    std::sort(partition_remaining.begin(), partition_remaining.end());
+    EXPECT_EQ(partition_remaining, SortedHostsExcept({remote_node.host}));
 
     auto batch_plan = QueryPlanForBatchWrite(
         nodes,
         {BatchWriteOperation::Put("orders", ItemWithId(key, "payload"))},
         metadata);
     EXPECT_EQ(batch_plan.Next(), remote_node);
+    auto batch_remaining = PlanHosts(std::move(batch_plan));
+    std::sort(batch_remaining.begin(), batch_remaining.end());
+    EXPECT_EQ(batch_remaining, SortedHostsExcept({remote_node.host}));
 }
 
 TEST(KeyRouteAffinity, PartitionKeyPlanKeepsActiveAffinityWhenQuarantineIsSampled) {
