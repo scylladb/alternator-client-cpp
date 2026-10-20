@@ -88,6 +88,14 @@ bool SameEndpointHost(const std::string& lhs, const std::string& rhs) {
     return UnbracketHost(lhs) == UnbracketHost(rhs);
 }
 
+bool MatchesEndpoint(const Aws::Http::URI& uri, const std::vector<Url>& known_nodes) {
+    const auto host = std::string(uri.GetHost().c_str());
+    const auto port = uri.GetPort();
+    return std::any_of(known_nodes.begin(), known_nodes.end(), [&](const Url& node) {
+        return SameEndpointHost(host, node.host) && port == node.port;
+    });
+}
+
 bool IsAlternatorEndpoint(const Aws::Http::URI& uri,
                           const AlternatorLiveNodes& nodes,
                           std::uint16_t endpoint_override_port) {
@@ -96,11 +104,7 @@ bool IsAlternatorEndpoint(const Aws::Http::URI& uri,
     if (SameEndpointHost(host, kEndpointOverrideHost) && port == endpoint_override_port) {
         return true;
     }
-
-    const auto known_nodes = nodes.GetNodes();
-    return std::any_of(known_nodes.begin(), known_nodes.end(), [&](const Url& node) {
-        return SameEndpointHost(host, node.host) && port == node.port;
-    });
+    return MatchesEndpoint(uri, nodes.GetNodes()) || MatchesEndpoint(uri, nodes.GetKnownAffinityNodes());
 }
 
 Url UrlFromAwsUri(const Aws::Http::URI& uri) {
@@ -321,7 +325,9 @@ Url SelectAttemptNode(const std::shared_ptr<Aws::Http::HttpRequest>& request,
     }
 
     auto current_node = UrlFromAwsUri(request->GetUri());
-    if (IsFirstSdkAttempt(*request) && !SameEndpointHost(current_node.host, kEndpointOverrideHost)) {
+    if (!SameEndpointHost(current_node.host, kEndpointOverrideHost) &&
+        (IsFirstSdkAttempt(*request) || !MatchesEndpoint(request->GetUri(), nodes->GetNodes()))) {
+        // Affinity-only endpoints keep the fixed client's existing retry destination.
         return current_node;
     }
 
