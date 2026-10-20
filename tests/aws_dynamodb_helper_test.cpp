@@ -30,7 +30,9 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -172,8 +174,12 @@ struct SequencedHttpResponse {
 
 class KeepAliveSequenceHttpServer {
 public:
-    explicit KeepAliveSequenceHttpServer(std::vector<SequencedHttpResponse> responses)
-        : responses_(std::move(responses)) {
+    explicit KeepAliveSequenceHttpServer(std::vector<SequencedHttpResponse> responses,
+                                        bool keep_connections = true,
+                                        std::chrono::milliseconds wait_timeout = std::chrono::seconds{5})
+        : responses_(std::move(responses))
+        , keep_connections_(keep_connections)
+        , wait_timeout_(wait_timeout) {
         fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) {
             throw std::runtime_error("socket failed");
@@ -201,11 +207,24 @@ public:
 
         worker_ = std::thread([this] {
             while (request_count_.load() < static_cast<int>(responses_.size())) {
+                pollfd ready{fd_, POLLIN, 0};
+                if (poll(&ready, 1, static_cast<int>(wait_timeout_.count())) <= 0 ||
+                    (ready.revents & POLLIN) == 0) {
+                    return;
+                }
                 int client = accept(fd_, nullptr, nullptr);
                 if (client < 0) {
                     return;
                 }
                 ++accept_count_;
+                timeval timeout{};
+                timeout.tv_sec = wait_timeout_.count() / 1000;
+                timeout.tv_usec = (wait_timeout_.count() % 1000) * 1000;
+                if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+                    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+                    close(client);
+                    return;
+                }
 
                 while (request_count_.load() < static_cast<int>(responses_.size())) {
                     auto request = ReadRequest(client);
@@ -214,7 +233,8 @@ public:
                     }
                     requests_.push_back(std::move(request));
                     const auto response_index = request_count_.fetch_add(1);
-                    const bool keep_connection = request_count_.load() < static_cast<int>(responses_.size());
+                    const bool keep_connection = keep_connections_ &&
+                        request_count_.load() < static_cast<int>(responses_.size());
                     SendResponse(
                         client,
                         responses_.at(static_cast<std::size_t>(response_index)),
@@ -230,10 +250,10 @@ public:
     }
 
     ~KeepAliveSequenceHttpServer() {
+        Wait();
         if (fd_ >= 0) {
             close(fd_);
         }
-        Wait();
     }
 
     void Wait() {
@@ -331,12 +351,14 @@ private:
              << "\r\n"
              << response.body;
         const auto response_text = text.str();
-        send(client, response_text.data(), response_text.size(), 0);
+        send(client, response_text.data(), response_text.size(), MSG_NOSIGNAL);
     }
 
     int fd_ = -1;
     std::uint16_t port_ = 0;
     std::vector<SequencedHttpResponse> responses_;
+    bool keep_connections_;
+    std::chrono::milliseconds wait_timeout_;
     std::vector<std::string> requests_;
     std::atomic<int> accept_count_{0};
     std::atomic<int> request_count_{0};
@@ -610,6 +632,25 @@ std::string PartitionKeyForHost(const aws::DynamoDBHelper& helper,
 
 } // namespace
 
+TEST(AwsDynamoDBHelper, SequenceServerWaitFinishesWithoutExpectedRequests) {
+    KeepAliveSequenceHttpServer missing({{200, "OK", "{}"}}, false, std::chrono::milliseconds{50});
+    missing.Wait();
+    EXPECT_TRUE(missing.Requests().empty());
+
+    KeepAliveSequenceHttpServer idle({{200, "OK", "{}"}}, true, std::chrono::milliseconds{500});
+    const int client = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(client, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(idle.Port());
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    EXPECT_EQ(connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    idle.Wait();
+    close(client);
+    EXPECT_EQ(idle.AcceptCount(), 1);
+    EXPECT_TRUE(idle.Requests().empty());
+}
+
 TEST(AwsDynamoDBHelper, ConfiguresClientAndInstantiatesRequestHooks) {
     Aws::SDKOptions sdk_options;
     AwsApiGuard api(sdk_options);
@@ -827,6 +868,72 @@ TEST(AwsDynamoDBHelper, TypedPutItemUsesSameCoordinatorForSamePartitionKey) {
     EXPECT_EQ(HostHeader(server.Requests()[1]), expected_host);
     EXPECT_NE(server.Requests()[0].find("PutItem"), std::string::npos);
     EXPECT_NE(server.Requests()[1].find("PutItem"), std::string::npos);
+}
+
+TEST(AwsDynamoDBHelper, DiscoveredDatacenterAffinityUsesTransportHooksWithoutChangingRetryDestination) {
+    class ScopedDiscovery final : public HttpClient {
+    public:
+        HttpResponse Get(const Url& url) const override {
+            if (url.query == "dc=A&rack=r1") {
+                return {200, R"(["127.0.0.1"])"};
+            }
+            EXPECT_EQ(url.query, "dc=A");
+            return {200, R"(["127.0.0.1","localhost"])"};
+        }
+    };
+    KeepAliveSequenceHttpServer server({
+        {200, "OK", "{}"},
+        {200, "OK", "{}"},
+        {200, "OK", R"({"TableNames":[]})"},
+        {200, "OK", "{}"},
+        {500, "Internal Server Error", R"({"__type":"InternalServerError","message":"retry"})"},
+        {200, "OK", "{}"},
+    }, false);
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.routing_scope = NewRackScope("A", "r1");
+    cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+    cfg.node_health.consecutive_server_error_threshold = 1;
+    cfg.node_health.quarantine_success_threshold = 2;
+    cfg.header_optimization = std::make_shared<HeaderAllowlistOptimization>(
+        std::vector<std::string>{"Host", "X-Amz-Target", "Content-Length"});
+    auto prepared_helper = std::make_unique<aws::DynamoDBHelper>(
+        std::vector<std::string>{"127.0.0.1"}, cfg, std::make_shared<ScopedDiscovery>());
+    prepared_helper->UpdateLiveNodes();
+    Aws::SDKOptions sdk_options;
+    prepared_helper->ApplyToSDKOptions(sdk_options);
+    AwsApiGuard api(sdk_options);
+    auto helper = std::move(prepared_helper);
+    const auto key = PartitionKeyForHost(*helper, "orders", "localhost");
+    EXPECT_FALSE(key.empty());
+    const Url peer("http", "localhost", server.Port());
+    const Url rack("http", "127.0.0.1", server.Port());
+    auto put = NewPutItemRequest();
+    put.AddItem("id", AwsStringValue(key));
+    EXPECT_TRUE(helper->PutItem(put).IsSuccess());
+
+    Aws::DynamoDB::Model::PutRequest batch_put;
+    batch_put.AddItem("id", AwsStringValue(key));
+    Aws::DynamoDB::Model::WriteRequest write;
+    write.SetPutRequest(batch_put);
+    Aws::DynamoDB::Model::BatchWriteItemRequest batch;
+    batch.AddRequestItems("orders", {write});
+    EXPECT_TRUE(helper->BatchWriteItem(batch).IsSuccess());
+    Aws::DynamoDB::Model::ListTablesRequest read;
+    EXPECT_TRUE(helper->NewDynamoDB()->ListTables(read).IsSuccess());
+    Aws::DynamoDB::Model::PutItemRequest missing_key;
+    missing_key.SetTableName("orders");
+    EXPECT_TRUE(helper->PutItem(missing_key).IsSuccess());
+    EXPECT_TRUE(helper->PutItem(put).IsSuccess());
+    server.Wait();
+    ASSERT_EQ(server.Requests().size(), 6U);
+    for (std::size_t i = 0; i < server.Requests().size(); ++i) {
+        EXPECT_EQ(HostHeader(server.Requests()[i]), (i == 2 || i == 3 ? rack : peer).Authority());
+        EXPECT_EQ(RequestHeaders(server.Requests()[i]).count("content-type"), 0U);
+    }
+    const auto active = helper->Nodes()->GetActiveKeyRouteAffinityNodes();
+    EXPECT_EQ(active, std::vector<Url>({rack}));
+    helper->ReportNodeResult(peer, NodeHealthObservation::Success);
+    EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), SortAndDedupeNodes({rack, peer}));
 }
 
 TEST(AwsDynamoDBHelper, TypedWriteMethodsSendRequestsThroughHelper) {

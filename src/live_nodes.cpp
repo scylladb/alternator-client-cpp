@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -146,6 +148,24 @@ void AppendUniqueNodes(std::vector<Url>& out, std::vector<Url> nodes) {
     }
 }
 
+std::vector<Url> KeepNodesPresentIn(std::vector<Url> nodes, const std::vector<Url>& allowed_nodes) {
+    // Health-store and membership snapshots are both sorted and unique.
+    std::vector<Url> present;
+    std::set_intersection(nodes.begin(), nodes.end(), allowed_nodes.begin(), allowed_nodes.end(),
+                          std::back_inserter(present));
+    return present;
+}
+
+std::vector<Url> MergeNodes(std::vector<Url> first, std::vector<Url> second) {
+    AppendUniqueNodes(first, std::move(second));
+    return SortAndDedupeNodes(std::move(first));
+}
+
+std::pair<std::string, bool> DiscoveryOperation(const RoutingScope& scope) {
+    const bool cluster_scope = scope.IsCluster();
+    return {scope.LocalNodesQuery(), cluster_scope};
+}
+
 bool QuarantinedNodeIsFirstForHash(const Url& node,
                                    const std::vector<Url>& active_nodes,
                                    std::int64_t hash) {
@@ -166,6 +186,9 @@ AlternatorLiveNodes::AlternatorLiveNodes(std::vector<std::string> initial_nodes,
     if (initial_nodes.empty()) {
         throw std::invalid_argument("initial_nodes cannot be empty");
     }
+    if (config_.key_route_affinity.mode != KeyRouteAffinityMode::None) {
+        AppendAffinityScopes(config_.routing_scope);
+    }
     if (!http_client_) {
         http_client_ = NewDefaultHttpClient(config_);
     }
@@ -175,6 +198,7 @@ AlternatorLiveNodes::AlternatorLiveNodes(std::vector<std::string> initial_nodes,
     }
     initial_nodes_ = SortAndDedupeNodes(std::move(initial_nodes_));
     live_nodes_ = initial_nodes_;
+    known_affinity_nodes_ = initial_nodes_;
     health_store_ = std::make_unique<NodeHealthStore>(config_.node_health, initial_nodes_);
     const auto now = std::chrono::steady_clock::now();
     last_activity_ = std::chrono::steady_clock::time_point::min();
@@ -183,6 +207,34 @@ AlternatorLiveNodes::AlternatorLiveNodes(std::vector<std::string> initial_nodes,
     } else {
         next_update_ = std::chrono::steady_clock::time_point::max();
     }
+}
+
+void AlternatorLiveNodes::AppendAffinityScopes(RoutingScopePtr scope) {
+    for (; scope; scope = scope->Fallback()) {
+        auto affinity_scope = scope;
+        if (const auto* rack = dynamic_cast<const RackScope*>(scope.get())) {
+            affinity_scope = NewDCScope(rack->Datacenter());
+            affinity_has_rack_ = true;
+        }
+        const bool fixed_scope = dynamic_cast<const DatacenterScope*>(affinity_scope.get()) != nullptr ||
+            dynamic_cast<const ClusterScope*>(affinity_scope.get()) != nullptr;
+        const ScopeOperation* operation = nullptr;
+        if (fixed_scope) {
+            const auto entry = fixed_affinity_scopes_.try_emplace(DiscoveryOperation(*affinity_scope), affinity_scope);
+            operation = &entry.first->first;
+            affinity_scope = entry.first->second;
+        }
+        affinity_scopes_.push_back({scope, std::move(affinity_scope), operation, fixed_scope});
+        if (!fixed_scope) {
+            // Do not evaluate an opaque query or fallback until discovery needs it.
+            return;
+        }
+    }
+}
+
+void AlternatorLiveNodes::ResolveAffinityFallback(std::size_t index, RoutingScopePtr fallback) {
+    AppendAffinityScopes(std::move(fallback));
+    affinity_scopes_[index].fallback_resolved = true;
 }
 
 AlternatorLiveNodes::~AlternatorLiveNodes() {
@@ -194,12 +246,19 @@ Url AlternatorLiveNodes::NextNode() {
 
     auto candidates = GetActiveNodes();
     if (candidates.empty()) {
-        ProbeDownNodes();
+        std::vector<Url> down_nodes;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            down_nodes = KeepNodesPresentIn(health_store_->GetDownNodes(),
+                live_nodes_.empty() ? initial_nodes_ : live_nodes_);
+        }
+        ProbeDownCandidates(down_nodes);
         candidates = GetActiveNodes();
     }
 
-    if (ShouldTryQuarantinedNode(candidates.empty())) {
-        auto quarantined = NextQuarantinedNode();
+    const auto quarantined_nodes = GetQuarantinedOrdinaryNodes();
+    if (ShouldTryQuarantinedNode(candidates.empty(), quarantined_nodes)) {
+        auto quarantined = NextQuarantinedNode(quarantined_nodes);
         if (!quarantined.Empty()) {
             return quarantined;
         }
@@ -222,13 +281,22 @@ std::vector<Url> AlternatorLiveNodes::GetNodes() const {
 }
 
 std::vector<Url> AlternatorLiveNodes::GetActiveNodes() const {
-    return health_store_->GetActiveNodes();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return KeepNodesPresentIn(health_store_->GetActiveNodes(),
+        live_nodes_.empty() ? initial_nodes_ : live_nodes_);
+}
+
+std::vector<Url> AlternatorLiveNodes::GetActiveKeyRouteAffinityNodes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return KeepNodesPresentIn(health_store_->GetActiveNodes(),
+        known_affinity_nodes_.empty() ? initial_nodes_ : known_affinity_nodes_);
 }
 
 std::vector<Url> AlternatorLiveNodes::GetQueryPlanNodes() const {
     auto candidates = GetActiveNodes();
-    if (ShouldTryQuarantinedNode(candidates.empty())) {
-        auto quarantined = NextQuarantinedNode();
+    const auto quarantined_nodes = GetQuarantinedOrdinaryNodes();
+    if (ShouldTryQuarantinedNode(candidates.empty(), quarantined_nodes)) {
+        auto quarantined = NextQuarantinedNode(quarantined_nodes);
         if (!quarantined.Empty()) {
             candidates.push_back(std::move(quarantined));
         }
@@ -238,7 +306,7 @@ std::vector<Url> AlternatorLiveNodes::GetQueryPlanNodes() const {
 
 std::vector<Url> AlternatorLiveNodes::GetQueryPlanNodesForHash(std::int64_t hash) const {
     std::vector<Url> candidates;
-    auto active_nodes = SortAndDedupeNodes(GetActiveNodes());
+    auto active_nodes = SortAndDedupeNodes(GetActiveKeyRouteAffinityNodes());
     auto quarantined = StickyQuarantinedNodeForHash(hash, active_nodes);
     if (!quarantined.Empty()) {
         candidates.push_back(std::move(quarantined));
@@ -258,27 +326,84 @@ std::vector<Url> AlternatorLiveNodes::GetDownNodes() const {
 void AlternatorLiveNodes::UpdateLiveNodes() {
     std::lock_guard<std::mutex> refresh_lock(refresh_mutex_);
 
-    auto new_nodes = FetchLiveNodes();
+    DiscoveryResults results;
+    auto new_nodes = FetchLiveNodes(results);
     if (new_nodes.empty()) {
         ProbeDownNodes();
         return;
     }
 
-    std::vector<Url> removed_nodes;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& node : new_nodes) {
-            health_store_->AddNode(node);
-        }
-        for (const auto& node : live_nodes_) {
-            if (std::find(new_nodes.begin(), new_nodes.end(), node) == new_nodes.end()) {
-                health_store_->RemoveNode(node);
-                removed_nodes.push_back(node);
+    if (!affinity_has_rack_ && std::any_of(results.ordinary_scopes.begin(), results.ordinary_scopes.end(),
+            [](const auto& scope) { return dynamic_cast<const RackScope*>(scope.get()) != nullptr; })) {
+        for (std::size_t i = 0; i + 1 < results.ordinary_scopes.size(); ++i) {
+            if (!affinity_scopes_[i].fallback_resolved) {
+                ResolveAffinityFallback(i, results.ordinary_scopes[i + 1]);
             }
         }
-        live_nodes_ = SortAndDedupeNodes(std::move(new_nodes));
     }
-    for (const auto& node : removed_nodes) {
+
+    new_nodes = SortAndDedupeNodes(std::move(new_nodes));
+    auto new_known_affinity_nodes = new_nodes;
+    if (affinity_has_rack_) {
+        if (has_affinity_snapshot_) {
+            new_known_affinity_nodes = GetKnownAffinityNodes();
+        }
+        for (std::size_t i = 0; i < affinity_scopes_.size(); ++i) {
+            const auto scope = affinity_scopes_[i].original;
+            try {
+                auto affinity_nodes = GetAffinityNodesForScope(i, results);
+                if (!affinity_nodes.empty()) {
+                    new_known_affinity_nodes = std::move(affinity_nodes);
+                    has_affinity_snapshot_ = true;
+                    break;
+                }
+            } catch (...) {
+                // Keep an established affinity snapshot, or current ordinary nodes before one exists,
+                // and continue through explicit fallbacks.
+            }
+            if (!affinity_scopes_[i].fallback_resolved) {
+                try {
+                    ResolveAffinityFallback(i, scope->Fallback());
+                } catch (...) {
+                    // Leave the unresolved occurrence available for the next refresh.
+                    break;
+                }
+            }
+        }
+    }
+    new_known_affinity_nodes = SortAndDedupeNodes(std::move(new_known_affinity_nodes));
+
+    std::vector<Url> old_nodes;
+    std::vector<Url> old_known_affinity_nodes;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        old_nodes = live_nodes_;
+        old_known_affinity_nodes = known_affinity_nodes_;
+    }
+
+    const auto old_all_nodes = MergeNodes(old_nodes, old_known_affinity_nodes);
+    const auto new_all_nodes = MergeNodes(new_nodes, new_known_affinity_nodes);
+    std::vector<Url> removed_known_affinity_nodes;
+    for (const auto& node : old_known_affinity_nodes) {
+        if (std::find(new_known_affinity_nodes.begin(), new_known_affinity_nodes.end(), node) ==
+            new_known_affinity_nodes.end()) {
+            removed_known_affinity_nodes.push_back(node);
+        }
+    }
+    for (const auto& node : new_all_nodes) {
+        health_store_->AddNode(node);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        live_nodes_ = std::move(new_nodes);
+        known_affinity_nodes_ = std::move(new_known_affinity_nodes);
+    }
+    for (const auto& node : old_all_nodes) {
+        if (std::find(new_all_nodes.begin(), new_all_nodes.end(), node) == new_all_nodes.end()) {
+            health_store_->RemoveNode(node);
+        }
+    }
+    for (const auto& node : removed_known_affinity_nodes) {
         RemoveQuarantineHashAssignmentsForNode(node);
     }
 
@@ -322,14 +447,18 @@ void AlternatorLiveNodes::ReportNodeResult(const Url& node, NodeHealthObservatio
 }
 
 std::vector<Url> AlternatorLiveNodes::ProbeDownNodes() {
-    return health_store_->ProbeDownNodes([this](const Url& node, const NodeHealthStatus&) {
+    return ProbeDownCandidates(health_store_->GetDownNodes());
+}
+
+std::vector<Url> AlternatorLiveNodes::ProbeDownCandidates(const std::vector<Url>& candidates) {
+    return health_store_->ProbeDownCandidates([this](const Url& node, const NodeHealthStatus&) {
         try {
             const auto resp = http_client_->Get(node.WithPathAndQuery("/localnodes"));
             return resp.status_code >= 500 ? NodeHealthObservation::ServerError : NodeHealthObservation::Success;
         } catch (...) {
             return NodeHealthObservation::ConnectionFailure;
         }
-    });
+    }, candidates);
 }
 
 void AlternatorLiveNodes::CheckIfRackAndDatacenterSetCorrectly() {
@@ -377,60 +506,149 @@ const Config& AlternatorLiveNodes::GetConfig() const {
     return config_;
 }
 
-std::vector<Url> AlternatorLiveNodes::FetchLiveNodes() {
+std::vector<Url> AlternatorLiveNodes::FetchLiveNodes(DiscoveryResults& results) {
     auto scope = config_.routing_scope;
+    std::size_t occurrence = 0;
+    bool associated = !affinity_scopes_.empty();
+    const bool capture_unknown_path = associated && !affinity_has_rack_;
     while (scope) {
-        auto nodes = GetNodesForScope(*scope);
+        auto nodes = GetNodesForScope(*scope, affinity_scopes_.empty() ? nullptr : &results);
+        if (capture_unknown_path) {
+            results.ordinary_scopes.push_back(scope);
+        }
+        if (associated) {
+            results.ordinary_nodes.push_back(nodes);
+        }
         if (!nodes.empty()) {
             return nodes;
         }
-        scope = scope->Fallback();
+        auto fallback = scope->Fallback();
+        if (associated && !capture_unknown_path) {
+            if (!affinity_scopes_[occurrence].fallback_resolved) {
+                ResolveAffinityFallback(occurrence, fallback);
+            } else {
+                const auto captured = occurrence + 1 < affinity_scopes_.size()
+                    ? affinity_scopes_[occurrence + 1].original : nullptr;
+                // A different opaque edge does not replace a captured derived link.
+                associated = captured == fallback;
+            }
+            ++occurrence;
+        }
+        scope = std::move(fallback);
     }
     return {};
 }
 
-std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope) {
+std::vector<Url> AlternatorLiveNodes::GetAffinityNodesForScope(std::size_t index, DiscoveryResults& results) {
+    const auto& occurrence = affinity_scopes_[index];
+    const auto& scope = occurrence.affinity;
+    if (occurrence.operation != nullptr) {
+        const auto existing = results.operations.find(*occurrence.operation);
+        if (existing != results.operations.end()) {
+            if (existing->second.error) {
+                std::rethrow_exception(existing->second.error);
+            }
+            return existing->second.nodes;
+        }
+    }
+    if (occurrence.original == scope && index < results.ordinary_nodes.size()) {
+        return results.ordinary_nodes[index];
+    }
+    return GetNodesForScope(*scope, &results, true);
+}
+
+std::vector<Url> AlternatorLiveNodes::GetNodesForScope(const RoutingScope& scope,
+                                                   DiscoveryResults* results,
+                                                   bool reuse_endpoints) {
     const bool cluster_scope = scope.IsCluster();
-    QueryPlan plan(GetDiscoveryNodesForScope(scope));
+    const bool cluster_seeds = scope.IsCluster();
+    QueryPlan plan(GetDiscoveryNodesForScope(cluster_seeds));
     std::vector<Url> discovered;
     std::exception_ptr last_error;
+    std::optional<std::string> query;
+    bool uniform_query = true;
+    const auto remember = [&](const std::vector<Url>& nodes, std::exception_ptr error = {}) {
+        if (results != nullptr && query && uniform_query && cluster_scope == cluster_seeds) {
+            results->operations.try_emplace(ScopeOperation{*query, cluster_scope}, DiscoveryOutcome{nodes, error});
+        }
+    };
 
     for (Url node = plan.Next(); !node.Empty(); node = plan.Next()) {
         auto endpoint = node.WithPathAndQuery("/localnodes", scope.LocalNodesQuery());
+        if (query) {
+            uniform_query = uniform_query && *query == endpoint.query;
+        } else {
+            query = endpoint.query;
+        }
+        bool reused = false;
         try {
-            auto nodes = GetNodesFromEndpoint(endpoint);
+            auto nodes = results != nullptr
+                ? ReadDiscoveryEndpoint(endpoint, *results, cluster_scope, reuse_endpoints, reused)
+                : GetNodesFromEndpoint(endpoint);
             if (nodes.empty()) {
                 continue;
             }
             if (!cluster_scope) {
+                remember(nodes);
                 return nodes;
             }
             discovered.insert(discovered.end(), nodes.begin(), nodes.end());
         } catch (const HttpStatusError& error) {
-            ReportNodeResult(
-                node,
-                error.status_code >= 500 ? NodeHealthObservation::ServerError : NodeHealthObservation::Success);
+            if (!reused) {
+                ReportNodeResult(
+                    node,
+                    error.status_code >= 500 ? NodeHealthObservation::ServerError : NodeHealthObservation::Success);
+            }
             last_error = std::current_exception();
         } catch (const InvalidHttpResponseError&) {
-            ReportNodeResult(node, NodeHealthObservation::Success);
+            if (!reused) {
+                ReportNodeResult(node, NodeHealthObservation::Success);
+            }
             last_error = std::current_exception();
         } catch (...) {
-            ReportNodeResult(node, NodeHealthObservation::ConnectionFailure);
+            if (!reused) {
+                ReportNodeResult(node, NodeHealthObservation::ConnectionFailure);
+            }
             last_error = std::current_exception();
         }
     }
 
     if (!discovered.empty()) {
-        return SortAndDedupeNodes(std::move(discovered));
+        discovered = SortAndDedupeNodes(std::move(discovered));
+        remember(discovered);
+        return discovered;
     }
     if (last_error) {
+        remember({}, last_error);
         std::rethrow_exception(last_error);
     }
+    remember({});
     return {};
 }
 
-std::vector<Url> AlternatorLiveNodes::GetDiscoveryNodesForScope(const RoutingScope& scope) const {
-    if (scope.IsCluster()) {
+std::vector<Url> AlternatorLiveNodes::ReadDiscoveryEndpoint(const Url& endpoint, DiscoveryResults& results,
+                                                          bool cluster_scope, bool reuse, bool& reused) {
+    const auto key = std::make_pair(endpoint, cluster_scope);
+    const auto existing = results.endpoints.find(key);
+    if (reuse && existing != results.endpoints.end()) {
+        reused = true;
+        if (existing->second.error) {
+            std::rethrow_exception(existing->second.error);
+        }
+        return existing->second.nodes;
+    }
+    try {
+        auto nodes = GetNodesFromEndpoint(endpoint);
+        results.endpoints.try_emplace(key, DiscoveryOutcome{nodes, {}});
+        return nodes;
+    } catch (...) {
+        results.endpoints.try_emplace(key, DiscoveryOutcome{{}, std::current_exception()});
+        throw;
+    }
+}
+
+std::vector<Url> AlternatorLiveNodes::GetDiscoveryNodesForScope(bool cluster_scope) const {
+    if (cluster_scope) {
         return initial_nodes_;
     }
     return GetQueryPlanNodes();
@@ -448,6 +666,26 @@ std::vector<Url> AlternatorLiveNodes::GetNodesFromEndpoint(const Url& endpoint) 
     }
 }
 
+std::vector<Url> AlternatorLiveNodes::GetKnownAffinityNodes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (known_affinity_nodes_.empty()) {
+        return initial_nodes_;
+    }
+    return known_affinity_nodes_;
+}
+
+std::vector<Url> AlternatorLiveNodes::GetQuarantinedKeyRouteAffinityNodes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return KeepNodesPresentIn(health_store_->GetQuarantinedNodes(),
+        known_affinity_nodes_.empty() ? initial_nodes_ : known_affinity_nodes_);
+}
+
+std::vector<Url> AlternatorLiveNodes::GetQuarantinedOrdinaryNodes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return KeepNodesPresentIn(health_store_->GetQuarantinedNodes(),
+        live_nodes_.empty() ? initial_nodes_ : live_nodes_);
+}
+
 Url AlternatorLiveNodes::NextKnownNode() {
     auto nodes = GetNodes();
     if (nodes.empty()) {
@@ -457,8 +695,8 @@ Url AlternatorLiveNodes::NextKnownNode() {
     return nodes[idx];
 }
 
-bool AlternatorLiveNodes::ShouldTryQuarantinedNode(bool active_nodes_empty) const {
-    const auto quarantined_nodes = GetQuarantinedNodes();
+bool AlternatorLiveNodes::ShouldTryQuarantinedNode(bool active_nodes_empty,
+                                                   const std::vector<Url>& quarantined_nodes) const {
     if (quarantined_nodes.empty()) {
         return false;
     }
@@ -474,17 +712,16 @@ bool AlternatorLiveNodes::ShouldTryQuarantinedNode(bool active_nodes_empty) cons
     return attempt % interval == 0;
 }
 
-Url AlternatorLiveNodes::NextQuarantinedNode() const {
-    auto nodes = GetQuarantinedNodes();
-    if (nodes.empty()) {
+Url AlternatorLiveNodes::NextQuarantinedNode(const std::vector<Url>& quarantined_nodes) const {
+    if (quarantined_nodes.empty()) {
         return {};
     }
-    const auto idx = quarantine_node_index_.fetch_add(1, std::memory_order_relaxed) % nodes.size();
-    return nodes[idx];
+    const auto idx = quarantine_node_index_.fetch_add(1, std::memory_order_relaxed) % quarantined_nodes.size();
+    return quarantined_nodes[idx];
 }
 
 Url AlternatorLiveNodes::StickyQuarantinedNodeForHash(std::int64_t hash, const std::vector<Url>& active_nodes) const {
-    auto quarantined_nodes = GetQuarantinedNodes();
+    auto quarantined_nodes = GetQuarantinedKeyRouteAffinityNodes();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -501,11 +738,11 @@ Url AlternatorLiveNodes::StickyQuarantinedNodeForHash(std::int64_t hash, const s
         }
     }
 
-    if (!ShouldTryQuarantinedNode(active_nodes.empty())) {
+    if (!ShouldTryQuarantinedNode(active_nodes.empty(), quarantined_nodes)) {
         return {};
     }
 
-    quarantined_nodes = GetQuarantinedNodes();
+    quarantined_nodes = GetQuarantinedKeyRouteAffinityNodes();
     if (quarantined_nodes.empty()) {
         return {};
     }

@@ -74,6 +74,7 @@ public:
     void RemoveNode(const Url& node);
     void ReportNodeResult(const Url& node, NodeHealthObservation observation);
     std::vector<Url> ProbeDownNodes(const DownProbe& probe);
+    std::vector<Url> ProbeDownCandidates(const DownProbe& probe, const std::vector<Url>& candidates);
 
 private:
     [[nodiscard]] std::vector<Url> GetNodesByState(NodeHealthState state) const;
