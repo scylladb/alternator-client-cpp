@@ -360,6 +360,51 @@ auto plan = helper.NewPartitionKeyQueryPlan(
 auto preferred = plan.Next();
 ```
 
+When affinity is enabled and the configured scope chain contains a rack restriction, eligible writes use a separate
+membership view. Each rack restriction becomes its datacenter, preserving the complete explicit fallback chain and order.
+For example, `rack(A,r1) -> rack(B,r2) -> cluster` becomes `DC(A) -> DC(B) -> cluster`. No implicit fallback is added.
+Named datacenters are discovered through `/localnodes?dc=<configured-dc>`; other datacenters stay excluded while the
+preferred datacenter is usable. The built-in affinity prefix is resolved at initialization. A custom fallback is resolved
+only when affinity discovery needs that occurrence, then newly reached built-ins are widened in order. Resolved links
+are reused, while repeated occurrences of the same custom object remain separate. A nonterminating custom tail can
+still fail to terminate when discovery needs it. Equivalent built-in queries with the same seed aggregation are
+deduplicated in first-occurrence order. Matching ordinary discovery results, including empty responses,
+are reused within each refresh attempt; later refreshes retry discovery.
+Configurations whose reached scope chain has no rack restriction retain their existing routing behavior, as does
+disabled affinity. A successful ordinary refresh that reaches a built-in rack through custom fallbacks activates
+the derived affinity view.
+
+After successful DC discovery, clients in different racks choose the same single-key affinity and batch-voting
+coordinators when their usable candidate membership, including local health observations, matches.
+Non-affinity requests continue to use ordinary scoped routing. Startup and discovery
+failures retain seed/rack fallback before the first usable affinity discovery. After successful discovery, affinity-only
+failures retain the exact previous affinity snapshot while explicit affinity fallbacks remain available. Ordinary
+membership is never merged into that snapshot. Requests do not wait for affinity readiness.
+
+Custom `NodesSource` implementations that provide a separate affinity domain supply both
+`GetActiveKeyRouteAffinityNodes()` for active hashing and voting membership and
+`GetQueryPlanNodesForHash()` for that hash's affinity candidates. For example, a custom source
+without quarantine sampling can implement the pair as follows:
+
+```cpp
+std::vector<Url> MyNodesSource::GetActiveKeyRouteAffinityNodes() const {
+    return affinity_nodes_;
+}
+
+std::vector<Url> MyNodesSource::GetQueryPlanNodesForHash(std::int64_t hash) const {
+    (void)hash;
+    return affinity_nodes_;
+}
+```
+
+Keep ordinary `GetActiveNodes()` and `GetQueryPlanNodes()` in the ordinary routing domain.
+The per-hash getter may also include eligible quarantined affinity candidates; candidates outside
+the active affinity set are tried before its hashed order. Ordinary fallback applies only when
+both active affinity and hash-specific candidates are empty. Existing sources retain their
+defaults: the active-affinity getter calls `GetActiveNodes()`, while the per-hash getter calls
+`GetQueryPlanNodes()`. Overriding only the active-affinity getter does not replace inherited
+per-hash candidates. `AlternatorLiveNodes` already supplies both affinity getters.
+
 The AWS helper can discover missing table partition-key names automatically. When an affinity plan needs metadata that is
 not cached yet, the helper starts one background `DescribeTable` lookup for that table and returns a normal non-affinity
 query plan for the current request. Later requests use the discovered HASH key name once the lookup completes. Configure

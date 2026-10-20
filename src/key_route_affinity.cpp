@@ -199,14 +199,11 @@ std::vector<Url> QueryPlanNodesForHashes(const NodesSource& nodes, const std::ve
     for (const auto hash : hashes) {
         AppendMissingNodes(out, nodes.GetQueryPlanNodesForHash(hash));
     }
-    if (out.empty()) {
-        return nodes.GetQueryPlanNodes();
-    }
     return out;
 }
 
 std::vector<Url> AffinityNodes(const NodesSource& nodes) {
-    auto active_nodes = nodes.GetActiveNodes();
+    auto active_nodes = nodes.GetActiveKeyRouteAffinityNodes();
     if (!active_nodes.empty()) {
         return SortAndDedupeNodes(std::move(active_nodes));
     }
@@ -267,9 +264,12 @@ QueryPlan QueryPlanForPartitionKey(const NodesSource& nodes,
                                    const std::string& table_name,
                                    const PartitionKeyMetadata& metadata) {
     const auto seed = HashPartitionKey(values, table_name, metadata);
-    auto active_nodes = nodes.GetActiveNodes();
+    auto active_nodes = nodes.GetActiveKeyRouteAffinityNodes();
     auto query_plan_nodes = nodes.GetQueryPlanNodesForHash(seed);
     if (active_nodes.empty()) {
+        if (query_plan_nodes.empty()) {
+            query_plan_nodes = nodes.GetQueryPlanNodes();
+        }
         return QueryPlan::WithSortedSeed(std::move(query_plan_nodes), seed);
     }
 
@@ -288,9 +288,12 @@ std::vector<Url> SelectBatchWritePreferredNodes(const NodesSource& nodes,
 QueryPlan QueryPlanForBatchWrite(const NodesSource& nodes,
                                  const std::vector<BatchWriteOperation>& operations,
                                  const PartitionKeyMetadata& metadata) {
-    auto active_nodes = nodes.GetActiveNodes();
+    auto active_nodes = nodes.GetActiveKeyRouteAffinityNodes();
     auto query_plan_nodes = QueryPlanNodesForHashes(nodes, BatchWriteHashes(operations, metadata));
     if (active_nodes.empty()) {
+        if (query_plan_nodes.empty()) {
+            query_plan_nodes = nodes.GetQueryPlanNodes();
+        }
         auto candidate_nodes = std::move(query_plan_nodes);
         return QueryPlan::WithPreferredNodes(
             candidate_nodes,
