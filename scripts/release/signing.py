@@ -308,7 +308,8 @@ def verify_tag(tag, commit=None):
         raise SigningError("Release tags must be signed annotated tags.")
     if run(["git", "for-each-ref", "--format=%(tag)", ref]).strip() != tag:
         raise SigningError("Signed release tag name does not match the requested name.")
-    if commit is not None and run(["git", "rev-parse", ref + "^{commit}"]).strip() != commit:
+    actual_commit = run(["git", "rev-parse", ref + "^{commit}"]).strip()
+    if commit is not None and actual_commit != commit:
         raise SigningError("Release tag points to an unexpected commit.")
     verify_git("tag", ref)
 
@@ -316,7 +317,7 @@ def verify_tag(tag, commit=None):
 def sign_files(files, signing_env=None):
     if not files:
         raise SigningError("At least one release artifact is required.")
-    artifacts = [Path(filename).resolve() for filename in files]
+    artifacts = [Path(filename).absolute() for filename in files]
     if any(not artifact.is_file() or artifact.suffix == ".asc" for artifact in artifacts):
         raise SigningError("Expected an unsigned release artifact.")
     if signing_env is None and any(

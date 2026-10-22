@@ -18,10 +18,12 @@ certifies the signing subkey and remains offline.
 
 Local `make release-tag` and internal `_release-tag` calls require the authenticated
 `gh` account `scylladb-publisher` before importing credentials or creating tags;
-switch accounts with `gh auth switch` if needed. Local Make dry runs use the same
-policy. Actions operators are authorized separately by the protected `release`
-environment. Approved maintainers can dispatch or rerun workflows without being
-the publisher account; signatures still use the pinned publisher subkey.
+switch accounts with `gh auth switch` if needed. Local Make dry runs check the
+account and version without opening signing credentials. Actions release commands
+and publication require `scylladb-publisher` as the effective initiator:
+`GITHUB_TRIGGERING_ACTOR`, falling back to `GITHUB_ACTOR` when unset or empty.
+This also checks the operator who requests a rerun. The protected `release`
+environment requires approval independently of that account check.
 `GITHUB_ACTIONS=true` only selects this policy branch; it does not prove approval.
 Public verification needs no account check. The local CLI identity does not
 establish which credentials a later Git push will use.
@@ -31,8 +33,12 @@ only the protected signing subkey, checks that primary private material is absen
 and verifies a fresh-agent signing preflight against the pinned public certificate.
 Anonymous pipes supply the key export and passphrase; the helper does not stage
 either input in a temporary file or command-line argument. Imported keys stay in
-the temporary keyring. Git configuration applies only to the command and its
-children, including cloned checkouts. Existing runtime Git settings are preserved.
+the temporary keyring. These pipes protect delivery to GnuPG; wrapped commands
+and their descendants inherit `RELEASE_GPG_PASSPHRASE` or
+`RELEASE_GPG_PASSPHRASE_FILE` and can read the passphrase or its file. Treat all
+commands run through `signing.py exec` as trusted recipients of those inputs.
+Git configuration applies only to the command and its children, including cloned
+checkouts. Existing runtime Git settings are preserved.
 Recursive Make cannot restore the consumed private-key inputs from command-line
 overrides. Temporary keyrings are removed on success, failure, or catchable
 cancellation, without changing checkout configuration or writing state to
@@ -72,8 +78,9 @@ Agent-shutdown failures produce a fixed warning without replacing that status.
 Helper failures report a fixed operation label and exit status or error category,
 without including command arguments, captured output, or exception payloads.
 Wrapped commands inherit stdout/stderr directly; this helper does not sanitize
-arbitrary build output. Commands receiving a passphrase must not print it or
-enable shell tracing.
+arbitrary build output. Wrapped commands must not print the inherited passphrase
+inputs or file contents, dump their environment, or enable shell tracing that
+exposes credentials.
 Run `make test-release-signing` to exercise signing with disposable keys.
 
 Direct artifact signing uses the same isolated session and credential inputs:
@@ -82,9 +89,10 @@ Direct artifact signing uses the same isolated session and credential inputs:
 python3 scripts/release/signing.py sign-files package.tar.gz SHA256SUMS
 ```
 
-Existing signatures are verified and reused without overwriting them. If every
-signature already exists, verification requires only public material. When using
-the Python API inside an existing session, pass its environment explicitly as
+Signatures use `FILE.asc` beside the supplied artifact path, including when that
+path is a symlink. Existing signatures are verified and reused without overwriting
+them. If every signature already exists, verification requires only public material.
+When using the Python API inside an existing session, pass its environment explicitly as
 `sign_files(files, signing_env)`.
 
 Consumers should obtain this public certificate from this repository at a reviewed
@@ -158,8 +166,8 @@ copies only after the migration and an approved rehearsal succeed. The current
 workflow does not import private material and cannot exercise that migration.
 
 Tests cover real Make/GPG/Git signing with disposable credentials, artifact
-tampering, maintainer dispatch/reruns, failure cleanup, and cancellation. They
-preserve persistent Git settings and verify temporary keyring removal. They do
+tampering, publisher authorization and reruns, failure cleanup, and cancellation.
+They preserve persistent Git settings and verify temporary keyring removal. They do
 not dispatch a real approved GitHub release or upload artifacts. Release-signing
 tests run in pull-request CI.
 

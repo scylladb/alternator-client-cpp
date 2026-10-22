@@ -88,15 +88,16 @@ clean:
 
 .PHONY: release-check-user release-check-version release-tag _release-tag release-verify-tag test-release-signing
 
-# Local policy is separate from the protected Actions environment and signer.
+# Require the effective publisher account before importing credentials or publishing.
 release-check-user:
 	+@set -eu; \
 	if [ "$${GITHUB_ACTIONS:-}" = true ]; then \
-		exit 0; \
-	fi; \
-	if ! user=$$(gh api user --jq .login); then \
-		echo "Release requires GitHub user scylladb-publisher. Run gh auth login or gh auth switch." >&2; \
-		exit 1; \
+		user=$${GITHUB_TRIGGERING_ACTOR:-$${GITHUB_ACTOR:-}}; \
+	else \
+		if ! user=$$(gh api user --jq .login); then \
+			echo "Release requires GitHub user scylladb-publisher. Run gh auth login or gh auth switch." >&2; \
+			exit 1; \
+		fi; \
 	fi; \
 	if [ "$$user" != scylladb-publisher ]; then \
 		echo "Release requires GitHub user scylladb-publisher (current: $$user)." >&2; \
@@ -111,18 +112,17 @@ release-check-version:
 	number='(0|[1-9][0-9]*)'; \
 	printf '%s\n' "$$version" | grep -Eq "^$$number\.$$number\.$$number(-(alpha|beta|rc)\.$$number)?$$" || invalid
 
-release-tag: release-check-user release-check-version
-	+python3 scripts/release/signing.py exec $(MAKE) _release-tag
+release-tag: _release-tag
 
 _release-tag: release-check-user release-check-version
-	@set -eu; \
+	@python3 scripts/release/signing.py exec sh -ec '\
 	: "$${RELEASE_VERSION:?Set RELEASE_VERSION to the version to release}"; \
 	commit=$$(git rev-parse HEAD); \
 	tag="v$$RELEASE_VERSION"; \
 	if ! git show-ref --verify --quiet "refs/tags/$$tag"; then \
 		git tag -s "$$tag" -m "Release $$tag" "$$commit"; \
 	fi; \
-	python3 scripts/release/signing.py verify-tag "$$tag" "$$commit"
+	python3 scripts/release/signing.py verify-tag "$$tag" "$$commit"'
 
 # Public verification is available to every consumer without signing credentials.
 release-verify-tag:

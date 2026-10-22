@@ -214,6 +214,20 @@ class SigningTests(unittest.TestCase):
             with self.assertRaisesRegex(signing.SigningError, "unexpected commit"):
                 signing.verify_tag("v1.0.0", signing.run(["git", "rev-parse", "HEAD"]).strip())
 
+    def test_public_tag_verification_requires_commit_resolution(self):
+        with self.repository():
+            blob = signing.run(["git", "hash-object", "-w", "--stdin"], input="artifact").strip()
+            with self.session():
+                for kind, target in [("tree", "HEAD^{tree}"), ("blob", blob)]:
+                    signing.run(["git", "tag", "-s", "-m", kind, "v1.0.0-" + kind, target])
+                self.release()
+                signing.run(["git", "tag", "-s", "-m", "Nested", "v1.0.1", "v1.0.0"])
+            for kind in ["tree", "blob"]:
+                with self.subTest(kind=kind), self.assertRaises(signing.SigningError):
+                    signing.verify_tag("v1.0.0-" + kind)
+            signing.verify_tag("v1.0.1")
+            signing.verify_tag("v1.0.1", signing.run(["git", "rev-parse", "HEAD"]).strip())
+
     def test_renamed_signed_tag_rejected(self):
         with self.repository(), self.session():
             self.release()
@@ -243,6 +257,27 @@ class SigningTests(unittest.TestCase):
             files[0].write_bytes(b"changed package")
             with self.assertRaises(signing.SigningError):
                 signing.sign_files(files, os.environ)
+
+    def test_symlink_artifact_sidecar_creation_reuse_and_tamper(self):
+        with self.repository() as directory:
+            target = directory / "package.tar.gz"
+            target.write_bytes(b"package")
+            artifact = Path("release.tar.gz")
+            artifact.symlink_to(target)
+            signature = Path("release.tar.gz.asc")
+            signing.sign_files([artifact])
+            self.assertTrue(signature.is_file())
+            self.assertFalse(Path(str(target) + ".asc").exists())
+            previous = signature.read_bytes()
+            del os.environ["RELEASE_GPG_PRIVATE_KEY_FILE"]
+            del os.environ["RELEASE_GPG_PASSPHRASE"]
+            signing.sign_files([artifact])
+            self.assertEqual(signature.read_bytes(), previous)
+            target.write_bytes(b"tampered package")
+            with self.assertRaises(signing.SigningError):
+                signing.sign_files([artifact])
+            self.assertEqual(signature.read_bytes(), previous)
+            self.assertFalse(Path(str(target) + ".asc").exists())
 
     def test_direct_artifact_signing_uses_session_and_reuses_publicly(self):
         with self.repository() as directory:
@@ -375,8 +410,6 @@ class SigningTests(unittest.TestCase):
         with self.make_repository() as directory:
             commit = signing.run(["git", "rev-parse", "HEAD"]).strip()
             config = Path(".git/config").read_bytes()
-            signing.run(["make", "-n", "release-tag"])
-            self.assertEqual(signing.run(["git", "tag", "--list", "v1.0.0"]), "")
             signing.run(["make", "release-tag"])
             signing.verify_tag("v1.0.0", commit)
             tag = signing.run(["git", "cat-file", "tag", "refs/tags/v1.0.0"])
@@ -398,15 +431,64 @@ class SigningTests(unittest.TestCase):
             self.assertEqual(signing.run(["git", "cat-file", "tag", "refs/tags/v1.0.0"]), tag)
             self.assertFalse(list(directory.glob("release-signing-*")))
 
-    def test_make_allows_approved_operators_and_reruns_with_pinned_signer(self):
-        with self.make_repository():
+    def test_make_dry_run_needs_no_credentials_or_gpg(self):
+        with self.make_repository() as directory:
+            tools = directory / "tools"
+            tools.mkdir()
+            marker = directory / "gpg-access"
+            for name in ["gpg", "gpgconf"]:
+                tool = tools / name
+                tool.write_text('#!/bin/sh\ntouch "$GPG_ACCESS"\nexit 99\n')
+                tool.chmod(0o700)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("RELEASE_GPG_")}
+            env.update(PATH=str(tools) + os.pathsep + env["PATH"], GPG_ACCESS=str(marker))
+            refs = signing.run(["git", "show-ref", "--head"])
+            for target in ["release-tag", "_release-tag"]:
+                with self.subTest(target=target):
+                    output = signing.run(["make", "-n", target], env=env)
+                    self.assertIn("signing.py exec", output)
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(signing.run(["git", "show-ref", "--head"]), refs)
+                    self.assertFalse(list(directory.glob("release-signing-*")))
+
+    def test_internal_make_target_validates_session_before_tag_creation(self):
+        with self.make_repository() as directory:
+            signing.run(["git", "config", "user.name", "Other signer"])
+            signing.run(["git", "config", "user.email", "other@example.invalid"])
+            signing.run(["git", "config", "user.signingkey", self.unprotected_subkey + "!"])
+            env = {**os.environ, "GNUPGHOME": str(self.unprotected_home)}
+            del env["RELEASE_GPG_PRIVATE_KEY_FILE"]
+            config = Path(".git/config").read_bytes()
+            result = subprocess.run(["make", "_release-tag"], env=env,
+                                    capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("signing-subkey export", result.stderr)
+            self.assertEqual(signing.run(["git", "tag", "--list"]), "")
+            env["RELEASE_GPG_PRIVATE_KEY_FILE"] = str(self.private)
+            signing.run(["make", "_release-tag"], env=env)
+            signing.verify_tag("v1.0.0", signing.run(["git", "rev-parse", "HEAD"]).strip())
+            self.assertEqual(Path(".git/config").read_bytes(), config)
+            self.assertFalse(list(directory.glob("release-signing-*")))
+
+    def test_make_requires_effective_publisher_before_signing(self):
+        with self.make_repository() as directory:
             commit = signing.run(["git", "rev-parse", "HEAD"]).strip()
-            for actor, rerun in [("maintainer-one", ""), ("maintainer-one", "maintainer-two")]:
-                with self.subTest(actor=actor, rerun=rerun):
-                    env = {**os.environ, "GITHUB_ACTOR": actor, "GITHUB_TRIGGERING_ACTOR": rerun}
-                    signing.run(["make", "release-tag"], env=env)
-                    signing.verify_tag("v1.0.0", commit)
-                    signing.run(["make", "-n", "release-tag"], env=env)
+            for actor, rerun in [("maintainer-one", ""), ("scylladb-publisher", "maintainer-two")]:
+                for target in ["release-tag", "_release-tag"]:
+                    with self.subTest(actor=actor, rerun=rerun, target=target):
+                        env = {**os.environ, "GITHUB_ACTOR": actor, "GITHUB_TRIGGERING_ACTOR": rerun,
+                               "RELEASE_GPG_PRIVATE_KEY_FILE": str(directory / "absent")}
+                        result = subprocess.run(["make", target], env=env,
+                                                capture_output=True, text=True, timeout=60)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("current: " + (rerun or actor), result.stderr)
+                        self.assertNotIn("signing.py exec", result.stdout)
+                        self.assertEqual(signing.run(["git", "tag", "--list"]), "")
+                        self.assertFalse(list(directory.glob("release-signing-*")))
+            signing.run(["make", "release-tag"], env={**os.environ,
+                        "GITHUB_ACTOR": "maintainer-one", "GITHUB_TRIGGERING_ACTOR": "scylladb-publisher"})
+            signing.verify_tag("v1.0.0", commit)
 
     def test_recursive_make_does_not_restore_consumed_credentials(self):
         with self.make_repository():
@@ -559,8 +641,14 @@ class DiagnosticTests(unittest.TestCase):
 
 
 class ReleaseUserTests(unittest.TestCase):
-    def test_actions_operators_are_independent_of_publisher(self):
-        for actor, triggering_actor in [("maintainer-one", ""), ("maintainer-one", "maintainer-two")]:
+    def test_actions_requires_effective_publisher(self):
+        for actor, triggering_actor, allowed in [
+                ("scylladb-publisher", "", True),
+                ("scylladb-publisher", "scylladb-publisher", True),
+                ("maintainer-one", "scylladb-publisher", True),
+                ("maintainer-one", "", False),
+                ("scylladb-publisher", "maintainer-two", False),
+                ("", "", False)]:
             for flags in [[], ["-n"]]:
                 with self.subTest(actor=actor, triggering_actor=triggering_actor, flags=flags):
                     result = subprocess.run(["make", *flags, "release-check-user"], cwd=ROOT,
@@ -568,7 +656,15 @@ class ReleaseUserTests(unittest.TestCase):
                                             env={**os.environ, "GITHUB_ACTIONS": "true",
                                                  "GITHUB_ACTOR": actor,
                                                  "GITHUB_TRIGGERING_ACTOR": triggering_actor})
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.returncode == 0, allowed, result.stderr)
+
+    def test_publication_workflow_calls_account_gate_before_verification(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("    environment: release\n", workflow)
+        gate = workflow.index("        run: make release-check-user\n")
+        self.assertLess(workflow.index("      - name: Checkout code\n"), gate)
+        self.assertLess(gate, workflow.index("      - name: Verify repository release tag\n"))
+        self.assertLess(gate, workflow.index("      - name: Create GitHub Release\n"))
 
     def test_local_release_uses_authenticated_gh_user(self):
         with tempfile.TemporaryDirectory() as temp:
