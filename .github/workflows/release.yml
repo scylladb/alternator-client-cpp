@@ -17,7 +17,7 @@ name: Publish Release Notes
 on:
   push:
     tags:
-      - 'v[0-9]+\.[0-9]+\.[0-9]+*'  # Triggers on version tags like v1.0.0
+      - 'v[0-9]+.[0-9]+.[0-9]+*'  # Triggers on version tags like v1.0.0
   workflow_dispatch:
     inputs:
       target-tag:
@@ -31,31 +31,31 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Provision required reviewers and launch-ref restrictions before publishing.
+    environment: release
 
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-
-      - name: Checkout target tag
-        if: ${{ inputs.target-tag != '' }}
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ inputs.target-tag }}
+          fetch-depth: 0
 
-      - name: Create GitHub Release for ${{ inputs.target-tag }}
-        if: ${{ inputs.target-tag != '' }}
+      - name: Preserve repository signing policy
         run: |
-          gh release create "${{ inputs.target-tag }}" \
-            --generate-notes \
-            --title "${{ inputs.target-tag }}"
+          mkdir -m 700 "$RUNNER_TEMP/release-signing-policy"
+          cp scripts/release/signing.py scripts/release/publisher.asc "$RUNNER_TEMP/release-signing-policy/"
+
+      - name: Verify repository release tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.target-tag || github.ref_name }}
+        run: python3 "$RUNNER_TEMP/release-signing-policy/signing.py" verify-tag "$RELEASE_TAG"
 
       - name: Create GitHub Release
-        if: ${{ inputs.target-tag == '' }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             --generate-notes \
-            --title "$GITHUB_REF_NAME"
+            --title "$RELEASE_TAG" \
+            --verify-tag
         env:
+          RELEASE_TAG: ${{ inputs.target-tag || github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
