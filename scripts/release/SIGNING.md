@@ -42,8 +42,11 @@ checkouts. Existing runtime Git settings are preserved.
 Recursive Make cannot restore the consumed private-key inputs from command-line
 overrides. Temporary keyrings are removed on success, failure, or catchable
 cancellation, without changing checkout configuration or writing state to
-`GITHUB_ENV`. Owned command groups are stopped before keyring cleanup. Commands
-that create separate process sessions must manage those sessions themselves.
+`GITHUB_ENV`. Guarded commands require Linux with `/proc`. The guard temporarily
+acts as a child subreaper, tracks descendants across new process sessions and
+double forks, and stops/reaps them before keyring cleanup. It preserves existing
+children and restores the caller's original subreaper setting. If ownership cannot
+be established, it refuses to start the command.
 Runner cleanup is still needed after an uncatchable kill or machine failure.
 
 For maintainer-driven tag creation:
@@ -77,10 +80,21 @@ A failed command propagates its exit status and still cleans up the session.
 Agent-shutdown failures produce a fixed warning without replacing that status.
 Helper failures report a fixed operation label and exit status or error category,
 without including command arguments, captured output, or exception payloads.
-Wrapped commands inherit stdout/stderr directly; this helper does not sanitize
-arbitrary build output. Wrapped commands must not print the inherited passphrase
-inputs or file contents, dump their environment, or enable shell tracing that
-exposes credentials.
+Wrapped commands run through `guard.py`: stdout and stderr are captured separately
+in bounded memory (8 MiB combined), then sanitized before either stream is printed
+or saved. Known credential values, input-file paths, keyring/wrapper paths, and
+their base64, hexadecimal, URL, JSON and shell-escaped forms are redacted. Raw
+command output is never spooled to disk. Set `RELEASE_LOG_DIR` to save sanitized
+`stdout.log` and `stderr.log`, including after command failure or cancellation.
+Overflow or incomplete capture withholds the streams and fails a successful
+command. Log-write failures also fail success, while preserving a command's
+nonzero status or cancellation. Credential-bearing argv, shell tracing and common
+debug/trace modes are rejected before private-key import. Guard errors disclose
+only fixed diagnostics.
+
+The guard is not a sandbox or a defense against deliberately transformed or
+exfiltrated credentials. Commands still receive the passphrase inputs and must be
+trusted. Do not print credentials, dump the environment, or enable tracing.
 Run `make test-release-signing` to exercise signing with disposable keys.
 
 Direct artifact signing uses the same isolated session and credential inputs:
@@ -126,20 +140,42 @@ following the repository's recovery instructions.
 
 ## Current release path
 
-The release-notes workflow verifies existing annotated tags with this certificate;
-it does not import a private key or create version commits. Maintainers create
+The normal release-notes path verifies existing annotated tags with this certificate;
+it does not import a private key or create version commits. The protected rehearsal
+mode imports the environment subkey only for its isolated signing preflight. Maintainers create
 release tags through `make release-tag` above. No release or development commits
 are prepared, so there is no new commit range to verify. The existing tagged
 commit need not be signed by the release key. Artifact uploads and Maven
 prepare/perform stages are outside this release path.
 
-The validation job uses the launch revision's helper and public certificate to
-verify the requested tag from fetched refs without checking out historical build
-code. After validation succeeds, the release environment requests approval. A
-separate publication job starts on a fresh runner, checks the same launch revision
-and the validated tag object again, then publishes release notes. Dispatch input
-selects an existing tag name, never a preceding commit or a replacement tag. A failed
-signature check blocks publication.
+The validation job runs the launch revision's release helper/guard tests and uses
+its public certificate to verify the requested tag. It records the exact tag
+object and target commit. A separate, read-only invocation of the existing C++
+test workflow checks out that recorded commit and runs build, license/lint, unit
+and integration checks. It receives no production signing secrets and has no
+deployment environment. Selected source code executes only on validation runners.
+
+Only after both validations succeed does the `release` environment request
+approval. A fresh publication runner checks out the launch revision's trusted
+tools, checks the same tag object and commit, and repeats public verification.
+There is no workspace, build-output or cache handoff into this runner. It checks
+the remote tag object again immediately before creating release notes with
+`--verify-tag`. Dispatch input selects an existing tag, never a preceding commit
+or replacement tag. Failed/cancelled/skipped validation prevents publication and
+approval. External tag immutability remains required to close concurrent remote
+updates; no sequence of client-side checks makes tag mutation atomic with the
+GitHub Release API.
+
+For an upload-free rehearsal after merge, dispatch `release.yml` from an allowed
+launch ref (normally `main`), select an existing repository-signed `target-tag`,
+and set `dry-run=true`. The same helper and exact-source C++ validation runs first.
+After approval, the protected job uses the environment secret pair for a fresh,
+isolated signing preflight and independent public verification, stops the agent,
+and removes its temporary keyring. It uploads only sanitized command logs and
+never calls `gh release create`, uploads packages, creates/replaces tags or pushes
+commits. This is distinct from `make -n release-tag`, which only prints a local
+recipe. A successful rehearsal still requires real GitHub approval; adding this
+mode does not establish that one has run.
 
 ## Deployment protection and rollout
 
@@ -162,13 +198,17 @@ Configure the corresponding release-tag ruleset as described below. YAML's
 Recheck the environment settings before releasing; local tests and API readback
 do not replace a real approved workflow rehearsal.
 
-If CI signing is added, provision the environment secret pair first, gate every
-signing or publishing job, then migrate the workflow. Remove repository-level
-copies only after the migration and an approved rehearsal succeed. The current
-workflow does not import private material and cannot exercise that migration.
+The protected rehearsal now exercises environment-scoped signing on a fresh
+runner. Keep every future signing or publishing job behind the same environment.
+Remove repository-level secret copies only after the environment-aware workflow
+has landed and an approved rehearsal succeeds. Until then, migration remains
+incomplete; the existence of this rehearsal mode is not evidence that it ran.
 
 Tests cover real Make/GPG/Git signing with disposable credentials, artifact
-tampering, publisher authorization and reruns, failure cleanup, and cancellation.
+tampering, publisher authorization and reruns, failure cleanup, cancellation,
+detached descendants, bounded/redacted logs, and the exact workflow shell blocks
+against a bare remote and fresh checkout. They reject moved/unsigned tag objects
+and prevent publication after the remote target changes.
 They preserve persistent Git settings and verify temporary keyring removal. They do
 not dispatch a real approved GitHub release or upload artifacts. Release-signing
 tests run in pull-request CI.
@@ -186,3 +226,39 @@ inside that workflow, or adding an environment check only to its current version
 does not prevent that bypass. Dispatching an old or modified workflow has the same
 limitation. The environment does not configure the separate release-tag ruleset;
 the workflow is not an independent security boundary against authorized tag creators.
+
+## Recovery from a partial release
+
+Stop concurrent release runs before recovery. Preserve the original tag name,
+signed object ID, target commit and Actions run URL. Never delete, move, re-sign or
+force-push a published tag to make a retry pass. Never remove old public keys or
+credentials as part of an unverified recovery.
+
+* If local `release-tag` failed, verify the existing local tag with
+  `RELEASE_TAG=vX.Y.Z make release-verify-tag` and confirm its commit equals the
+  intended source. Rerunning `make release-tag` reuses it only when both its
+  signature and commit match. A mismatch requires investigation, not replacement.
+* If the tag was pushed but validation failed, fix the validation problem first.
+  Dispatch the workflow from the reviewed allowed launch ref with that same tag;
+  its unchanged object and source undergo fresh validation before approval. An
+  intentional source change requires a new version/tag.
+* If approval was rejected/cancelled or the protected job failed before release
+  creation, confirm the remote tag is unchanged and check whether a GitHub Release
+  already exists before rerunning. A rerun is still subject to publisher identity,
+  validation dependencies and environment approval. Use a new dispatch when the
+  previous validation or launch tools are no longer suitable.
+* If creation timed out or its result is uncertain, first inspect
+  `gh release view vX.Y.Z --repo scylladb/alternator-client-cpp` and the remote tag
+  object. If the intended published release already exists, treat creation as
+  complete; do not rerun `gh release create`. Review its tag, notes and draft state
+  manually. A conflicting or draft release needs an explicit maintainer decision;
+  this workflow does not overwrite or automatically publish it.
+* If no release exists and the signed remote tag still matches the retained object
+  and commit, a new dispatch can safely repeat validation/approval and attempt
+  creation. Do not infer absence from an authentication, network or API error.
+* A failed rehearsal publishes nothing. Correct the reported issue and repeat the
+  rehearsal with the same immutable tag. Keep its approval and sanitized-log
+  evidence before retiring repository-level signing-secret copies.
+
+The current path has no package upload or prepared version commits to reconcile.
+If either is added, define its destination-specific recovery before enabling it.

@@ -19,6 +19,12 @@ on:
     branches: [ main ]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Exact source commit selected by release validation
+        required: true
+        type: string
 
 defaults:
   run:
@@ -40,6 +46,21 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Preserve trusted command guard
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp scripts/release/guard.py scripts/release/signing.py "$RUNNER_TEMP/release-tools/"
+
+      - name: Checkout validated release source
+        if: inputs.source-ref != ''
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -67,7 +88,10 @@ jobs:
 
       - name: Build AWS SDK for C++
         if: steps.cache-aws-sdk.outputs.cache-hit != 'true'
+        env:
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/aws-sdk
         run: |
+          python3 "$RUNNER_TEMP/release-tools/guard.py" run sh -ec '
           git clone \
             --branch "$AWS_SDK_CPP_VERSION" \
             --depth 1 \
@@ -85,24 +109,43 @@ jobs:
             -DBUILD_DEPS=ON
           cmake --build .deps/aws-sdk-cpp-build --parallel 2
           cmake --install .deps/aws-sdk-cpp-build
+          '
 
       - name: Run build
+        env:
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/build
         run: |
-          make build
+          python3 "$RUNNER_TEMP/release-tools/guard.py" run make build
 
       - name: Run linters
+        env:
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/check
         run: |
-          make check
+          python3 "$RUNNER_TEMP/release-tools/guard.py" run make check
 
       - name: Run unit tests
+        env:
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/unit
         run: |
-          make test-unit
+          python3 "$RUNNER_TEMP/release-tools/guard.py" run make test-unit
 
       - name: Run integration tests
+        env:
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/integration
         run: |
-          make test-integration
+          python3 "$RUNNER_TEMP/release-tools/guard.py" run make test-integration
 
       - name: Stop Scylla
         if: always()
+        env:
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/cleanup
         run: |
-          make scylla-stop
+          python3 "$RUNNER_TEMP/release-tools/guard.py" run make scylla-stop
+
+      - name: Upload sanitized validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: validation-logs-${{ github.job }}
+          path: ${{ runner.temp }}/release-logs/**/*.log
+          if-no-files-found: ignore

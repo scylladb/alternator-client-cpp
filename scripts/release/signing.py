@@ -23,12 +23,12 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
+
+import guard
 
 PRIMARY = "04E63A9B9DC6BCE2BA182CBFB1F1949F8B9A0FC6"
 SIGNING = "15F46DE2ED437CB62E4C6F4BBA5DD9E6771F70D5"
 PUBLIC_KEY = Path(__file__).with_name("publisher.asc")
-TERMINATION_GRACE = 2
 
 
 class SigningError(ValueError):
@@ -193,47 +193,14 @@ def session_signals():
         interrupted.check()
 
 
-def execute(command, env):
+def execute(command, env, sensitive_env=None):
     with session_signals() as interrupted:
-        process = None
         try:
-            interrupted.check()
-            try:
-                process = subprocess.Popen(command, env=env, start_new_session=True)
-            except OSError:
-                raise SigningError(command_operation(command) + " could not start (OS error).") from None
-            while True:
-                interrupted.check()
-                try:
-                    status = process.wait(timeout=0.1)
-                except subprocess.TimeoutExpired:
-                    continue
-                interrupted.check()
-                return status if status >= 0 else 128 - status
-        finally:
-            if process is not None:
-                # Stop lingering children even if the top-level command exited.
-                stop_process_group(process, interrupted.signum or signal.SIGTERM)
-
-
-def stop_process_group(process, signum):
-    try:
-        os.killpg(process.pid, signum)
-    except ProcessLookupError:
-        process.wait()
-        return
-    deadline = time.monotonic() + TERMINATION_GRACE
-    try:
-        process.wait(timeout=TERMINATION_GRACE)
-    except subprocess.TimeoutExpired:
-        pass
-    # Make may exit before its children finish shutting down.
-    time.sleep(max(0, deadline - time.monotonic()))
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+            return guard.execute(command, env, interrupted, sensitive_env)
+        except guard.GuardError as error:
+            raise SigningError(str(error)) from None
+        except OSError:
+            raise SigningError("Command execution failed (OS error); values withheld.") from None
 
 
 @contextmanager
@@ -350,8 +317,10 @@ def main():
         elif len(sys.argv) > 2 and sys.argv[1] == "sign-files":
             sign_files(sys.argv[2:])
         elif len(sys.argv) > 2 and sys.argv[1] == "exec":
+            # Reject unsafe command modes before importing production material.
+            guard.check_command(sys.argv[2:], os.environ, guard.secret_forms(os.environ))
             with signing_session() as env:
-                return execute(sys.argv[2:], env)
+                return execute(sys.argv[2:], env, os.environ)
         else:
             raise SigningError("Expected verify-commit COMMIT, verify-tag TAG [COMMIT], sign-files FILE..., or exec COMMAND...")
         print("Release signing " + sys.argv[1] + " passed.")

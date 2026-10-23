@@ -129,4 +129,4 @@ release-verify-tag:
 	@python3 scripts/release/signing.py verify-tag "$${RELEASE_TAG:?Set RELEASE_TAG to the tag to verify}"
 
 test-release-signing:
-	python3 -m unittest discover -s scripts/release -p 'test_signing.py' -v
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/release -p 'test_*.py' -v

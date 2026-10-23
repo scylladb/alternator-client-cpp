@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest.mock import patch
@@ -398,7 +399,7 @@ class SigningTests(unittest.TestCase):
     @contextmanager
     def make_repository(self):
         with self.repository() as directory:
-            for name in ["Makefile", "scripts/release/signing.py"]:
+            for name in ["Makefile", "scripts/release/signing.py", "scripts/release/guard.py"]:
                 target = Path(name)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text((ROOT / name).read_text())
@@ -410,6 +411,68 @@ class SigningTests(unittest.TestCase):
             os.environ.update(GITHUB_ACTIONS="true", GITHUB_ACTOR="scylladb-publisher",
                               RELEASE_VERSION="1.0.0")
             yield directory
+
+    def workflow_script(self, name):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        step = workflow.split("      - name: " + name + "\n", 1)[1].split("\n      - ", 1)[0]
+        body = step.split("        run: |\n", 1)[1]
+        lines = []
+        for line in body.splitlines():
+            if line and not line.startswith("          "):
+                break
+            lines.append(line)
+        return textwrap.dedent("\n".join(lines))
+
+    def test_workflow_handoff_pins_signed_tag_and_rejects_remote_moves(self):
+        with self.make_repository() as directory:
+            signing.run(["make", "release-tag"])
+            outputs = directory / "outputs"
+            env = {**os.environ, "RELEASE_TAG": "v1.0.0", "GITHUB_OUTPUT": str(outputs)}
+            scripts = {name: self.workflow_script(name) for name in (
+                "Verify repository release tag", "Recheck validated release tag", "Create GitHub Release")}
+            subprocess.run(["sh", "-ec", scripts["Verify repository release tag"]],
+                           env=env, check=True, capture_output=True, timeout=30)
+            values = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
+            self.assertEqual(values["commit"], signing.run(["git", "rev-parse", "HEAD"]).strip())
+            env.update(EXPECTED_TAG_OBJECT=values["object"], EXPECTED_COMMIT=values["commit"])
+            remote = directory / "remote.git"
+            signing.run(["git", "init", "--bare", "--quiet", str(remote)])
+            signing.run(["git", "remote", "add", "origin", str(remote)])
+            signing.run(["git", "push", "origin", "HEAD:refs/heads/main", "refs/tags/v1.0.0"])
+            clone = directory / "publication"
+            signing.run(["git", "clone", "--quiet", "--no-checkout", str(remote), str(clone)])
+            signing.run(["git", "-C", str(clone), "checkout", "--detach", values["commit"]])
+            # Each fresh runner obtains trusted tools independently of the target source.
+            shutil.copytree(Path("scripts"), clone / "scripts")
+            gh = directory / "gh"
+            gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$PUBLICATION_RECORD"\n')
+            gh.chmod(0o700)
+            record = directory / "published"
+            env.update(PATH=str(directory) + os.pathsep + env["PATH"], PUBLICATION_RECORD=str(record))
+            for name in ("Recheck validated release tag", "Create GitHub Release"):
+                subprocess.run(["sh", "-ec", scripts[name]], cwd=clone, env=env,
+                               check=True, capture_output=True, timeout=30)
+            self.assertIn("--verify-tag", record.read_text())
+            record.unlink()
+            # Moving the remote after checkout must stop publication, even when
+            # the publication runner still holds the previously validated object.
+            signing.run(["git", "-C", str(remote), "update-ref", "refs/tags/v1.0.0", values["commit"]])
+            result = subprocess.run(["sh", "-ec", scripts["Create GitHub Release"]],
+                                    cwd=clone, env=env, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(record.exists())
+            # A moved object fetched on a fresh runner also fails the first recheck.
+            signing.run(["git", "-C", str(clone), "fetch", "--force", "origin",
+                         "refs/tags/v1.0.0:refs/tags/v1.0.0"])
+            result = subprocess.run(["sh", "-ec", scripts["Recheck validated release tag"]],
+                                    cwd=clone, env=env, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            # Object equality alone is insufficient: reject an unsigned object
+            # even if that unsigned object is supplied as the expected snapshot.
+            env["EXPECTED_TAG_OBJECT"] = values["commit"]
+            result = subprocess.run(["sh", "-ec", scripts["Recheck validated release tag"]],
+                                    cwd=clone, env=env, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
 
     def test_make_creates_and_reuses_tag_at_current_commit(self):
         with self.make_repository() as directory:
@@ -678,7 +741,26 @@ class ReleaseUserTests(unittest.TestCase):
         validation, publication = workflow.split("  release:\n", 1)
         self.assertIn("  validate:\n", validation)
         self.assertNotIn("environment: release", validation)
-        self.assertIn("    needs: validate\n", publication)
+        self.assertIn("    needs: [validate, validate-source]\n", publication)
+        self.assertIn("      - name: Test trusted release tools\n", validation)
+        self.assertIn("        run: make test-release-signing\n", validation)
+        self.assertIn("    uses: ./.github/workflows/tests.yml\n", validation)
+        self.assertIn("      source-ref: ${{ needs.validate.outputs.commit }}\n", validation)
+        reusable = (ROOT / ".github/workflows/tests.yml").read_text()
+        self.assertIn("  workflow_call:\n", reusable)
+        self.assertIn("          ref: ${{ inputs.source-ref }}\n", reusable)
+        self.assertLess(reusable.index("      - name: Preserve trusted command guard\n"),
+                        reusable.index("      - name: Checkout validated release source\n"))
+        for command in ("make build", "make check", "make test-unit", "make test-integration"):
+            self.assertIn(command, reusable)
+        self.assertNotIn("secrets.", validation + reusable)
+        self.assertNotIn("environment: release", reusable)
+        self.assertNotIn("actions/cache", publication)
+        self.assertNotIn("download-artifact", publication)
+        self.assertNotIn("always()", publication.split("    steps:\n", 1)[0])
+        self.assertIn("        if: inputs.dry-run != true\n", publication)
+        self.assertIn("        if: inputs.dry-run == true\n", publication)
+        self.assertIn("      - name: Upload sanitized rehearsal logs\n", publication)
         self.assertIn("    environment: release\n", publication)
         self.assertIn("    runs-on: ubuntu-latest\n", validation)
         self.assertIn("    runs-on: ubuntu-latest\n", publication)

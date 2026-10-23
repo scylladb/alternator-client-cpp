@@ -24,6 +24,11 @@ on:
         required: true
         type: string
         description: Target tag to run on
+      dry-run:
+        description: Rehearse validation, approval and protected signing without publishing
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -34,6 +39,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.name }}
       tag-object: ${{ steps.tag.outputs.object }}
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -44,6 +50,9 @@ jobs:
       - name: Require publisher release user
         run: make release-check-user
 
+      - name: Test trusted release tools
+        run: make test-release-signing
+
       - name: Verify repository release tag
         id: tag
         env:
@@ -51,10 +60,20 @@ jobs:
         run: |
           set -eu
           python3 scripts/release/signing.py verify-tag "$RELEASE_TAG"
-          printf 'name=%s\nobject=%s\n' "$RELEASE_TAG" "$(git rev-parse "refs/tags/$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
+          printf 'name=%s\nobject=%s\ncommit=%s\n' "$RELEASE_TAG" \
+            "$(git rev-parse "refs/tags/$RELEASE_TAG")" \
+            "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" >> "$GITHUB_OUTPUT"
+
+  validate-source:
+    needs: validate
+    # Build/lint/unit/integration checks run against the exact verified commit.
+    # This reusable workflow has read-only access and no deployment environment.
+    uses: ./.github/workflows/tests.yml
+    with:
+      source-ref: ${{ needs.validate.outputs.commit }}
 
   release:
-    needs: validate
+    needs: [validate, validate-source]
     runs-on: ubuntu-latest
     # Approval is requested only after validation; publication gets a fresh runner.
     environment: release
@@ -74,17 +93,39 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           set -eu
           test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$EXPECTED_TAG_OBJECT"
-          python3 scripts/release/signing.py verify-tag "$RELEASE_TAG"
+          python3 scripts/release/signing.py verify-tag "$RELEASE_TAG" "$EXPECTED_COMMIT"
+
+      - name: Rehearse protected signing
+        if: inputs.dry-run == true
+        env:
+          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs
+        run: python3 scripts/release/signing.py exec python3 -c 'print("Protected signing rehearsal passed")'
+
+      - name: Upload sanitized rehearsal logs
+        if: always() && inputs.dry-run == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-rehearsal-logs
+          path: ${{ runner.temp }}/release-logs/*.log
+          if-no-files-found: ignore
 
       - name: Create GitHub Release
+        if: inputs.dry-run != true
         run: |
+          set -eu
+          remote_object=$(git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" | cut -f1)
+          test "$remote_object" = "$EXPECTED_TAG_OBJECT"
           gh release create "$RELEASE_TAG" \
             --generate-notes \
             --title "$RELEASE_TAG" \
             --verify-tag
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
