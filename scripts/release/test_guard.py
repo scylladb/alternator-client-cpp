@@ -76,6 +76,55 @@ for value in forms:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b"[REDACTED]\n" * 3)
 
+    def test_encoded_credentials_are_redacted_in_terminal_and_artifacts(self):
+        code = '''import base64, html, json, os, re, sys
+from urllib.parse import quote
+s = os.environ["RELEASE_GPG_PASSPHRASE"]
+basic = os.environ["PACKAGE_USERNAME"] + ":" + os.environ["PACKAGE_PASSWORD"]
+forms = [re.sub(r"%[0-9A-F]{2}", lambda m: m[0].lower(), quote(s, safe="")),
+         quote(quote(s, safe=""), safe=""),
+         quote(json.dumps(s)[1:-1], safe=""),
+         base64.b64encode(basic.encode()).decode(),
+         html.escape(s, quote=False).replace("'", "&apos;").replace('"', "&#34;")]
+for value in forms:
+    for fd in (1, 2):
+        raw = value.encode()
+        os.write(fd, raw[:4])
+        os.write(fd, raw[4:] + b"\\n")
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            env = self.environment(directory)
+            env.update(RELEASE_GPG_PASSPHRASE="Case/Alpha+%quotes'\" λ",
+                       PACKAGE_USERNAME="synthetic-user", PACKAGE_PASSWORD="synthetic-password")
+            result = subprocess.run([sys.executable, GUARD, "run", sys.executable, "-c", code],
+                                    env=env, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+                self.assertEqual(stream, b"[REDACTED]\n" * 5)
+                self.assertEqual((directory / "logs" / (name + ".log")).read_bytes(), stream)
+
+    def test_unknown_headers_and_credential_properties_are_redacted(self):
+        data = (b'Authorization: Bearer UNKNOWN-AUTH\n'
+                b'proxy-authorization: Basic UNKNOWN-PROXY\n'
+                b'-Dgpg.passphrase=UNKNOWN-PHRASE --api-token=UNKNOWN-TOKEN\n'
+                b'--define=token=first;UNKNOWN-SEMICOLON\n'
+                b'-Dpassword=first,UNKNOWN-COMMA\n'
+                b'--api-token=first}UNKNOWN-BRACE\n'
+                b'{"password": "UNKNOWN PASSWORD", "username": "UNKNOWN USER"}\n'
+                b'"-Dsecret=UNKNOWN WITH SPACES"\n')
+        clean = guard.redact(data, [])
+        self.assertNotIn(b"UNKNOWN", clean)
+        self.assertIn(b'Authorization: [REDACTED]', clean)
+        self.assertIn(b'proxy-authorization: [REDACTED]', clean)
+        self.assertIn(b'-Dgpg.passphrase=[REDACTED]', clean)
+
+    def test_redaction_combines_overlapping_matches_without_rescanning_markers(self):
+        self.assertEqual(guard.redact(b"abcdefgh", [b"abcdef", b"bcdefgh"]), b"[REDACTED]")
+        self.assertEqual(guard.redact(b"abababa", [b"ababa"]), b"[REDACTED]")
+        self.assertEqual(guard.redact(b"marker [REDACTED] value", [b"[REDACTED]", b"value"]),
+                         b"marker [REDACTED] [REDACTED]")
+
     def test_rejects_credentials_and_trace_modes_before_starting(self):
         with tempfile.TemporaryDirectory() as temp:
             env = self.environment(Path(temp))

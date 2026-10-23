@@ -539,20 +539,17 @@ class SigningTests(unittest.TestCase):
             self.assertEqual(Path(".git/config").read_bytes(), config)
             self.assertFalse(list(directory.glob("release-signing-*")))
 
-    def test_make_requires_effective_publisher_before_signing(self):
+    def test_actions_make_operators_differ_from_publisher_identity(self):
         with self.make_repository() as directory:
             commit = signing.run(["git", "rev-parse", "HEAD"]).strip()
-            for actor, rerun in [("maintainer-one", ""), ("scylladb-publisher", "maintainer-two")]:
+            for actor, rerun in [("maintainer-one", ""), ("maintainer-one", "maintainer-two")]:
                 for target in ["release-tag", "_release-tag"]:
                     with self.subTest(actor=actor, rerun=rerun, target=target):
-                        env = {**os.environ, "GITHUB_ACTOR": actor, "GITHUB_TRIGGERING_ACTOR": rerun,
-                               "RELEASE_GPG_PRIVATE_KEY_FILE": str(directory / "absent")}
+                        env = {**os.environ, "GITHUB_ACTOR": actor, "GITHUB_TRIGGERING_ACTOR": rerun}
                         result = subprocess.run(["make", target], env=env,
                                                 capture_output=True, text=True, timeout=60)
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertIn("current: " + (rerun or actor), result.stderr)
-                        self.assertNotIn("signing.py exec", result.stdout)
-                        self.assertEqual(signing.run(["git", "tag", "--list"]), "")
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        signing.verify_tag("v1.0.0", commit)
                         self.assertFalse(list(directory.glob("release-signing-*")))
             signing.run(["make", "release-tag"], env={**os.environ,
                         "GITHUB_ACTOR": "maintainer-one", "GITHUB_TRIGGERING_ACTOR": "scylladb-publisher"})
@@ -719,14 +716,14 @@ class DiagnosticTests(unittest.TestCase):
 
 
 class ReleaseUserTests(unittest.TestCase):
-    def test_actions_requires_effective_publisher(self):
+    def test_actions_operator_is_independent_of_signer(self):
         for actor, triggering_actor, allowed in [
                 ("scylladb-publisher", "", True),
                 ("scylladb-publisher", "scylladb-publisher", True),
                 ("maintainer-one", "scylladb-publisher", True),
-                ("maintainer-one", "", False),
-                ("scylladb-publisher", "maintainer-two", False),
-                ("", "", False)]:
+                ("maintainer-one", "", True),
+                ("scylladb-publisher", "maintainer-two", True),
+                ("", "", True)]:
             for flags in [[], ["-n"]]:
                 with self.subTest(actor=actor, triggering_actor=triggering_actor, flags=flags):
                     result = subprocess.run(["make", *flags, "release-check-user"], cwd=ROOT,
@@ -761,6 +758,12 @@ class ReleaseUserTests(unittest.TestCase):
         self.assertIn("        if: inputs.dry-run != true\n", publication)
         self.assertIn("        if: inputs.dry-run == true\n", publication)
         self.assertIn("      - name: Upload sanitized rehearsal logs\n", publication)
+        self.assertIn("      - name: Check release blockers\n", validation)
+        self.assertLess(validation.index("      - name: Check release blockers\n"),
+                        validation.index("      - name: Verify repository release tag\n"))
+        self.assertLess(publication.index("      - name: Recheck release blockers before publication\n"),
+                        publication.index("      - name: Create GitHub Release\n"))
+        self.assertIn("      issues: read\n", publication)
         self.assertIn("    environment: release\n", publication)
         self.assertIn("    runs-on: ubuntu-latest\n", validation)
         self.assertIn("    runs-on: ubuntu-latest\n", publication)

@@ -88,16 +88,15 @@ clean:
 
 .PHONY: release-check-user release-check-version release-tag _release-tag release-verify-tag test-release-signing
 
-# Require the effective publisher account before importing credentials or publishing.
+# Local operators use the publisher account; Actions uses the protected environment.
 release-check-user:
 	+@set -eu; \
 	if [ "$${GITHUB_ACTIONS:-}" = true ]; then \
-		user=$${GITHUB_TRIGGERING_ACTOR:-$${GITHUB_ACTOR:-}}; \
-	else \
-		if ! user=$$(gh api user --jq .login); then \
-			echo "Release requires GitHub user scylladb-publisher. Run gh auth login or gh auth switch." >&2; \
-			exit 1; \
-		fi; \
+		exit 0; \
+	fi; \
+	if ! user=$$(gh api user --jq .login); then \
+		echo "Release requires GitHub user scylladb-publisher. Run gh auth login or gh auth switch." >&2; \
+		exit 1; \
 	fi; \
 	if [ "$$user" != scylladb-publisher ]; then \
 		echo "Release requires GitHub user scylladb-publisher (current: $$user)." >&2; \

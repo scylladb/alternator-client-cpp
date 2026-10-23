@@ -17,6 +17,7 @@
 
 import base64
 import ctypes
+import heapq
 import html
 import json
 import os
@@ -39,24 +40,38 @@ class GuardError(ValueError):
 
 
 def secret_forms(env):
-    values = []
+    values = set()
     for name, value in env.items():
-        if name.endswith(("_TOKEN", "_PASSWORD", "_PASSPHRASE", "_PRIVATE_KEY",
-                          "_SECRET_ACCESS_KEY")) and value:
-            values.append(value)
+        if value and re.search(r"PASSWORD|PASSPHRASE|TOKEN|SECRET|PRIVATE_KEY|AUTHORIZATION", name, re.I):
+            values.add(value)
+        for suffix in ("_USERNAME", "_USER"):
+            if name.endswith(suffix) and value:
+                password = env.get(name[:-len(suffix)] + "_PASSWORD")
+                if password:
+                    values.add(value + ":" + password)
     for name in ("RELEASE_GPG_PRIVATE_KEY_FILE", "RELEASE_GPG_PASSPHRASE_FILE"):
         if env.get(name):
-            values.append(env[name])
+            values.add(env[name])
             with open(env[name], "rb") as source:
                 value = source.read(1024 * 1024 + 1)
             if len(value) > 1024 * 1024:
                 raise GuardError("Credential input exceeds the supported size; values withheld.")
-            values.append(value.decode("utf-8").removesuffix("\n"))
+            values.add(value.decode("utf-8").removesuffix("\n"))
     if env.get("GNUPGHOME"):
-        values.append(env["GNUPGHOME"])
+        values.add(env["GNUPGHOME"])
     for index in range(int(env.get("GIT_CONFIG_COUNT", "0"))):
         if env.get(f"GIT_CONFIG_KEY_{index}") == "gpg.program":
-            values.append(env[f"GIT_CONFIG_VALUE_{index}"])
+            values.add(env[f"GIT_CONFIG_VALUE_{index}"])
+    values |= {line for value in values for line in value.splitlines() if line}
+    values |= {value.replace("\n", "\\n").replace("\r", "\\r") for value in values}
+    # Serializers may escape Unicode and punctuation before transport encoding.
+    values |= {json.dumps(value, ensure_ascii=ascii_only)[1:-1]
+               for value in tuple(values) for ascii_only in (True, False)}
+    for value in tuple(values):
+        escaped = html.escape(value, quote=False)
+        for apostrophe in ("'", "&apos;", "&#39;", "&#x27;"):
+            for double_quote in ('"', "&quot;", "&#34;", "&#x22;"):
+                values.add(escaped.replace("'", apostrophe).replace('"', double_quote))
     forms = set()
     for value in values:
         if not value:
@@ -64,7 +79,7 @@ def secret_forms(env):
         raw = value.encode()
         forms.update((raw, base64.b64encode(raw), base64.urlsafe_b64encode(raw),
                       raw.hex().encode(), raw.hex().upper().encode(),
-                      quote(value, safe="").encode(), quote_plus(value, safe="").encode(),
+                      quote(value, safe="").encode(), quote(value).encode(), quote_plus(value, safe="").encode(),
                       json.dumps(value)[1:-1].encode(),
                       json.dumps(value, ensure_ascii=False)[1:-1].encode(),
                       shlex.quote(value).encode(), html.escape(value).encode()))
@@ -73,8 +88,41 @@ def secret_forms(env):
                      if len(line) >= 8 and not line.startswith("-----")]
             forms.update(line.encode() for line in lines)
             forms.add("".join(lines).encode())
-    forms.update(value.rstrip(b"=") for value in tuple(forms) if value)
+    for value in tuple(forms):
+        forms.update((quote(value, safe="").encode(), quote(value).encode(), value.rstrip(b"=")))
     return sorted((value for value in forms if value), key=len, reverse=True)
+
+
+def redact(data, forms):
+    """Union matches in the original bytes, including overlapping secrets."""
+    def spans(pattern, group, flags=0):
+        return (match.span(group) for match in re.finditer(pattern, data, flags))
+
+    matches = [
+        spans(rb"(?im)((?:proxy-)?authorization[\"']?\s*[:=]\s*)([^\r\n]*)", 2),
+        spans(rb"(?i)([\"'])((?:-D\s*|--?define[=\s]+)[\w.-]*"
+              rb"(?:passphrase|password|username|token|secret|authorization)[\w.-]*=)"
+              rb"((?:\\[\s\S]|(?!\1)[^\\])*)\1", 3),
+        spans(rb"(?i)([\w.-]*(?:passphrase|password|username|token|secret|authorization|private[_-]?key)"
+              rb"[\w.-]*[\"']?\s*[:=]\s*)"
+              rb"(\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'|[^\s]+)", 2),
+    ]
+    for value in forms:
+        # Percent-escape case is immaterial; lookahead includes overlapping matches.
+        matches.append(spans(b"(?=(" + re.escape(value) + b"))", 1, re.I if b"%" in value else 0))
+    output = bytearray()
+    start = end = 0
+    for left, right in heapq.merge(*matches):
+        if left > end:
+            if end > start:
+                output.extend(b"[REDACTED]")
+            output.extend(data[end:left])
+            start = left
+        end = max(end, right)
+    if end > start:
+        output.extend(b"[REDACTED]")
+    output.extend(data[end:])
+    return bytes(output)
 
 
 def check_command(command, env, secrets):
@@ -226,10 +274,7 @@ class Capture:
             complete = not self.selector.get_map() and not self.overflow
             streams = [bytes(value) for value in self.buffers] if complete else [
                 b"", b"Command output withheld: incomplete or over the size limit.\n"]
-            for index, value in enumerate(streams):
-                for secret in secrets:
-                    value = value.replace(secret, b"[REDACTED]")
-                streams[index] = value
+            streams = [redact(value, secrets) for value in streams]
             # Raw output exists only in bounded memory. Only sanitized bytes can
             # reach either the terminal or persistent diagnostic artifacts.
             if env.get("RELEASE_LOG_DIR"):

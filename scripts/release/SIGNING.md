@@ -19,12 +19,13 @@ certifies the signing subkey and remains offline.
 Local `make release-tag` and internal `_release-tag` calls require the authenticated
 `gh` account `scylladb-publisher` before importing credentials or creating tags;
 switch accounts with `gh auth switch` if needed. Local Make dry runs check the
-account and version without opening signing credentials. Actions release commands
-and publication require `scylladb-publisher` as the effective initiator:
-`GITHUB_TRIGGERING_ACTOR`, falling back to `GITHUB_ACTOR` when unset or empty.
-This also checks the operator who requests a rerun. The protected `release`
-environment requires approval independently of that account check.
-`GITHUB_ACTIONS=true` only selects this policy branch; it does not prove approval.
+account and version without opening signing credentials. In Actions, repository
+permissions and the protected `release` environment authorize operators, including
+reruns and rehearsals. An approved maintainer need not be `scylladb-publisher`:
+signatures still use the pinned repository subkey and publisher identity.
+`GITHUB_ACTIONS=true` selects the local-policy exemption; it does not prove approval
+or grant permission to push tags or invoke a GitHub workflow. Every publishing or
+production-signing job must declare `environment: release`.
 Public verification needs no account check. The local CLI identity does not
 establish which credentials a later Git push will use.
 
@@ -83,7 +84,11 @@ without including command arguments, captured output, or exception payloads.
 Wrapped commands run through `guard.py`: stdout and stderr are captured separately
 in bounded memory (8 MiB combined), then sanitized before either stream is printed
 or saved. Known credential values, input-file paths, keyring/wrapper paths, and
-their base64, hexadecimal, URL, JSON and shell-escaped forms are redacted. Raw
+their base64, hexadecimal, URL, JSON, XML and shell-escaped forms are redacted.
+This includes double URL encoding, case-insensitive percent escapes, and encoded
+username/password pairs. Authorization headers and credential assignments are
+masked even when their values were not supplied to the helper. Overlapping
+matches are combined against the original bytes before inserting redaction markers. Raw
 command output is never spooled to disk. Set `RELEASE_LOG_DIR` to save sanitized
 `stdout.log` and `stderr.log`, including after command failure or cancellation.
 Overflow or incomplete capture withholds the streams and fails a successful
@@ -166,6 +171,11 @@ approval. External tag immutability remains required to close concurrent remote
 updates; no sequence of client-side checks makes tag mutation atomic with the
 GitHub Release API.
 
+Normal releases check for open issues labelled `release-blocker` before validation
+and again after environment approval, before publication. An open blocker or a
+failed/malformed GitHub response stops the run. Rehearsals skip this check so a
+maintainer can investigate release readiness without publishing anything.
+
 For an upload-free rehearsal after merge, dispatch `release.yml` from an allowed
 launch ref (normally `main`), select an existing repository-signed `target-tag`,
 and set `dry-run=true`. The same helper and exact-source C++ validation runs first.
@@ -205,7 +215,7 @@ has landed and an approved rehearsal succeeds. Until then, migration remains
 incomplete; the existence of this rehearsal mode is not evidence that it ran.
 
 Tests cover real Make/GPG/Git signing with disposable credentials, artifact
-tampering, publisher authorization and reruns, failure cleanup, cancellation,
+tampering, local publisher policy, independent Actions operators/reruns, failure cleanup, cancellation,
 detached descendants, bounded/redacted logs, and the exact workflow shell blocks
 against a bare remote and fresh checkout. They reject moved/unsigned tag objects
 and prevent publication after the remote target changes.
@@ -244,8 +254,8 @@ credentials as part of an unverified recovery.
   intentional source change requires a new version/tag.
 * If approval was rejected/cancelled or the protected job failed before release
   creation, confirm the remote tag is unchanged and check whether a GitHub Release
-  already exists before rerunning. A rerun is still subject to publisher identity,
-  validation dependencies and environment approval. Use a new dispatch when the
+  already exists before rerunning. A rerun is still subject to repository
+  permissions, validation dependencies, release blockers and environment approval. Use a new dispatch when the
   previous validation or launch tools are no longer suitable.
 * If creation timed out or its result is uncertain, first inspect
   `gh release view vX.Y.Z --repo scylladb/alternator-client-cpp` and the remote tag
