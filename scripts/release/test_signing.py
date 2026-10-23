@@ -82,10 +82,15 @@ class SigningTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for home in [cls.keyring, cls.unprotected_home]:
-            subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"],
+        try:
+            subprocess.run(["gpgconf", "--homedir", str(cls.keyring), "--kill", "gpg-agent"],
                            capture_output=True, check=True, timeout=60)
-        cls.fixture.cleanup()
+        finally:
+            try:
+                subprocess.run(["gpgconf", "--homedir", str(cls.unprotected_home), "--kill", "gpg-agent"],
+                               capture_output=True, check=True, timeout=60)
+            finally:
+                cls.fixture.cleanup()
 
     @contextmanager
     def repository(self, full=False, password=None):
@@ -517,8 +522,11 @@ class SigningTests(unittest.TestCase):
             # A stubborn grandchild must not outlive cancellation of Make/build.
             child_code = ('import json, os, signal, time; from pathlib import Path; '
                           'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
-                          'Path(os.environ["CHILD_STATE"]).write_text(json.dumps('
+                          'state = Path(os.environ["CHILD_STATE"]); '
+                          'pending = state.with_suffix(".tmp"); '
+                          'pending.write_text(json.dumps('
                           '{"pid": os.getpid(), "home": os.environ["GNUPGHOME"]})); '
+                          'pending.replace(state); '
                           'time.sleep(60)')
             parent_code = ('import subprocess, sys, time; '
                            'subprocess.Popen([sys.executable, "-c", ' + repr(child_code) + ']); '
@@ -544,14 +552,21 @@ class SigningTests(unittest.TestCase):
                 if proc.exists():
                     self.assertEqual(proc.read_text().split()[2], "Z")
             finally:
-                if process.poll() is None:
-                    process.kill()
-                process.communicate(timeout=10)
-                if info is not None:
-                    try:
-                        os.kill(info["pid"], signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                finally:
+                    if info is not None:
+                        try:
+                            os.kill(info["pid"], signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    process.stderr.close()
+                    process.wait(timeout=10)
 
     def test_make_rejects_existing_unsigned_and_lightweight_tags(self):
         for options in [[], ["-a", "-m", "Unsigned"]]:
