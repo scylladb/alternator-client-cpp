@@ -85,3 +85,47 @@ scylla-rm:
 .PHONY: clean
 clean:
 	$(CMAKE) -E rm -rf $(BUILD_DIR) $(CHECK_BUILD_DIR)
+
+.PHONY: release-check-user release-check-version release-tag _release-tag release-verify-tag test-release-signing
+
+# Local operators use the publisher account; Actions uses the protected environment.
+release-check-user:
+	+@set -eu; \
+	if [ "$${GITHUB_ACTIONS:-}" = true ]; then \
+		exit 0; \
+	fi; \
+	if ! user=$$(gh api user --jq .login); then \
+		echo "Release requires GitHub user scylladb-publisher. Run gh auth login or gh auth switch." >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$user" != scylladb-publisher ]; then \
+		echo "Release requires GitHub user scylladb-publisher (current: $$user)." >&2; \
+		exit 1; \
+	fi
+
+release-check-version:
+	+@set -eu; \
+	version=$${RELEASE_VERSION:-}; \
+	invalid() { echo 'Expected RELEASE_VERSION=X.Y.Z, X.Y.Z-alpha.1, -beta.1, or -rc.1' >&2; exit 1; }; \
+	case "$$version" in ''|*[!0-9A-Za-z.-]*) invalid;; esac; \
+	number='(0|[1-9][0-9]*)'; \
+	printf '%s\n' "$$version" | grep -Eq "^$$number\.$$number\.$$number(-(alpha|beta|rc)\.$$number)?$$" || invalid
+
+release-tag: _release-tag
+
+_release-tag: release-check-user release-check-version
+	@python3 scripts/release/signing.py exec sh -ec '\
+	: "$${RELEASE_VERSION:?Set RELEASE_VERSION to the version to release}"; \
+	commit=$$(git rev-parse HEAD); \
+	tag="v$$RELEASE_VERSION"; \
+	if ! git show-ref --verify --quiet "refs/tags/$$tag"; then \
+		git tag -s "$$tag" -m "Release $$tag" "$$commit"; \
+	fi; \
+	python3 scripts/release/signing.py verify-tag "$$tag" "$$commit"'
+
+# Public verification is available to every consumer without signing credentials.
+release-verify-tag:
+	@python3 scripts/release/signing.py verify-tag "$${RELEASE_TAG:?Set RELEASE_TAG to the tag to verify}"
+
+test-release-signing:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/release -p 'test_*.py' -v

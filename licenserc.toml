@@ -24,6 +24,7 @@ includes = [
     "examples/**/*.cpp",
     "include/**/*.h",
     "licenserc.toml",
+    "scripts/**/*.py",
     "src/**/*.cpp",
     "src/**/*.h",
     "test/**/*.yaml",
