@@ -660,7 +660,18 @@ class ReleaseUserTests(unittest.TestCase):
 
     def test_publication_workflow_calls_account_gate_before_verification(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("    environment: release\n", workflow)
+        validation, publication = workflow.split("  release:\n", 1)
+        self.assertIn("  validate:\n", validation)
+        self.assertNotIn("environment: release", validation)
+        self.assertIn("    needs: validate\n", publication)
+        self.assertIn("    environment: release\n", publication)
+        self.assertIn("    runs-on: ubuntu-latest\n", validation)
+        self.assertIn("    runs-on: ubuntu-latest\n", publication)
+        self.assertIn("  contents: read\n", validation)
+        self.assertIn("      contents: write\n", publication)
+        self.assertIn("EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}", publication)
+        self.assertLess(publication.index("      - name: Recheck validated release tag\n"),
+                        publication.index("      - name: Create GitHub Release\n"))
         gate = workflow.index("        run: make release-check-user\n")
         self.assertLess(workflow.index("      - name: Checkout code\n"), gate)
         self.assertLess(gate, workflow.index("      - name: Verify repository release tag\n"))

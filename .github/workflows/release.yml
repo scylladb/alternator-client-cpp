@@ -26,32 +26,58 @@ on:
         description: Target tag to run on
 
 permissions:
-  contents: write  # Required to create release
+  contents: read
 
 jobs:
-  release:
+  validate:
     runs-on: ubuntu-latest
-    # Provision required reviewers and launch-ref restrictions before publishing.
-    environment: release
-
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
+      tag-object: ${{ steps.tag.outputs.object }}
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
 
       - name: Require publisher release user
         run: make release-check-user
 
-      - name: Preserve repository signing policy
-        run: |
-          mkdir -m 700 "$RUNNER_TEMP/release-signing-policy"
-          cp scripts/release/signing.py scripts/release/publisher.asc "$RUNNER_TEMP/release-signing-policy/"
-
       - name: Verify repository release tag
+        id: tag
         env:
           RELEASE_TAG: ${{ inputs.target-tag || github.ref_name }}
-        run: python3 "$RUNNER_TEMP/release-signing-policy/signing.py" verify-tag "$RELEASE_TAG"
+        run: |
+          set -eu
+          python3 scripts/release/signing.py verify-tag "$RELEASE_TAG"
+          printf 'name=%s\nobject=%s\n' "$RELEASE_TAG" "$(git rev-parse "refs/tags/$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    # Approval is requested only after validation; publication gets a fresh runner.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Require publisher release user
+        run: make release-check-user
+
+      - name: Recheck validated release tag
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
+        run: |
+          set -eu
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$EXPECTED_TAG_OBJECT"
+          python3 scripts/release/signing.py verify-tag "$RELEASE_TAG"
 
       - name: Create GitHub Release
         run: |
@@ -60,5 +86,5 @@ jobs:
             --title "$RELEASE_TAG" \
             --verify-tag
         env:
-          RELEASE_TAG: ${{ inputs.target-tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

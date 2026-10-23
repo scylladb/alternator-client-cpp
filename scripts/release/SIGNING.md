@@ -133,10 +133,12 @@ are prepared, so there is no new commit range to verify. The existing tagged
 commit need not be signed by the release key. Artifact uploads and Maven
 prepare/perform stages are outside this release path.
 
-The workflow preserves the launch revision's helper and public certificate,
-verifies the requested tag directly from fetched refs, then publishes release
-notes without checking out historical build code. Dispatch input selects an
-existing tag name, never a preceding commit or a replacement tag. A failed
+The validation job uses the launch revision's helper and public certificate to
+verify the requested tag from fetched refs without checking out historical build
+code. After validation succeeds, the release environment requests approval. A
+separate publication job starts on a fresh runner, checks the same launch revision
+and the validated tag object again, then publishes release notes. Dispatch input
+selects an existing tag name, never a preceding commit or a replacement tag. A failed
 signature check blocks publication.
 
 ## Deployment protection and rollout
