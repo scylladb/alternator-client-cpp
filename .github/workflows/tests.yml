@@ -57,6 +57,7 @@ jobs:
 
       - name: Test release automation
         run: |
+          npm ci --ignore-scripts --prefix .github
           node --test .github/tests/*.test.cjs
 
       - name: Checkout validated release source
