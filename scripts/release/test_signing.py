@@ -429,7 +429,8 @@ class SigningTests(unittest.TestCase):
             outputs = directory / "outputs"
             env = {**os.environ, "RELEASE_TAG": "v1.0.0", "GITHUB_OUTPUT": str(outputs)}
             scripts = {name: self.workflow_script(name) for name in (
-                "Verify repository release tag", "Recheck validated release tag", "Create GitHub Release")}
+                "Verify repository release tag", "Recheck validated release tag",
+                "Recheck published tag before GitHub release")}
             subprocess.run(["sh", "-ec", scripts["Verify repository release tag"]],
                            env=env, check=True, capture_output=True, timeout=30)
             values = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
@@ -444,23 +445,18 @@ class SigningTests(unittest.TestCase):
             signing.run(["git", "-C", str(clone), "checkout", "--detach", values["commit"]])
             # Each fresh runner obtains trusted tools independently of the target source.
             shutil.copytree(Path("scripts"), clone / "scripts")
-            gh = directory / "gh"
-            gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$PUBLICATION_RECORD"\n')
-            gh.chmod(0o700)
-            record = directory / "published"
-            env.update(PATH=str(directory) + os.pathsep + env["PATH"], PUBLICATION_RECORD=str(record))
-            for name in ("Recheck validated release tag", "Create GitHub Release"):
+            for name in ("Recheck validated release tag", "Recheck published tag before GitHub release"):
                 subprocess.run(["sh", "-ec", scripts[name]], cwd=clone, env=env,
                                check=True, capture_output=True, timeout=30)
-            self.assertIn("--verify-tag", record.read_text())
-            record.unlink()
+            workflow = (ROOT / ".github/workflows/release.yml").read_text()
+            self.assertLess(workflow.index("- name: Recheck published tag before GitHub release"),
+                            workflow.index("- name: Create GitHub Release"))
             # Moving the remote after checkout must stop publication, even when
             # the publication runner still holds the previously validated object.
             signing.run(["git", "-C", str(remote), "update-ref", "refs/tags/v1.0.0", values["commit"]])
-            result = subprocess.run(["sh", "-ec", scripts["Create GitHub Release"]],
+            result = subprocess.run(["sh", "-ec", scripts["Recheck published tag before GitHub release"]],
                                     cwd=clone, env=env, capture_output=True, timeout=30)
             self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(record.exists())
             # A moved object fetched on a fresh runner also fails the first recheck.
             signing.run(["git", "-C", str(clone), "fetch", "--force", "origin",
                          "refs/tags/v1.0.0:refs/tags/v1.0.0"])
@@ -776,6 +772,44 @@ class ReleaseUserTests(unittest.TestCase):
         self.assertLess(workflow.index("      - name: Checkout code\n"), gate)
         self.assertLess(gate, workflow.index("      - name: Verify repository release tag\n"))
         self.assertLess(gate, workflow.index("      - name: Create GitHub Release\n"))
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for publication checks")
+    def test_publication_checks_use_trusted_tree_before_historical_source_checkout(self):
+        reusable = (ROOT / ".github/workflows/tests.yml").read_text()
+        self.assertLess(reusable.index("      - name: Test release automation\n"),
+                        reusable.index("      - name: Checkout validated release source\n"))
+        self.assertIn("          ref: ${{ inputs.source-ref }}\n", reusable)
+        command = next(line.strip() for line in reusable.splitlines()
+                       if line.strip().startswith("node --test "))
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("GIT_", "GITHUB_", "RELEASE_", "MAKE"))}
+            env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-c", "commit.gpgsign=false", "-c", "user.name=Test",
+                     "-c", "user.email=test@example.test", "-c", "core.hooksPath=/dev/null",
+                     *args], cwd=directory, env=env, text=True, stderr=subprocess.PIPE,
+                    timeout=30).strip()
+            git("init", "-q")
+            (directory / "source.txt").write_text("historical target")
+            git("add", ".")
+            git("commit", "-qm", "Historical source without publication checks")
+            source = git("rev-parse", "HEAD")
+            for relative in (".github/workflows/release.yml", ".github/tests/release-publishing.test.cjs"):
+                target = directory / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
+            (directory / "source.txt").write_text("trusted workflow tree")
+            git("add", ".")
+            git("commit", "-qm", "Trusted publication workflow and matching checks")
+            result = subprocess.run(["sh", "-ec", command], cwd=directory,
+                                    env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            git("checkout", "--detach", source)
+            self.assertEqual((directory / "source.txt").read_text(), "historical target")
+            self.assertFalse((directory / ".github/tests/release-publishing.test.cjs").exists())
 
     def test_local_release_uses_authenticated_gh_user(self):
         with tempfile.TemporaryDirectory() as temp:

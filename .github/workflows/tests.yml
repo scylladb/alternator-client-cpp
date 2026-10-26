@@ -55,6 +55,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release-tools"
           cp scripts/release/guard.py scripts/release/signing.py "$RUNNER_TEMP/release-tools/"
 
+      - name: Test release automation
+        run: |
+          node --test .github/tests/*.test.cjs
+
       - name: Checkout validated release source
         if: inputs.source-ref != ''
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

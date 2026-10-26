@@ -84,6 +84,9 @@ jobs:
     runs-on: ubuntu-latest
     # Approval is requested only after validation; publication gets a fresh runner.
     environment: release
+    concurrency:
+      group: github-release-${{ needs.validate.outputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
       issues: read
@@ -129,17 +132,50 @@ jobs:
           path: ${{ runner.temp }}/release-logs/*.log
           if-no-files-found: ignore
 
-      - name: Create GitHub Release
+      - name: Recheck published tag before GitHub release
         if: inputs.dry-run != true
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
         run: |
           set -eu
           remote_object=$(git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" | cut -f1)
           test "$remote_object" = "$EXPECTED_TAG_OBJECT"
-          gh release create "$RELEASE_TAG" \
-            --generate-notes \
-            --title "$RELEASE_TAG" \
-            --verify-tag
+
+      - name: Create GitHub Release
+        if: inputs.dry-run != true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo, per_page: 100
+            });
+            if (releases.some(release => release.tag_name === tag && release.draft)) {
+              throw new Error('Existing release is a draft; reconcile it before rerunning publication');
+            }
+            try {
+              const {data: release} = await github.rest.repos.getReleaseByTag({
+                ...context.repo, tag
+              });
+              if (release.draft) {
+                throw new Error('Existing release is a draft; reconcile it before rerunning publication');
+              }
+              core.info(`Release already exists: ${release.html_url}`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const {data: tagRef} = await github.rest.git.getRef({
+              ...context.repo, ref: `tags/${tag}`
+            });
+            const expected = process.env.EXPECTED_TAG_OBJECT;
+            if (!expected || tagRef.object?.sha !== expected) {
+              throw new Error('Release tag changed after validation');
+            }
+            await github.rest.repos.createRelease({
+              ...context.repo, tag_name: tag, name: tag, generate_release_notes: true
+            });
