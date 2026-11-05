@@ -1,0 +1,67 @@
+# Copyright ScyllaDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Prepare release
+description: Reconstruct the validated tree and retain verified signed history and assets
+inputs:
+  baseline:
+    description: Validated baseline commit
+    required: true
+  release-version:
+    description: Validated stable version
+    required: true
+  tree:
+    description: Validated release tree
+    required: true
+  signing-private-key:
+    description: Protected signing subkey
+    required: true
+  signing-passphrase:
+    description: Signing passphrase
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Preserve launch tools
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/release-tools"
+        cp scripts/release/*.py scripts/release/publisher.asc "$RUNNER_TEMP/release-tools/"
+    - name: Reconstruct validated release plan
+      shell: bash
+      env:
+        RELEASE_BASELINE: ${{ inputs.baseline }}
+        RELEASE_VERSION: ${{ inputs.release-version }}
+        RELEASE_TREE: ${{ inputs.tree }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        test "$GITHUB_REF" = refs/heads/main
+        test "$(git rev-parse HEAD)" = "$RELEASE_BASELINE"
+        python3 "$RUNNER_TEMP/release-tools/lifecycle.py" plan \
+          --baseline "$RELEASE_BASELINE" --version "$RELEASE_VERSION" \
+          --tree "$RELEASE_TREE" --plan "$RUNNER_TEMP/release-plan.json"
+    - name: Prepare signed history and source assets
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_GPG_PRIVATE_KEY: ${{ inputs.signing-private-key }}
+        RELEASE_GPG_PASSPHRASE: ${{ inputs.signing-passphrase }}
+        RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/preparation
+      run: |
+        python3 "$RUNNER_TEMP/release-tools/guard.py" run \
+          python3 "$RUNNER_TEMP/release-tools/lifecycle.py" prepare \
+          --plan "$RUNNER_TEMP/release-plan.json" --output "$RUNNER_TEMP/release-recovery"
+    - name: Independently verify signed outputs with public material
+      shell: bash
+      run: python3 "$RUNNER_TEMP/release-tools/lifecycle.py" verify --output "$RUNNER_TEMP/release-recovery"

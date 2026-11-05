@@ -13,6 +13,53 @@ make test
 
 The core target requires C++17. The default discovery HTTP client uses libcurl when CMake can find the libcurl development package; otherwise it falls back to a small POSIX plain-HTTP client. HTTPS discovery requires libcurl or a caller-provided `HttpClient`. Built-in gzip and deflate response decoding is available when CMake finds zlib; callers can provide a custom decoder for other content encodings or for builds without zlib. Tests use GoogleTest when it is installed. The AWS adapter target is built only when CMake can find `AWSSDK` with the `dynamodb` component. `make test-integration` requires the AWS adapter and its tests by configuring with `ALTERNATOR_CLIENT_CPP_REQUIRE_AWS=ON`.
 
+## Source releases
+
+Stable releases are available on [GitHub Releases](https://github.com/scylladb/alternator-client-cpp/releases).
+Download `alternator-client-cpp-X.Y.Z.tar.gz` or `.zip`, their detached `.asc`
+signatures, and `SHA256SUMS` with its signature from the published release.
+Actions dry-run artifacts are rehearsal and recovery material; a valid signature
+alone does not establish that a version was published. Both archives extract into
+`alternator-client-cpp-X.Y.Z/` and include source, build files and licenses.
+Verify the public certificate fingerprint from a trusted reviewed revision using
+[the signing guide](scripts/release/SIGNING.md#signing-certificate-and-isolation), then:
+
+```sh
+(
+set -eu
+GNUPGHOME=$(mktemp -d)
+export GNUPGHOME
+trap 'rm -rf "$GNUPGHOME"' EXIT
+trap 'exit 1' HUP INT TERM
+gpg --batch --import /path/to/reviewed/publisher.asc
+for asset in SHA256SUMS alternator-client-cpp-X.Y.Z.tar.gz alternator-client-cpp-X.Y.Z.zip; do
+    gpg --batch --no-auto-key-retrieve --no-auto-key-import --auto-key-locate clear \
+        --status-fd 1 --verify "$asset.asc" "$asset" > "$GNUPGHOME/status"
+    awk '$1 == "[GNUPG:]" {
+             if ($2 == "GOODSIG" && $3 == "BA5DD9E6771F70D5") good++
+             if ($2 == "VALIDSIG" && $3 == "15F46DE2ED437CB62E4C6F4BBA5DD9E6771F70D5" &&
+                 $12 == "04E63A9B9DC6BCE2BA182CBFB1F1949F8B9A0FC6") valid++
+             if ($2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|KEYREVOKED|KEYEXPIRED|SIGEXPIRED|FAILURE|ERROR)$/) bad = 1
+         }
+         END { exit !(good == 1 && valid == 1 && !bad) }' "$GNUPGHOME/status"
+done
+sha256sum --check SHA256SUMS
+tar -xzf alternator-client-cpp-X.Y.Z.tar.gz
+cmake -S alternator-client-cpp-X.Y.Z -B build -DALTERNATOR_CLIENT_CPP_BUILD_TESTS=OFF
+cmake --build build --parallel
+cmake --install build --prefix /your/install/prefix
+)
+```
+
+Download both archive formats when checking the complete checksum file. Consumers
+use `find_package(scylladb-alternator-client-cpp CONFIG REQUIRED)` and link
+`ScyllaDB::alternator_client_cpp`, or `ScyllaDB::alternator_client_cpp_aws` when the
+DynamoDB AWS SDK was available at build time. Set `CMAKE_PREFIX_PATH` to the
+installation prefix and AWS SDK prefix as needed. `VERSION` supplies the full
+runtime/user-agent version; CMake package compatibility uses its numeric portion.
+See [release operation and recovery](scripts/release/SIGNING.md) for the manual
+Release and Release dry run workflows.
+
 ## Core Usage
 
 ```cpp

@@ -47,7 +47,8 @@ def command_operation(command):
     if command[0] == "gpgconf":
         return "GPG agent shutdown"
     if command[0] == "git":
-        for subcommand in ["verify-commit", "verify-tag", "check-ref-format", "cat-file", "rev-parse"]:
+        for subcommand in ["verify-commit", "verify-tag", "check-ref-format", "cat-file", "rev-parse",
+                           "push", "bundle", "commit-tree", "tag", "update-ref", "worktree", "ls-remote"]:
             if subcommand in command:
                 return "Git " + subcommand
         return "Git operation"

@@ -25,18 +25,23 @@ import sys
 def check(repository):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Expected OWNER/REPOSITORY")
-    result = subprocess.run(["gh", "issue", "list", "--repo", repository, "--state", "open",
-                             "--label", "release-blocker", "--limit", "1", "--json", "number"],
+    # The REST issues endpoint includes pull requests; slurp preserves page boundaries.
+    result = subprocess.run(["gh", "api", "--paginate", "--slurp",
+                             f"repos/{repository}/issues?state=open&labels=release-blocker&per_page=100"],
                             capture_output=True, text=True, timeout=60, check=True)
-    issues = json.loads(result.stdout)
-    if (not isinstance(issues, list) or len(issues) > 1 or any(
-            not isinstance(issue, dict) or type(issue.get("number")) is not int
-            or issue["number"] <= 0 for issue in issues)):
+    pages = json.loads(result.stdout)
+    if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+        raise ValueError("Invalid paginated issue response")
+    issues = [issue for page in pages for issue in page]
+    if any(not isinstance(issue, dict) or type(issue.get("number")) is not int
+           or issue["number"] <= 0 for issue in issues):
         raise ValueError("Invalid issue response")
     if issues:
-        print(f"Release blocked: https://github.com/{repository}/issues/{issues[0]['number']}", file=sys.stderr)
+        for issue in issues:
+            kind = "pull" if "pull_request" in issue else "issues"
+            print(f"Release blocked: https://github.com/{repository}/{kind}/{issue['number']}", file=sys.stderr)
         return 1
-    print("No open release-blocker issues.")
+    print("No open release-blocker issues or PRs.")
     return 0
 
 

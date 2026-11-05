@@ -45,30 +45,37 @@ class BlockerTests(unittest.TestCase):
             return result, json.loads(record.read_text())
 
     def test_empty_blockers_allow_publication_and_query_only_open_labelled_issues(self):
-        result, arguments = self.query("[]")
+        result, arguments = self.query("[[]]")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(arguments, ["issue", "list", "--repo", "scylladb/alternator-client-cpp",
-                                    "--state", "open", "--label", "release-blocker", "--limit", "1",
-                                    "--json", "number"])
+        self.assertEqual(arguments, ["api", "--paginate", "--slurp",
+            "repos/scylladb/alternator-client-cpp/issues?state=open&labels=release-blocker&per_page=100"])
+
 
     def test_open_blocker_stops_publication_and_identifies_the_issue(self):
-        result, _ = self.query('[{"number": 123}]')
+        result, _ = self.query('[[{"number": 123}]]')
         self.assertEqual(result.returncode, 1)
         self.assertIn("https://github.com/scylladb/alternator-client-cpp/issues/123", result.stderr)
 
     def test_api_failure_is_not_treated_as_absence(self):
-        result, _ = self.query("[]", code=1)
+        result, _ = self.query("[[]]", code=1)
         self.assertEqual(result.returncode, 2)
         self.assertIn("publication is blocked", result.stderr)
         self.assertNotIn("SYNTHETIC-ERROR-PAYLOAD", result.stderr + result.stdout)
 
     def test_invalid_or_incomplete_responses_fail_closed(self):
         for response in ("invalid-json", "null", "{}", '[{"number":true}]', '[{"number":0}]',
-                         '[{"number":"SYNTHETIC-SECRET"}]', '[{"number":1},{"number":2}]'):
+                         '[{"number":"SYNTHETIC-SECRET"}]', '[{"number":1},{"number":2}]', '[]', '[[{"number":false}]]', '[[{"number":0}]]'):
             with self.subTest(response=response):
                 result, _ = self.query(response)
                 self.assertEqual(result.returncode, 2)
                 self.assertNotIn("SYNTHETIC-SECRET", result.stdout + result.stderr)
+
+    def test_pull_request_on_later_page_blocks(self):
+        result, _ = self.query('[[{"number": 1}], [{"number": 123, "pull_request": {}}]]')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("/pull/123", result.stderr)
+        self.assertIn("/issues/1", result.stderr)
+
 
 
 if __name__ == "__main__":

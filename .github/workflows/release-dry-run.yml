@@ -1,0 +1,102 @@
+# Copyright ScyllaDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release dry run
+on:
+  workflow_dispatch:
+    inputs:
+      release-version:
+        description: Optional stable X.Y.Z override (defaults to VERSION without -SNAPSHOT)
+        required: false
+        type: string
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AWS_SDK_CPP_VERSION: 1.11.844
+      AWS_SDK_CPP_INSTALL_DIR: ${{ github.workspace }}/.deps/aws-sdk-cpp
+      CMAKE_PREFIX_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp
+      LD_LIBRARY_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp/lib:${{ github.workspace }}/.deps/aws-sdk-cpp/lib64
+    outputs:
+      baseline: ${{ steps.validation.outputs.baseline }}
+      version: ${{ steps.validation.outputs.version }}
+      tree: ${{ steps.validation.outputs.tree }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require main dispatch
+        run: test "$GITHUB_REF" = refs/heads/main
+      - name: Validate planned release
+        id: validation
+        uses: ./.github/actions/release-validate
+        with:
+          release-version: ${{ inputs.release-version }}
+          skip-tests: 'false'
+      - name: Upload sanitized validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-validation-logs
+          path: ${{ runner.temp }}/release-logs/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    concurrency:
+      group: alternator-client-cpp-release
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare signed release
+        uses: ./.github/actions/release-prepare
+        with:
+          baseline: ${{ needs.validate.outputs.baseline }}
+          release-version: ${{ needs.validate.outputs.version }}
+          tree: ${{ needs.validate.outputs.tree }}
+          signing-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          signing-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Retain exact recovery objects and assets before remote changes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-recovery-${{ needs.validate.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-recovery/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload sanitized preparation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-preparation-logs
+          path: ${{ runner.temp }}/release-logs/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7

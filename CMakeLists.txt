@@ -14,8 +14,16 @@
 
 cmake_minimum_required(VERSION 3.20)
 
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ALTERNATOR_CLIENT_CPP_VERSION)
+string(STRIP "${ALTERNATOR_CLIENT_CPP_VERSION}" ALTERNATOR_CLIENT_CPP_VERSION)
+if(NOT ALTERNATOR_CLIENT_CPP_VERSION MATCHES "^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-SNAPSHOT)?$")
+    message(FATAL_ERROR "VERSION must contain X.Y.Z or X.Y.Z-SNAPSHOT")
+endif()
+string(REGEX REPLACE "-SNAPSHOT$" "" ALTERNATOR_CLIENT_CPP_NUMERIC_VERSION "${ALTERNATOR_CLIENT_CPP_VERSION}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+
 project(alternator-client-cpp
-    VERSION 0.1.0
+    VERSION ${ALTERNATOR_CLIENT_CPP_NUMERIC_VERSION}
     DESCRIPTION "ScyllaDB Alternator client-side load balancing helper for AWS SDK for C++"
     LANGUAGES CXX)
 
@@ -58,7 +66,7 @@ add_library(ScyllaDB::alternator_client_cpp ALIAS alternator_client_cpp)
 target_compile_features(alternator_client_cpp PUBLIC cxx_std_17)
 target_compile_definitions(alternator_client_cpp
     PUBLIC
-        SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION="${PROJECT_VERSION}")
+        SCYLLADB_ALTERNATOR_CLIENT_CPP_VERSION="${ALTERNATOR_CLIENT_CPP_VERSION}")
 target_include_directories(alternator_client_cpp
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -227,5 +235,5 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/scylladb-alternator-client-cpp-config-version.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/scylladb-alternator-client-cpp)
 
-install(FILES THIRD_PARTY_NOTICES.md
+install(FILES LICENSE THIRD_PARTY_NOTICES.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR})

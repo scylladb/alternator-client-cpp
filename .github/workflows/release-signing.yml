@@ -15,10 +15,10 @@
 name: Release signing
 on:
   pull_request:
-    paths: ['scripts/release/**', '.github/workflows/*release*', 'Makefile']
+    paths: ['scripts/release/**', '.github/workflows/*release*', '.github/actions/**', 'Makefile', 'VERSION', 'CMakeLists.txt', 'cmake/**']
   push:
     branches: [main]
-    paths: ['scripts/release/**', '.github/workflows/*release*', 'Makefile']
+    paths: ['scripts/release/**', '.github/workflows/*release*', '.github/actions/**', 'Makefile', 'VERSION', 'CMakeLists.txt', 'cmake/**']
 permissions:
   contents: read
 jobs:

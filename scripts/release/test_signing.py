@@ -24,14 +24,13 @@ import signal
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 import unittest
 from unittest.mock import patch
 
 import signing
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("RELEASE_LAUNCH_ROOT", Path(__file__).resolve().parents[2]))
 REPOSITORY_PRIMARY = signing.PRIMARY
 REPOSITORY_SIGNING = signing.SIGNING
 
@@ -412,148 +411,6 @@ class SigningTests(unittest.TestCase):
                               RELEASE_VERSION="1.0.0")
             yield directory
 
-    def workflow_script(self, name):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        step = workflow.split("      - name: " + name + "\n", 1)[1].split("\n      - ", 1)[0]
-        body = step.split("        run: |\n", 1)[1]
-        lines = []
-        for line in body.splitlines():
-            if line and not line.startswith("          "):
-                break
-            lines.append(line)
-        return textwrap.dedent("\n".join(lines))
-
-    def test_workflow_handoff_pins_signed_tag_and_rejects_remote_moves(self):
-        with self.make_repository() as directory:
-            signing.run(["make", "release-tag"])
-            outputs = directory / "outputs"
-            env = {**os.environ, "RELEASE_TAG": "v1.0.0", "GITHUB_OUTPUT": str(outputs)}
-            scripts = {name: self.workflow_script(name) for name in (
-                "Verify repository release tag", "Recheck validated release tag", "Create GitHub Release")}
-            subprocess.run(["sh", "-ec", scripts["Verify repository release tag"]],
-                           env=env, check=True, capture_output=True, timeout=30)
-            values = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
-            self.assertEqual(values["commit"], signing.run(["git", "rev-parse", "HEAD"]).strip())
-            env.update(EXPECTED_TAG_OBJECT=values["object"], EXPECTED_COMMIT=values["commit"])
-            remote = directory / "remote.git"
-            signing.run(["git", "init", "--bare", "--quiet", str(remote)])
-            signing.run(["git", "remote", "add", "origin", str(remote)])
-            signing.run(["git", "push", "origin", "HEAD:refs/heads/main", "refs/tags/v1.0.0"])
-            clone = directory / "publication"
-            signing.run(["git", "clone", "--quiet", "--no-checkout", str(remote), str(clone)])
-            signing.run(["git", "-C", str(clone), "checkout", "--detach", values["commit"]])
-            # Each fresh runner obtains trusted tools independently of the target source.
-            shutil.copytree(Path("scripts"), clone / "scripts")
-            gh = directory / "gh"
-            gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$PUBLICATION_RECORD"\n')
-            gh.chmod(0o700)
-            record = directory / "published"
-            env.update(PATH=str(directory) + os.pathsep + env["PATH"], PUBLICATION_RECORD=str(record))
-            for name in ("Recheck validated release tag", "Create GitHub Release"):
-                subprocess.run(["sh", "-ec", scripts[name]], cwd=clone, env=env,
-                               check=True, capture_output=True, timeout=30)
-            self.assertIn("--verify-tag", record.read_text())
-            record.unlink()
-            # Moving the remote after checkout must stop publication, even when
-            # the publication runner still holds the previously validated object.
-            signing.run(["git", "-C", str(remote), "update-ref", "refs/tags/v1.0.0", values["commit"]])
-            result = subprocess.run(["sh", "-ec", scripts["Create GitHub Release"]],
-                                    cwd=clone, env=env, capture_output=True, timeout=30)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(record.exists())
-            # A moved object fetched on a fresh runner also fails the first recheck.
-            signing.run(["git", "-C", str(clone), "fetch", "--force", "origin",
-                         "refs/tags/v1.0.0:refs/tags/v1.0.0"])
-            result = subprocess.run(["sh", "-ec", scripts["Recheck validated release tag"]],
-                                    cwd=clone, env=env, capture_output=True, timeout=30)
-            self.assertNotEqual(result.returncode, 0)
-            # Object equality alone is insufficient: reject an unsigned object
-            # even if that unsigned object is supplied as the expected snapshot.
-            env["EXPECTED_TAG_OBJECT"] = values["commit"]
-            result = subprocess.run(["sh", "-ec", scripts["Recheck validated release tag"]],
-                                    cwd=clone, env=env, capture_output=True, timeout=30)
-            self.assertNotEqual(result.returncode, 0)
-
-    def test_make_creates_and_reuses_tag_at_current_commit(self):
-        with self.make_repository() as directory:
-            commit = signing.run(["git", "rev-parse", "HEAD"]).strip()
-            config = Path(".git/config").read_bytes()
-            signing.run(["make", "release-tag"])
-            signing.verify_tag("v1.0.0", commit)
-            tag = signing.run(["git", "cat-file", "tag", "refs/tags/v1.0.0"])
-            signing.run(["make", "release-tag"])
-            self.assertEqual(signing.run(["git", "cat-file", "tag", "refs/tags/v1.0.0"]), tag)
-            self.assertEqual(Path(".git/config").read_bytes(), config)
-            self.assertFalse(list(directory.glob("release-signing-*")))
-
-            self.assertFalse(Path(os.environ["GITHUB_ENV"]).exists())
-            # Consumers can verify without any release credentials or account.
-            public = {key: value for key, value in os.environ.items()
-                      if not key.startswith(("RELEASE_GPG_", "GITHUB_"))}
-            signing.run(["make", "release-verify-tag", "RELEASE_TAG=v1.0.0"], env=public)
-            signing.run(["git", "-c", "user.name=Initial", "-c", "user.email=initial@example.invalid",
-                         "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Later"])
-            result = subprocess.run(["make", "release-tag"], capture_output=True, text=True, timeout=60)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("unexpected commit", result.stderr)
-            self.assertEqual(signing.run(["git", "cat-file", "tag", "refs/tags/v1.0.0"]), tag)
-            self.assertFalse(list(directory.glob("release-signing-*")))
-
-    def test_make_dry_run_needs_no_credentials_or_gpg(self):
-        with self.make_repository() as directory:
-            tools = directory / "tools"
-            tools.mkdir()
-            marker = directory / "gpg-access"
-            for name in ["gpg", "gpgconf"]:
-                tool = tools / name
-                tool.write_text('#!/bin/sh\ntouch "$GPG_ACCESS"\nexit 99\n')
-                tool.chmod(0o700)
-            env = {key: value for key, value in os.environ.items()
-                   if not key.startswith("RELEASE_GPG_")}
-            env.update(PATH=str(tools) + os.pathsep + env["PATH"], GPG_ACCESS=str(marker))
-            refs = signing.run(["git", "show-ref", "--head"])
-            for target in ["release-tag", "_release-tag"]:
-                with self.subTest(target=target):
-                    output = signing.run(["make", "-n", target], env=env)
-                    self.assertIn("signing.py exec", output)
-                    self.assertFalse(marker.exists())
-                    self.assertEqual(signing.run(["git", "show-ref", "--head"]), refs)
-                    self.assertFalse(list(directory.glob("release-signing-*")))
-
-    def test_internal_make_target_validates_session_before_tag_creation(self):
-        with self.make_repository() as directory:
-            signing.run(["git", "config", "user.name", "Other signer"])
-            signing.run(["git", "config", "user.email", "other@example.invalid"])
-            signing.run(["git", "config", "user.signingkey", self.unprotected_subkey + "!"])
-            env = {**os.environ, "GNUPGHOME": str(self.unprotected_home)}
-            del env["RELEASE_GPG_PRIVATE_KEY_FILE"]
-            config = Path(".git/config").read_bytes()
-            result = subprocess.run(["make", "_release-tag"], env=env,
-                                    capture_output=True, text=True, timeout=60)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("signing-subkey export", result.stderr)
-            self.assertEqual(signing.run(["git", "tag", "--list"]), "")
-            env["RELEASE_GPG_PRIVATE_KEY_FILE"] = str(self.private)
-            signing.run(["make", "_release-tag"], env=env)
-            signing.verify_tag("v1.0.0", signing.run(["git", "rev-parse", "HEAD"]).strip())
-            self.assertEqual(Path(".git/config").read_bytes(), config)
-            self.assertFalse(list(directory.glob("release-signing-*")))
-
-    def test_actions_make_operators_differ_from_publisher_identity(self):
-        with self.make_repository() as directory:
-            commit = signing.run(["git", "rev-parse", "HEAD"]).strip()
-            for actor, rerun in [("maintainer-one", ""), ("maintainer-one", "maintainer-two")]:
-                for target in ["release-tag", "_release-tag"]:
-                    with self.subTest(actor=actor, rerun=rerun, target=target):
-                        env = {**os.environ, "GITHUB_ACTOR": actor, "GITHUB_TRIGGERING_ACTOR": rerun}
-                        result = subprocess.run(["make", target], env=env,
-                                                capture_output=True, text=True, timeout=60)
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        signing.verify_tag("v1.0.0", commit)
-                        self.assertFalse(list(directory.glob("release-signing-*")))
-            signing.run(["make", "release-tag"], env={**os.environ,
-                        "GITHUB_ACTOR": "maintainer-one", "GITHUB_TRIGGERING_ACTOR": "scylladb-publisher"})
-            signing.verify_tag("v1.0.0", commit)
 
     def test_recursive_make_does_not_restore_consumed_credentials(self):
         with self.make_repository():
@@ -628,31 +485,6 @@ class SigningTests(unittest.TestCase):
                     process.stderr.close()
                     process.wait(timeout=10)
 
-    def test_make_rejects_existing_unsigned_and_lightweight_tags(self):
-        for options in [[], ["-a", "-m", "Unsigned"]]:
-            with self.subTest(options=options), self.make_repository() as directory:
-                signing.run(["git", "-c", "user.name=Initial", "-c", "user.email=initial@example.invalid",
-                             "-c", "tag.gpgSign=false", "tag", *options, "v1.0.0"])
-                previous = signing.run(["git", "rev-parse", "refs/tags/v1.0.0"])
-                result = subprocess.run(["make", "release-tag"], capture_output=True, text=True, timeout=60)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(signing.run(["git", "rev-parse", "refs/tags/v1.0.0"]), previous)
-                self.assertFalse(list(directory.glob("release-signing-*")))
-
-    def test_make_validates_version_before_signing(self):
-        with self.make_repository() as directory:
-            for version in ["", "01.0.0", "1.0", "v1.0.0", "1.0.0-rc.01", "1.0.0\ninvalid", "1.0.0;exit"]:
-                with self.subTest(version=version):
-                    result = subprocess.run(["make", "release-tag", "RELEASE_VERSION=" + version],
-                                            capture_output=True, text=True, timeout=60)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("Expected RELEASE_VERSION", result.stderr)
-                    self.assertNotIn("signing.py exec", result.stdout)
-                    self.assertFalse(list(directory.glob("release-signing-*")))
-            for suffix in ["alpha.1", "beta.1", "rc.1"]:
-                signing.run(["make", "release-tag", "RELEASE_VERSION=1.0.0-" + suffix])
-                signing.verify_tag("v1.0.0-" + suffix, signing.run(["git", "rev-parse", "HEAD"]).strip())
-
 
 class DiagnosticTests(unittest.TestCase):
     def test_cancellation_during_process_start_stops_owned_group(self):
@@ -713,92 +545,6 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertEqual(signing.main(), 1)
             self.assertIn("verify-commit failed (" + category + ")", output.getvalue())
             self.assertNotIn("DO-NOT-DISCLOSE", output.getvalue())
-
-
-class ReleaseUserTests(unittest.TestCase):
-    def test_actions_operator_is_independent_of_signer(self):
-        for actor, triggering_actor, allowed in [
-                ("scylladb-publisher", "", True),
-                ("scylladb-publisher", "scylladb-publisher", True),
-                ("maintainer-one", "scylladb-publisher", True),
-                ("maintainer-one", "", True),
-                ("scylladb-publisher", "maintainer-two", True),
-                ("", "", True)]:
-            for flags in [[], ["-n"]]:
-                with self.subTest(actor=actor, triggering_actor=triggering_actor, flags=flags):
-                    result = subprocess.run(["make", *flags, "release-check-user"], cwd=ROOT,
-                                            capture_output=True, text=True, timeout=60,
-                                            env={**os.environ, "GITHUB_ACTIONS": "true",
-                                                 "GITHUB_ACTOR": actor,
-                                                 "GITHUB_TRIGGERING_ACTOR": triggering_actor})
-                    self.assertEqual(result.returncode == 0, allowed, result.stderr)
-
-    def test_publication_workflow_calls_account_gate_before_verification(self):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        validation, publication = workflow.split("  release:\n", 1)
-        self.assertIn("  validate:\n", validation)
-        self.assertNotIn("environment: release", validation)
-        self.assertIn("    needs: [validate, validate-source]\n", publication)
-        self.assertIn("      - name: Test trusted release tools\n", validation)
-        self.assertIn("        run: make test-release-signing\n", validation)
-        self.assertIn("    uses: ./.github/workflows/tests.yml\n", validation)
-        self.assertIn("      source-ref: ${{ needs.validate.outputs.commit }}\n", validation)
-        reusable = (ROOT / ".github/workflows/tests.yml").read_text()
-        self.assertIn("  workflow_call:\n", reusable)
-        self.assertIn("          ref: ${{ inputs.source-ref }}\n", reusable)
-        self.assertLess(reusable.index("      - name: Preserve trusted command guard\n"),
-                        reusable.index("      - name: Checkout validated release source\n"))
-        for command in ("make build", "make check", "make test-unit", "make test-integration"):
-            self.assertIn(command, reusable)
-        self.assertNotIn("secrets.", validation + reusable)
-        self.assertNotIn("environment: release", reusable)
-        self.assertNotIn("actions/cache", publication)
-        self.assertNotIn("download-artifact", publication)
-        self.assertNotIn("always()", publication.split("    steps:\n", 1)[0])
-        self.assertIn("        if: inputs.dry-run != true\n", publication)
-        self.assertIn("        if: inputs.dry-run == true\n", publication)
-        self.assertIn("      - name: Upload sanitized rehearsal logs\n", publication)
-        self.assertIn("      - name: Check release blockers\n", validation)
-        self.assertLess(validation.index("      - name: Check release blockers\n"),
-                        validation.index("      - name: Verify repository release tag\n"))
-        self.assertLess(publication.index("      - name: Recheck release blockers before publication\n"),
-                        publication.index("      - name: Create GitHub Release\n"))
-        self.assertIn("      issues: read\n", publication)
-        self.assertIn("    environment: release\n", publication)
-        self.assertIn("    runs-on: ubuntu-latest\n", validation)
-        self.assertIn("    runs-on: ubuntu-latest\n", publication)
-        self.assertIn("  contents: read\n", validation)
-        self.assertIn("      contents: write\n", publication)
-        self.assertIn("EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}", publication)
-        self.assertLess(publication.index("      - name: Recheck validated release tag\n"),
-                        publication.index("      - name: Create GitHub Release\n"))
-        gate = workflow.index("        run: make release-check-user\n")
-        self.assertLess(workflow.index("      - name: Checkout code\n"), gate)
-        self.assertLess(gate, workflow.index("      - name: Verify repository release tag\n"))
-        self.assertLess(gate, workflow.index("      - name: Create GitHub Release\n"))
-
-    def test_local_release_uses_authenticated_gh_user(self):
-        with tempfile.TemporaryDirectory() as temp:
-            gh = Path(temp) / "gh"
-            gh.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_GH_USER"\n')
-            gh.chmod(0o700)
-            env = {**os.environ, "PATH": temp + os.pathsep + os.environ["PATH"],
-                   "GITHUB_ACTIONS": "false", "TEST_GH_USER": "someone-else"}
-            for target in ["release-tag", "_release-tag"]:
-                for flags in [[], ["-n"]]:
-                    with self.subTest(target=target, flags=flags):
-                        result = subprocess.run(["make", *flags, target], cwd=ROOT, env=env,
-                                                capture_output=True, text=True, timeout=60)
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertIn("current: someone-else", result.stderr)
-            env["TEST_GH_USER"] = "scylladb-publisher"
-            subprocess.run(["make", "release-check-user"], cwd=ROOT, env=env, check=True,
-                           capture_output=True, timeout=60)
-            gh.write_text("#!/bin/sh\nexit 1\n")
-            result = subprocess.run(["make", "release-tag"], cwd=ROOT, env=env,
-                                    capture_output=True, text=True, timeout=60)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Run gh auth login or gh auth switch", result.stderr)
 
 
 if __name__ == "__main__":

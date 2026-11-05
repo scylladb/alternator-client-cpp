@@ -10,3 +10,4 @@ test/scylla/db.key
 *.dylib
 *.dll
 *.exe
+__pycache__/
