@@ -30,9 +30,17 @@ public:
     virtual ~NodesSource() = default;
 
     [[nodiscard]] virtual std::vector<Url> GetActiveNodes() const = 0;
+    // Active membership for affinity hashing and batch voting. A source with a
+    // separate affinity domain also supplies GetQueryPlanNodesForHash().
+    [[nodiscard]] virtual std::vector<Url> GetActiveKeyRouteAffinityNodes() const {
+        return GetActiveNodes();
+    }
     [[nodiscard]] virtual std::vector<Url> GetQueryPlanNodes() const {
         return GetActiveNodes();
     }
+    // Candidates for this hash, including eligible quarantined affinity nodes.
+    // The default preserves existing sources' ordinary query-plan behavior;
+    // override it alongside the active-affinity getter for a separate domain.
     [[nodiscard]] virtual std::vector<Url> GetQueryPlanNodesForHash(std::int64_t hash) const {
         (void)hash;
         return GetQueryPlanNodes();

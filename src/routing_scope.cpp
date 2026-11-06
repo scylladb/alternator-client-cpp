@@ -82,6 +82,10 @@ RoutingScopePtr RackScope::Fallback() const {
     return fallback_;
 }
 
+const std::string& RackScope::Datacenter() const {
+    return datacenter_;
+}
+
 RoutingScopePtr NewClusterScope() {
     return std::make_shared<ClusterScope>();
 }

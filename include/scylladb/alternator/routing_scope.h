@@ -65,6 +65,7 @@ public:
     [[nodiscard]] std::string ToString() const override;
     [[nodiscard]] std::string LocalNodesQuery() const override;
     [[nodiscard]] RoutingScopePtr Fallback() const override;
+    [[nodiscard]] const std::string& Datacenter() const;
 
 private:
     std::string datacenter_;
