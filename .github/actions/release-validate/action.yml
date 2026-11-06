@@ -1,0 +1,78 @@
+# Copyright ScyllaDB, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Validate release
+description: Validate a stable release tree before protected signing
+inputs:
+  release-version:
+    description: Optional stable X.Y.Z override
+    default: ''
+  skip-tests:
+    description: Skip only project unit and integration execution
+    default: 'false'
+outputs:
+  baseline:
+    description: Validated main commit
+    value: ${{ steps.plan.outputs.baseline }}
+  version:
+    description: Selected stable version
+    value: ${{ steps.plan.outputs.version }}
+  tree:
+    description: Validated release tree
+    value: ${{ steps.plan.outputs.tree }}
+runs:
+  using: composite
+  steps:
+    - name: Preserve launch tools before selecting source
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/release-tools"
+        cp scripts/release/*.py scripts/release/publisher.asc "$RUNNER_TEMP/release-tools/"
+    - name: Plan release
+      id: plan
+      shell: bash
+      env:
+        RELEASE_VERSION: ${{ inputs.release-version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python3 "$RUNNER_TEMP/release-tools/lifecycle.py" plan \
+          --baseline "$GITHUB_SHA" --version "$RELEASE_VERSION" \
+          --plan "$RUNNER_TEMP/release-plan.json" >> "$GITHUB_OUTPUT"
+    - name: Install validation dependencies
+      uses: ./.github/actions/setup-dependencies
+    - name: Validate planned source
+      shell: bash
+      env:
+        RELEASE_SKIP_TESTS: ${{ inputs.skip-tests }}
+        RELEASE_LAUNCH_ROOT: ${{ github.workspace }}
+        RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs/validation
+      run: |
+        python3 "$RUNNER_TEMP/release-tools/guard.py" run \
+          python3 "$RUNNER_TEMP/release-tools/validate.py" \
+          --plan "$RUNNER_TEMP/release-plan.json" --skip-tests "$RELEASE_SKIP_TESTS"
+    - name: Recheck main and version after validation
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$RUNNER_TEMP/release-tools/lifecycle.py" recheck --plan "$RUNNER_TEMP/release-plan.json"
+    - name: Summarize validated release for approval
+      shell: bash
+      env:
+        RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        RELEASE_BASELINE: ${{ steps.plan.outputs.baseline }}
+        RELEASE_TREE: ${{ steps.plan.outputs.tree }}
+        RELEASE_SKIP_TESTS: ${{ inputs.skip-tests }}
+      run: |
+        printf 'Validated release: **v%s**\n\nBaseline: `%s`\n\nRelease tree: `%s`\n\nProject tests skipped: **%s**\n' \
+          "$RELEASE_VERSION" "$RELEASE_BASELINE" "$RELEASE_TREE" "$RELEASE_SKIP_TESTS" >> "$GITHUB_STEP_SUMMARY"

@@ -12,134 +12,112 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Publish Release Notes
-
+name: Release
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'  # Triggers on version tags like v1.0.0
   workflow_dispatch:
     inputs:
-      target-tag:
-        required: true
-        type: string
-        description: Target tag to run on
-      dry-run:
-        description: Rehearse validation, approval and protected signing without publishing
+      release-version:
+        description: Optional stable X.Y.Z override (defaults to VERSION without -SNAPSHOT)
         required: false
-        default: false
+        type: string
+      skip-tests:
+        description: Skip project unit/integration tests only
         type: boolean
-
+        default: false
 permissions:
   contents: read
   issues: read
-
+  pull-requests: read
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AWS_SDK_CPP_VERSION: 1.11.844
+      AWS_SDK_CPP_INSTALL_DIR: ${{ github.workspace }}/.deps/aws-sdk-cpp
+      CMAKE_PREFIX_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp
+      LD_LIBRARY_PATH: ${{ github.workspace }}/.deps/aws-sdk-cpp/lib:${{ github.workspace }}/.deps/aws-sdk-cpp/lib64
     outputs:
-      tag: ${{ steps.tag.outputs.name }}
-      tag-object: ${{ steps.tag.outputs.object }}
-      commit: ${{ steps.tag.outputs.commit }}
+      baseline: ${{ steps.validation.outputs.baseline }}
+      version: ${{ steps.validation.outputs.version }}
+      tree: ${{ steps.validation.outputs.tree }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          fetch-depth: 0
           ref: ${{ github.sha }}
-
-      - name: Check release account policy
-        run: make release-check-user
-
-      - name: Check release blockers
-        if: inputs.dry-run != true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require main dispatch
+        run: test "$GITHUB_REF" = refs/heads/main
+      - name: Check blockers before validation
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release/check_blockers.py --repo "$GITHUB_REPOSITORY"
-
-      - name: Test trusted release tools
-        run: make test-release-signing
-
-      - name: Verify repository release tag
-        id: tag
+      - name: Validate planned release
+        id: validation
+        uses: ./.github/actions/release-validate
+        with:
+          release-version: ${{ inputs.release-version }}
+          skip-tests: ${{ inputs.skip-tests }}
+      - name: Check blockers after validation
         env:
-          RELEASE_TAG: ${{ inputs.target-tag || github.ref_name }}
-        run: |
-          set -eu
-          python3 scripts/release/signing.py verify-tag "$RELEASE_TAG"
-          printf 'name=%s\nobject=%s\ncommit=%s\n' "$RELEASE_TAG" \
-            "$(git rev-parse "refs/tags/$RELEASE_TAG")" \
-            "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" >> "$GITHUB_OUTPUT"
-
-  validate-source:
-    needs: validate
-    # Build/lint/unit/integration checks run against the exact verified commit.
-    # This reusable workflow has read-only access and no deployment environment.
-    uses: ./.github/workflows/tests.yml
-    with:
-      source-ref: ${{ needs.validate.outputs.commit }}
-
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/release-tools/check_blockers.py" --repo "$GITHUB_REPOSITORY"
+      - name: Upload sanitized validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-validation-logs
+          path: ${{ runner.temp }}/release-logs/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
   release:
-    needs: [validate, validate-source]
+    needs: validate
     runs-on: ubuntu-latest
-    # Approval is requested only after validation; publication gets a fresh runner.
+    timeout-minutes: 20
     environment: release
+    concurrency:
+      group: alternator-client-cpp-release
+      cancel-in-progress: false
     permissions:
       contents: write
       issues: read
+      pull-requests: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          fetch-depth: 0
           ref: ${{ github.sha }}
-
-      - name: Check release account policy
-        run: make release-check-user
-
-      - name: Recheck validated release tag
-        env:
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
-          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
-        run: |
-          set -eu
-          test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$EXPECTED_TAG_OBJECT"
-          python3 scripts/release/signing.py verify-tag "$RELEASE_TAG" "$EXPECTED_COMMIT"
-
-      - name: Recheck release blockers before publication
-        if: inputs.dry-run != true
+          fetch-depth: 0
+      - name: Check blockers after approval
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release/check_blockers.py --repo "$GITHUB_REPOSITORY"
-
-      - name: Rehearse protected signing
-        if: inputs.dry-run == true
-        env:
-          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          RELEASE_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs
-        run: python3 scripts/release/signing.py exec python3 -c 'print("Protected signing rehearsal passed")'
-
-      - name: Upload sanitized rehearsal logs
-        if: always() && inputs.dry-run == true
+      - name: Prepare signed release
+        uses: ./.github/actions/release-prepare
+        with:
+          baseline: ${{ needs.validate.outputs.baseline }}
+          release-version: ${{ needs.validate.outputs.version }}
+          tree: ${{ needs.validate.outputs.tree }}
+          signing-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          signing-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Retain exact recovery objects and assets before remote changes
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-rehearsal-logs
-          path: ${{ runner.temp }}/release-logs/*.log
-          if-no-files-found: ignore
-
-      - name: Create GitHub Release
-        if: inputs.dry-run != true
-        run: |
-          set -eu
-          remote_object=$(git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" | cut -f1)
-          test "$remote_object" = "$EXPECTED_TAG_OBJECT"
-          gh release create "$RELEASE_TAG" \
-            --generate-notes \
-            --title "$RELEASE_TAG" \
-            --verify-tag
+          name: release-recovery-${{ needs.validate.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-recovery/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Atomically push and publish verified draft
         env:
-          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag-object }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 "$RUNNER_TEMP/release-tools/lifecycle.py" publish \
+            --output "$RUNNER_TEMP/release-recovery"
+      - name: Upload sanitized preparation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-preparation-logs
+          path: ${{ runner.temp }}/release-logs/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
