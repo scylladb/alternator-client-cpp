@@ -567,7 +567,7 @@ TEST(HttpClient, RejectsUnacceptedResponseEncoding) {
     CurlHttpClient client(cfg);
 
     EXPECT_THROW(
-        client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes")),
+        (void)client.Get(Url("http", "127.0.0.1", server.Port()).WithPathAndQuery("/localnodes")),
         std::runtime_error);
 }
 

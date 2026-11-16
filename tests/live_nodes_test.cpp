@@ -326,7 +326,7 @@ TEST(AlternatorLiveNodes, KeyRouteAffinityUsesDatacenterNodesAcrossRackScopes) {
         retry_nodes.push_back(node);
     }
     EXPECT_EQ(SortAndDedupeNodes(retry_nodes), dc_nodes);
-    EXPECT_THROW(QueryPlanForPartitionKey(rack1_nodes, {}, "orders", metadata), std::invalid_argument);
+    EXPECT_THROW((void)QueryPlanForPartitionKey(rack1_nodes, {}, "orders", metadata), std::invalid_argument);
 
     rack1_nodes.ReportNodeResult(target, NodeHealthObservation::ConnectionFailure);
     EXPECT_EQ(Hosts(rack1_nodes.GetActiveKeyRouteAffinityNodes()),
