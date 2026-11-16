@@ -439,6 +439,13 @@ The AWS helper also exposes typed write methods that inspect SDK request objects
 `BatchWriteItem` in `AnyWrite` mode using batch-write voting. If metadata is missing or the partition key cannot be
 hashed, the current request uses the normal query plan and discovery is triggered for later requests:
 
+With the HTTP client factory installed, eligible typed writes retain their complete affinity
+plan for SDK retries. Each attempt uses the next captured coordinator, even if discovery changes
+between attempts. After exhausting the captured list, remaining SDK attempts keep its last
+coordinator; the SDK's retry limit still applies. A missing or malformed SDK attempt header uses
+the first captured coordinator. The request's cancellation callback remains active. Ordinary
+requests and clients constructed for a fixed endpoint keep their existing retry behavior.
+
 ```cpp
 Aws::DynamoDB::Model::PutItemRequest put;
 put.SetTableName("orders");

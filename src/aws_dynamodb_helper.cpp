@@ -44,15 +44,21 @@
 #include <aws/dynamodb/model/WriteRequest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <ios>
 #include <istream>
 #include <iterator>
+#include <memory>
 #include <set>
 #include <stdexcept>
+#include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace scylladb::alternator::aws {
 namespace {
@@ -273,6 +279,54 @@ bool IsFirstSdkAttempt(const Aws::Http::HttpRequest& request) {
     return value_pos < header.size() && header[value_pos] == '1';
 }
 
+struct CapturedAffinityPlan {
+    std::shared_ptr<const std::vector<Url>> nodes;
+    std::shared_ptr<AlternatorLiveNodes> owner_nodes;
+    Aws::Http::ContinueRequestHandler previous_handler;
+    std::shared_ptr<std::atomic<bool>> transport_reported;
+
+    bool operator()(const Aws::Http::HttpRequest* request) const {
+        return !previous_handler || previous_handler(request);
+    }
+
+    Url NodeForAttempt(const Aws::Http::HttpRequest& request) const {
+        const auto header = request.GetHeaderValue(Aws::Http::SDK_REQUEST_HEADER);
+        std::string_view remaining(header.data(), header.size());
+        std::size_t attempt = 1;
+        bool found_attempt = false;
+        while (!remaining.empty()) {
+            const auto separator = remaining.find(';');
+            auto field = remaining.substr(0, separator);
+            while (!field.empty() && (field.front() == ' ' || field.front() == '\t')) {
+                field.remove_prefix(1);
+            }
+            while (!field.empty() && (field.back() == ' ' || field.back() == '\t')) {
+                field.remove_suffix(1);
+            }
+            constexpr std::string_view prefix = "attempt=";
+            if (field.substr(0, prefix.size()) == prefix) {
+                if (found_attempt) {
+                    return nodes->front();
+                }
+                found_attempt = true;
+                const auto value = field.substr(prefix.size());
+                std::size_t parsed = 0;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed == 0) {
+                    return nodes->front();
+                }
+                attempt = parsed;
+            }
+            if (separator == std::string_view::npos) {
+                break;
+            }
+            remaining.remove_prefix(separator + 1);
+        }
+        // Keep remaining SDK attempts on the last captured node after exhaustion.
+        return nodes->at(std::min(attempt, nodes->size()) - 1);
+    }
+};
+
 std::set<std::string> NormalizeHeaderAllowlist(const std::vector<std::string>& headers) {
     std::set<std::string> allowlist;
     for (const auto& header : headers) {
@@ -320,6 +374,14 @@ void OptimizeRequestHeaders(const std::shared_ptr<Aws::Http::HttpRequest>& reque
 Url SelectAttemptNode(const std::shared_ptr<Aws::Http::HttpRequest>& request,
                       const std::shared_ptr<AlternatorLiveNodes>& nodes,
                       std::uint16_t endpoint_override_port) {
+    if (request) {
+        const auto* captured = request->GetContinueRequestHandler().target<CapturedAffinityPlan>();
+        if (captured) {
+            const auto node = captured->NodeForAttempt(*request);
+            RewriteRequestEndpoint(request, node);
+            return node;
+        }
+    }
     if (!request || !IsAlternatorEndpoint(request->GetUri(), *nodes, endpoint_override_port)) {
         return {};
     }
@@ -386,7 +448,13 @@ public:
                 content_encoding_decoders_);
         }
         if (!node.Empty()) {
-            nodes_->ReportNodeResult(node, ObservationFromHttpResult(response));
+            const auto* captured = request->GetContinueRequestHandler().target<CapturedAffinityPlan>();
+            // The process-wide factory can belong to a different helper.
+            const auto& health_nodes = captured ? captured->owner_nodes : nodes_;
+            health_nodes->ReportNodeResult(node, ObservationFromHttpResult(response));
+            if (captured) {
+                captured->transport_reported->store(true);
+            }
         }
         return response;
     }
@@ -648,28 +716,72 @@ WriteOperationOptions UpdateItemOptions(const Aws::DynamoDB::Model::UpdateItemRe
     return options;
 }
 
-QueryPlan DefaultQueryPlanFor(const DynamoDBHelper& helper) {
-    return QueryPlan::FromNodesSource(*helper.Nodes());
+struct RequestRoutingPlan {
+    QueryPlan plan;
+    bool affinity = false;
+};
+
+// Record the candidates actually read by the core planner, including its
+// ordinary fallback, without sampling health a second time to classify the plan.
+class RoutingPlanNodesSource final : public NodesSource {
+public:
+    explicit RoutingPlanNodesSource(const NodesSource& source) : source_(source) {}
+
+    std::vector<Url> GetActiveNodes() const override {
+        return source_.GetActiveNodes();
+    }
+    std::vector<Url> GetActiveKeyRouteAffinityNodes() const override {
+        return ObserveAffinity(source_.GetActiveKeyRouteAffinityNodes());
+    }
+    std::vector<Url> GetQueryPlanNodes() const override {
+        return source_.GetQueryPlanNodes();
+    }
+    std::vector<Url> GetQueryPlanNodesForHash(std::int64_t hash) const override {
+        return ObserveAffinity(source_.GetQueryPlanNodesForHash(hash));
+    }
+    std::vector<Url> GetDownNodes() const override {
+        return source_.GetDownNodes();
+    }
+    bool HasAffinityCandidates() const {
+        return has_affinity_candidates_;
+    }
+
+private:
+    std::vector<Url> ObserveAffinity(std::vector<Url> candidates) const {
+        has_affinity_candidates_ = has_affinity_candidates_ || !candidates.empty();
+        return candidates;
+    }
+
+    const NodesSource& source_;
+    mutable bool has_affinity_candidates_ = false;
+};
+
+RequestRoutingPlan DefaultQueryPlanFor(const DynamoDBHelper& helper) {
+    return {QueryPlan::FromNodesSource(*helper.Nodes()), false};
 }
 
-QueryPlan PartitionKeyQueryPlanFor(
+RequestRoutingPlan PartitionKeyQueryPlanFor(
     const DynamoDBHelper& helper,
     const Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue>& values,
     const Aws::String& table_name) {
     const auto table = std::string(table_name.c_str());
     const auto key_name = helper.GetPartitionKeyName(table);
     if (key_name.empty()) {
-        return helper.NewPartitionKeyQueryPlan({}, table);
+        return {helper.NewPartitionKeyQueryPlan({}, table), false};
     }
 
     try {
-        return helper.NewPartitionKeyQueryPlan(PartitionKeyOnlyAttributeMap(values, key_name), table);
+        const PartitionKeyMetadata metadata({{table, key_name}});
+        RoutingPlanNodesSource source(*helper.Nodes());
+        auto plan = QueryPlanForPartitionKey(
+            source, PartitionKeyOnlyAttributeMap(values, key_name), table, metadata);
+        return {std::move(plan), source.HasAffinityCandidates()};
     } catch (const std::invalid_argument&) {
-        return helper.NewPartitionKeyQueryPlan({}, table);
+        return {helper.NewPartitionKeyQueryPlan({}, table), false};
     }
 }
 
-QueryPlan PutItemQueryPlanFor(const DynamoDBHelper& helper,
+RequestRoutingPlan PutItemQueryPlanFor(const DynamoDBHelper& helper,
                               const Aws::DynamoDB::Model::PutItemRequest& request) {
     if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::PutItem, PutItemOptions(request))) {
         return DefaultQueryPlanFor(helper);
@@ -677,7 +789,7 @@ QueryPlan PutItemQueryPlanFor(const DynamoDBHelper& helper,
     return PartitionKeyQueryPlanFor(helper, request.GetItem(), request.GetTableName());
 }
 
-QueryPlan UpdateItemQueryPlanFor(const DynamoDBHelper& helper,
+RequestRoutingPlan UpdateItemQueryPlanFor(const DynamoDBHelper& helper,
                                  const Aws::DynamoDB::Model::UpdateItemRequest& request) {
     if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::UpdateItem, UpdateItemOptions(request))) {
         return DefaultQueryPlanFor(helper);
@@ -685,7 +797,7 @@ QueryPlan UpdateItemQueryPlanFor(const DynamoDBHelper& helper,
     return PartitionKeyQueryPlanFor(helper, request.GetKey(), request.GetTableName());
 }
 
-QueryPlan DeleteItemQueryPlanFor(const DynamoDBHelper& helper,
+RequestRoutingPlan DeleteItemQueryPlanFor(const DynamoDBHelper& helper,
                                  const Aws::DynamoDB::Model::DeleteItemRequest& request) {
     if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::DeleteItem, DeleteItemOptions(request))) {
         return DefaultQueryPlanFor(helper);
@@ -733,20 +845,6 @@ std::vector<BatchWriteOperation> BatchWriteOperationsFor(const DynamoDBHelper& h
         }
     }
     return operations;
-}
-
-QueryPlan BatchWriteItemQueryPlanFor(const DynamoDBHelper& helper,
-                                     const Aws::DynamoDB::Model::BatchWriteItemRequest& request) {
-    // A default PutItem is affinity-routed only in AnyWrite mode; batch writes follow the same rule.
-    if (!helper.ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::PutItem, {})) {
-        return DefaultQueryPlanFor(helper);
-    }
-
-    auto operations = BatchWriteOperationsFor(helper, request);
-    if (operations.empty()) {
-        return DefaultQueryPlanFor(helper);
-    }
-    return helper.NewBatchWriteQueryPlan(operations);
 }
 
 } // namespace
@@ -824,29 +922,56 @@ std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDB() con
 Aws::DynamoDB::Model::PutItemOutcome DynamoDBHelper::PutItem(
     const Aws::DynamoDB::Model::PutItemRequest& request) const {
     auto routed_request = request;
-    AttachNodeErrorReporter(routed_request);
-    return NewDynamoDBForQueryPlan(PutItemQueryPlanFor(*this, request))->PutItem(routed_request);
+    auto routing = PutItemQueryPlanFor(*this, request);
+    if (!routing.affinity) {
+        AttachNodeErrorReporter(routed_request);
+    }
+    return NewDynamoDBForQueryPlan(std::move(routing.plan), routing.affinity ? &routed_request : nullptr)
+        ->PutItem(routed_request);
 }
 
 Aws::DynamoDB::Model::UpdateItemOutcome DynamoDBHelper::UpdateItem(
     const Aws::DynamoDB::Model::UpdateItemRequest& request) const {
     auto routed_request = request;
-    AttachNodeErrorReporter(routed_request);
-    return NewDynamoDBForQueryPlan(UpdateItemQueryPlanFor(*this, request))->UpdateItem(routed_request);
+    auto routing = UpdateItemQueryPlanFor(*this, request);
+    if (!routing.affinity) {
+        AttachNodeErrorReporter(routed_request);
+    }
+    return NewDynamoDBForQueryPlan(std::move(routing.plan), routing.affinity ? &routed_request : nullptr)
+        ->UpdateItem(routed_request);
 }
 
 Aws::DynamoDB::Model::DeleteItemOutcome DynamoDBHelper::DeleteItem(
     const Aws::DynamoDB::Model::DeleteItemRequest& request) const {
     auto routed_request = request;
-    AttachNodeErrorReporter(routed_request);
-    return NewDynamoDBForQueryPlan(DeleteItemQueryPlanFor(*this, request))->DeleteItem(routed_request);
+    auto routing = DeleteItemQueryPlanFor(*this, request);
+    if (!routing.affinity) {
+        AttachNodeErrorReporter(routed_request);
+    }
+    return NewDynamoDBForQueryPlan(std::move(routing.plan), routing.affinity ? &routed_request : nullptr)
+        ->DeleteItem(routed_request);
 }
 
 Aws::DynamoDB::Model::BatchWriteItemOutcome DynamoDBHelper::BatchWriteItem(
     const Aws::DynamoDB::Model::BatchWriteItemRequest& request) const {
     auto routed_request = request;
-    AttachNodeErrorReporter(routed_request);
-    return NewDynamoDBForQueryPlan(BatchWriteItemQueryPlanFor(*this, request))->BatchWriteItem(routed_request);
+    auto routing = [&]() -> RequestRoutingPlan {
+        // A default PutItem and batch writes share the AnyWrite eligibility rule.
+        if (!ShouldUseKeyRouteAffinityForWrite(WriteOperationKind::PutItem, {})) {
+            return DefaultQueryPlanFor(*this);
+        }
+        auto operations = BatchWriteOperationsFor(*this, request);
+        if (operations.empty()) {
+            return DefaultQueryPlanFor(*this);
+        }
+        auto result = NewBatchWriteRoutingPlan(operations);
+        return {std::move(result.first), result.second};
+    }();
+    if (!routing.affinity) {
+        AttachNodeErrorReporter(routed_request);
+    }
+    return NewDynamoDBForQueryPlan(std::move(routing.plan), routing.affinity ? &routed_request : nullptr)
+        ->BatchWriteItem(routed_request);
 }
 
 std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBWithEndpointProvider(
@@ -885,10 +1010,40 @@ std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBForNod
     return client;
 }
 
-std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBForQueryPlan(QueryPlan plan) const {
+std::shared_ptr<Aws::DynamoDB::DynamoDBClient> DynamoDBHelper::NewDynamoDBForQueryPlan(
+    QueryPlan plan, Aws::AmazonWebServiceRequest* affinity_request) const {
     const auto node = plan.Next();
     if (node.Empty()) {
+        if (affinity_request) {
+            AttachNodeErrorReporter(*affinity_request);
+        }
         return NewDynamoDB();
+    }
+    if (affinity_request) {
+        auto captured = std::make_shared<std::vector<Url>>();
+        captured->push_back(node);
+        for (auto next = plan.Next(); !next.Empty(); next = plan.Next()) {
+            captured->push_back(next);
+        }
+        const auto previous_retry_handler = affinity_request->GetRequestRetryHandler();
+        AttachNodeErrorReporter(*affinity_request);
+        const auto fallback_retry_handler = affinity_request->GetRequestRetryHandler();
+        auto transport_reported = std::make_shared<std::atomic<bool>>(false);
+        affinity_request->SetRequestRetryHandler(
+            [transport_reported, previous_retry_handler, fallback_retry_handler](
+                const Aws::AmazonWebServiceRequest& retry_request) {
+                // The transport reports the actual destination, which can differ
+                // from the signed endpoint. Keep the old reporter without it.
+                if (!transport_reported->load()) {
+                    fallback_retry_handler(retry_request);
+                } else if (previous_retry_handler) {
+                    previous_retry_handler(retry_request);
+                }
+            });
+        // The SDK copies this callback unchanged to each HTTP attempt. Its callable
+        // carries immutable request-local routing while preserving cancellation.
+        affinity_request->SetContinueRequestHandler(CapturedAffinityPlan{
+            std::move(captured), nodes_, affinity_request->GetContinueRequestHandler(), std::move(transport_reported)});
     }
     return NewDynamoDBForNode(node);
 }
@@ -1020,11 +1175,18 @@ QueryPlan DynamoDBHelper::NewPartitionKeyQueryPlan(const AttributeMap& values,
 }
 
 QueryPlan DynamoDBHelper::NewBatchWriteQueryPlan(const std::vector<BatchWriteOperation>& operations) const {
+    return NewBatchWriteRoutingPlan(operations).first;
+}
+
+std::pair<QueryPlan, bool> DynamoDBHelper::NewBatchWriteRoutingPlan(
+    const std::vector<BatchWriteOperation>& operations) const {
     TriggerPartitionKeyDiscoveryForMissingMetadata(operations);
     try {
-        return QueryPlanForBatchWrite(*nodes_, operations, *partition_keys_);
+        RoutingPlanNodesSource source(*nodes_);
+        auto plan = QueryPlanForBatchWrite(source, operations, *partition_keys_);
+        return {std::move(plan), source.HasAffinityCandidates()};
     } catch (const std::invalid_argument&) {
-        return DefaultQueryPlan();
+        return {DefaultQueryPlan(), false};
     }
 }
 

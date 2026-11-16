@@ -18,6 +18,10 @@
 
 #include <aws/core/Aws.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
+#include <aws/core/http/HttpClient.h>
+#include <aws/core/http/HttpClientFactory.h>
+#include <aws/core/http/HttpResponse.h>
+#include <aws/core/http/standard/StandardHttpRequest.h>
 #include <aws/core/utils/json/JsonSerializer.h>
 #include <aws/dynamodb/model/BatchWriteItemRequest.h>
 #include <aws/dynamodb/model/DeleteItemRequest.h>
@@ -43,6 +47,7 @@
 #endif
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstring>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
@@ -50,6 +55,7 @@
 #endif
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -630,6 +636,19 @@ std::string PartitionKeyForHost(const aws::DynamoDBHelper& helper,
     return {};
 }
 
+class AffinityRetryDiscovery final : public HttpClient {
+public:
+    HttpResponse Get(const Url& url) const override {
+        if (url.query == "dc=A&rack=r1") {
+            return {200, R"(["rack.invalid"])"};
+        }
+        EXPECT_EQ(url.query, "dc=A");
+        return {200, replaced.load() ? R"(["replacement.invalid"])" : R"(["localhost","127.0.0.1"])"};
+    }
+
+    std::atomic<bool> replaced{false};
+};
+
 } // namespace
 
 TEST(AwsDynamoDBHelper, SequenceServerWaitFinishesWithoutExpectedRequests) {
@@ -870,7 +889,7 @@ TEST(AwsDynamoDBHelper, TypedPutItemUsesSameCoordinatorForSamePartitionKey) {
     EXPECT_NE(server.Requests()[1].find("PutItem"), std::string::npos);
 }
 
-TEST(AwsDynamoDBHelper, DiscoveredDatacenterAffinityUsesTransportHooksWithoutChangingRetryDestination) {
+TEST(AwsDynamoDBHelper, DiscoveredDatacenterAffinityUsesTransportHooksAndCapturedRetryPlan) {
     class ScopedDiscovery final : public HttpClient {
     public:
         HttpResponse Get(const Url& url) const override {
@@ -927,13 +946,384 @@ TEST(AwsDynamoDBHelper, DiscoveredDatacenterAffinityUsesTransportHooksWithoutCha
     server.Wait();
     ASSERT_EQ(server.Requests().size(), 6U);
     for (std::size_t i = 0; i < server.Requests().size(); ++i) {
-        EXPECT_EQ(HostHeader(server.Requests()[i]), (i == 2 || i == 3 ? rack : peer).Authority());
+        EXPECT_EQ(HostHeader(server.Requests()[i]), (i == 2 || i == 3 || i == 5 ? rack : peer).Authority());
         EXPECT_EQ(RequestHeaders(server.Requests()[i]).count("content-type"), 0U);
     }
     const auto active = helper->Nodes()->GetActiveKeyRouteAffinityNodes();
     EXPECT_EQ(active, std::vector<Url>({rack}));
     helper->ReportNodeResult(peer, NodeHealthObservation::Success);
+    EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), std::vector<Url>({rack}));
+    helper->ReportNodeResult(peer, NodeHealthObservation::Success);
     EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), SortAndDedupeNodes({rack, peer}));
+}
+
+TEST(AwsDynamoDBHelper, AffinitySdkRetriesKeepCapturedNodesAcrossRefreshForSingleAndBatchWrites) {
+    KeepAliveSequenceHttpServer server({
+        {503, "Service Unavailable", R"({"__type":"ServiceUnavailable","message":"retry"})"},
+        {200, "OK", "{}"},
+        {503, "Service Unavailable", R"({"__type":"ServiceUnavailable","message":"retry"})"},
+        {200, "OK", "{}"},
+    }, false);
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.routing_scope = NewRackScope("A", "r1");
+    cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+    cfg.node_health.disabled = true;
+    auto discovery = std::make_shared<AffinityRetryDiscovery>();
+    auto prepared = std::make_unique<aws::DynamoDBHelper>(std::vector<std::string>{"127.0.0.1"}, cfg, discovery);
+    prepared->UpdateLiveNodes();
+    Aws::SDKOptions options;
+    prepared->ApplyToSDKOptions(options);
+    AwsApiGuard api(options);
+    auto helper = std::move(prepared);
+    const auto key = PartitionKeyForHost(*helper, "orders", "localhost");
+    ASSERT_FALSE(key.empty());
+    auto refresh = [&](const Aws::AmazonWebServiceRequest&) {
+        discovery->replaced = true;
+        helper->UpdateLiveNodes();
+    };
+    auto put = NewPutItemRequest();
+    put.AddItem("id", AwsStringValue(key));
+    put.SetRequestRetryHandler(refresh);
+    EXPECT_TRUE(helper->PutItem(put).IsSuccess());
+    EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes().front().host, "replacement.invalid");
+
+    discovery->replaced = false;
+    helper->UpdateLiveNodes();
+    Aws::DynamoDB::Model::PutRequest item;
+    item.AddItem("id", AwsStringValue(key));
+    Aws::DynamoDB::Model::WriteRequest write;
+    write.SetPutRequest(item);
+    Aws::DynamoDB::Model::BatchWriteItemRequest batch;
+    batch.AddRequestItems("orders", {write});
+    batch.SetRequestRetryHandler(refresh);
+    EXPECT_TRUE(helper->BatchWriteItem(batch).IsSuccess());
+    server.Wait();
+    ASSERT_EQ(server.Requests().size(), 4U);
+    for (std::size_t i = 0; i < server.Requests().size(); ++i) {
+        EXPECT_EQ(HostHeader(server.Requests()[i]),
+                  Url("http", i % 2 == 0 ? "localhost" : "127.0.0.1", server.Port()).Authority());
+    }
+}
+
+TEST(AwsDynamoDBHelper, AffinityRetryHealthUsesActualAttemptsAndPreservesFallbackReporter) {
+    enum class Factory { None, RequestOwner, OtherHelper };
+    for (const auto factory : {Factory::None, Factory::RequestOwner, Factory::OtherHelper}) {
+        const bool use_transport = factory != Factory::None;
+        for (const bool batch_write : {false, true}) {
+            for (const int failed_attempts : {1, 2}) {
+                SCOPED_TRACE(::testing::Message() << "factory=" << static_cast<int>(factory)
+                             << " batch=" << batch_write << " failures=" << failed_attempts);
+                std::vector<SequencedHttpResponse> responses;
+                for (int i = 0; i < failed_attempts; ++i) {
+                    responses.push_back({503, "Service Unavailable",
+                        R"({"__type":"ServiceUnavailable","message":"retry"})"});
+                }
+                responses.push_back({200, "OK", "{}"});
+                KeepAliveSequenceHttpServer server(std::move(responses), false);
+                auto cfg = DiscoveryTestConfig(server.Port());
+                cfg.routing_scope = NewRackScope("A", "r1");
+                cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+                cfg.node_health.consecutive_server_error_threshold = 3;
+                cfg.node_health.quarantine_success_threshold = 2;
+                auto prepared = std::make_unique<aws::DynamoDBHelper>(
+                    std::vector<std::string>{"127.0.0.1"}, cfg, std::make_shared<AffinityRetryDiscovery>());
+                prepared->UpdateLiveNodes();
+                auto foreign = std::make_unique<aws::DynamoDBHelper>(
+                    std::vector<std::string>{"foreign.invalid"}, cfg);
+                const auto foreign_membership = foreign->Nodes()->GetActiveKeyRouteAffinityNodes();
+                Aws::SDKOptions options;
+                if (factory == Factory::RequestOwner) {
+                    prepared->ApplyToSDKOptions(options);
+                } else if (factory == Factory::OtherHelper) {
+                    foreign->ApplyToSDKOptions(options);
+                }
+                AwsApiGuard api(options);
+                auto helper = std::move(prepared);
+                const auto key = PartitionKeyForHost(*helper, "orders", "localhost");
+                ASSERT_FALSE(key.empty());
+                int signed_attempts = 0;
+                int retries = 0;
+                auto signed_handler = [&](const Aws::Http::HttpRequest&) { ++signed_attempts; };
+                auto retry_handler = [&](const Aws::AmazonWebServiceRequest&) { ++retries; };
+                if (batch_write) {
+                    Aws::DynamoDB::Model::PutRequest item;
+                    item.AddItem("id", AwsStringValue(key));
+                    Aws::DynamoDB::Model::WriteRequest write;
+                    write.SetPutRequest(item);
+                    Aws::DynamoDB::Model::BatchWriteItemRequest request;
+                    request.AddRequestItems("orders", {write});
+                    request.SetRequestSignedHandler(signed_handler);
+                    request.SetRequestRetryHandler(retry_handler);
+                    EXPECT_TRUE(helper->BatchWriteItem(request).IsSuccess());
+                } else {
+                    auto request = NewPutItemRequest();
+                    request.AddItem("id", AwsStringValue(key));
+                    request.SetRequestSignedHandler(signed_handler);
+                    request.SetRequestRetryHandler(retry_handler);
+                    EXPECT_TRUE(helper->PutItem(request).IsSuccess());
+                }
+                server.Wait();
+                EXPECT_EQ(signed_attempts, failed_attempts + 1);
+                EXPECT_EQ(retries, failed_attempts);
+                ASSERT_EQ(server.Requests().size(), static_cast<std::size_t>(failed_attempts + 1));
+                const Url first("http", "localhost", server.Port());
+                const Url second("http", "127.0.0.1", server.Port());
+                for (std::size_t i = 0; i < server.Requests().size(); ++i) {
+                    EXPECT_EQ(HostHeader(server.Requests()[i]),
+                              (use_transport && i > 0 ? second : first).Authority());
+                }
+                const auto both = SortAndDedupeNodes({first, second});
+                EXPECT_EQ(foreign->Nodes()->GetActiveKeyRouteAffinityNodes(), foreign_membership);
+                EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), both);
+                // Each failed attempt counts once against its actual destination.
+                // Without the transport, all attempts use the first endpoint and
+                // retain the SDK retry reporter's existing error-only observations.
+                const int first_errors = use_transport ? 1 : failed_attempts;
+                for (int i = first_errors; i < 2; ++i) {
+                    helper->ReportNodeResult(first, NodeHealthObservation::ServerError);
+                }
+                EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), both);
+                helper->ReportNodeResult(first, NodeHealthObservation::ServerError);
+                EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), std::vector<Url>({second}));
+                // A successful retry at the second node leaves its error count reset.
+                helper->ReportNodeResult(second, NodeHealthObservation::ServerError);
+                helper->ReportNodeResult(second, NodeHealthObservation::ServerError);
+                EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes(), std::vector<Url>({second}));
+            }
+        }
+    }
+}
+
+TEST(AwsDynamoDBHelper, AffinityWithoutUsableTargetsKeepsOrdinarySdkRetrySelection) {
+    class ScopedDiscovery final : public HttpClient {
+    public:
+        HttpResponse Get(const Url& url) const override {
+            if (url.query == "dc=A&rack=r1") {
+                return {200, R"(["localhost","127.0.0.1"])"};
+            }
+            EXPECT_EQ(url.query, "dc=A");
+            return {200, R"(["affinity.invalid"])"};
+        }
+    };
+    for (const bool batch_write : {false, true}) {
+        SCOPED_TRACE(batch_write);
+        KeepAliveSequenceHttpServer server({
+            {503, "Service Unavailable", R"({"__type":"ServiceUnavailable","message":"retry"})"},
+            {503, "Service Unavailable", R"({"__type":"ServiceUnavailable","message":"retry"})"},
+            {200, "OK", "{}"},
+        }, false);
+        auto cfg = DiscoveryTestConfig(server.Port());
+        cfg.routing_scope = NewRackScope("A", "r1");
+        cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+        cfg.node_health.consecutive_server_error_threshold = 1;
+        cfg.node_health.quarantine_success_threshold = 2;
+        auto prepared = std::make_unique<aws::DynamoDBHelper>(
+            std::vector<std::string>{"127.0.0.1"}, cfg, std::make_shared<ScopedDiscovery>());
+        prepared->UpdateLiveNodes();
+        Aws::SDKOptions options;
+        prepared->ApplyToSDKOptions(options);
+        AwsApiGuard api(options);
+        auto helper = std::move(prepared);
+        helper->ReportNodeResult(Url("http", "affinity.invalid", server.Port()),
+                                 NodeHealthObservation::ConnectionFailure);
+        ASSERT_TRUE(helper->Nodes()->GetActiveKeyRouteAffinityNodes().empty());
+        const auto key = PartitionKeyForHost(*helper, "orders", "localhost");
+        ASSERT_FALSE(key.empty());
+        const Url first("http", "localhost", server.Port());
+        const Url second("http", "127.0.0.1", server.Port());
+        int retries = 0;
+        auto recover_first = [&](const Aws::AmazonWebServiceRequest&) {
+            if (++retries == 2) {
+                helper->ReportNodeResult(first, NodeHealthObservation::Success);
+                helper->ReportNodeResult(first, NodeHealthObservation::Success);
+            }
+        };
+        if (batch_write) {
+            Aws::DynamoDB::Model::PutRequest item;
+            item.AddItem("id", AwsStringValue(key));
+            Aws::DynamoDB::Model::WriteRequest write;
+            write.SetPutRequest(item);
+            Aws::DynamoDB::Model::BatchWriteItemRequest request;
+            request.AddRequestItems("orders", {write});
+            request.SetRequestRetryHandler(recover_first);
+            EXPECT_TRUE(helper->BatchWriteItem(request).IsSuccess());
+        } else {
+            auto request = NewPutItemRequest();
+            request.AddItem("id", AwsStringValue(key));
+            request.SetRequestRetryHandler(recover_first);
+            EXPECT_TRUE(helper->PutItem(request).IsSuccess());
+        }
+        server.Wait();
+        ASSERT_EQ(server.Requests().size(), 3U);
+        EXPECT_EQ(HostHeader(server.Requests()[0]), first.Authority());
+        EXPECT_EQ(HostHeader(server.Requests()[1]), second.Authority());
+        EXPECT_EQ(HostHeader(server.Requests()[2]), first.Authority());
+        EXPECT_EQ(retries, 2);
+    }
+}
+
+TEST(AwsDynamoDBHelper, ConcurrentAffinityCallsHaveIndependentSdkRetryPlans) {
+    KeepAliveSequenceHttpServer server({
+        {503, "Service Unavailable", R"({"__type":"ServiceUnavailable","message":"retry"})"},
+        {503, "Service Unavailable", R"({"__type":"ServiceUnavailable","message":"retry"})"},
+        {200, "OK", "{}"},
+        {200, "OK", "{}"},
+    }, false);
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.routing_scope = NewRackScope("A", "r1");
+    cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+    cfg.node_health.disabled = true;
+    auto prepared = std::make_unique<aws::DynamoDBHelper>(
+        std::vector<std::string>{"127.0.0.1"}, cfg, std::make_shared<AffinityRetryDiscovery>());
+    prepared->UpdateLiveNodes();
+    Aws::SDKOptions options;
+    prepared->ApplyToSDKOptions(options);
+    AwsApiGuard api(options);
+    auto helper = std::move(prepared);
+    auto put = NewPutItemRequest();
+    const auto key = PartitionKeyForHost(*helper, "orders", "localhost");
+    ASSERT_FALSE(key.empty());
+    put.AddItem("id", AwsStringValue(key));
+    std::mutex mutex;
+    std::condition_variable ready;
+    int failed_attempts = 0;
+    put.SetRequestRetryHandler([&](const Aws::AmazonWebServiceRequest&) {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++failed_attempts;
+        ready.notify_all();
+        EXPECT_TRUE(ready.wait_for(lock, std::chrono::seconds{5}, [&] { return failed_attempts == 2; }));
+    });
+    std::atomic<int> successes{0};
+    auto call = [&] { if (helper->PutItem(put).IsSuccess()) { ++successes; } };
+    std::thread first(call);
+    std::thread second(call);
+    first.join();
+    second.join();
+    server.Wait();
+    EXPECT_EQ(successes.load(), 2);
+    ASSERT_EQ(server.Requests().size(), 4U);
+    EXPECT_EQ(HostHeader(server.Requests()[0]), Url("http", "localhost", server.Port()).Authority());
+    EXPECT_EQ(HostHeader(server.Requests()[1]), Url("http", "localhost", server.Port()).Authority());
+    EXPECT_EQ(HostHeader(server.Requests()[2]), Url("http", "127.0.0.1", server.Port()).Authority());
+    EXPECT_EQ(HostHeader(server.Requests()[3]), Url("http", "127.0.0.1", server.Port()).Authority());
+}
+
+TEST(AwsDynamoDBHelper, BatchWithoutKnownPartitionKeysKeepsOrdinaryRouting) {
+    class ScopedDiscovery final : public HttpClient {
+    public:
+        HttpResponse Get(const Url& url) const override {
+            return {200, url.query == "dc=A" ? R"(["localhost"])" : R"(["127.0.0.1"])"};
+        }
+    };
+    const auto body = R"({"Table":{"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}})";
+    KeepAliveSequenceHttpServer server({{200, "OK", body}, {200, "OK", body}}, false);
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.routing_scope = NewRackScope("A", "r1");
+    cfg.key_route_affinity.partition_key_discovery_attempts = 1;
+    auto prepared = std::make_unique<aws::DynamoDBHelper>(
+        std::vector<std::string>{"127.0.0.1"}, cfg, std::make_shared<ScopedDiscovery>());
+    prepared->UpdateLiveNodes();
+    Aws::SDKOptions options;
+    prepared->ApplyToSDKOptions(options);
+    AwsApiGuard api(options);
+    auto helper = std::move(prepared);
+    Aws::DynamoDB::Model::PutRequest item;
+    item.AddItem("id", AwsStringValue("unknown-key"));
+    Aws::DynamoDB::Model::WriteRequest write;
+    write.SetPutRequest(item);
+    Aws::DynamoDB::Model::BatchWriteItemRequest batch;
+    batch.AddRequestItems("unknown", {write});
+    EXPECT_TRUE(helper->BatchWriteItem(batch).IsSuccess());
+    EXPECT_TRUE(WaitForPartitionKeyName(*helper, "unknown", "id"));
+    server.Wait();
+    ASSERT_EQ(server.Requests().size(), 2U);
+    for (const auto& request : server.Requests()) {
+        EXPECT_EQ(HostHeader(request), Url("http", "127.0.0.1", server.Port()).Authority());
+    }
+}
+
+TEST(AwsDynamoDBHelper, AffinityTransportHandlesAttemptHeadersAndPreservesCallerCancellation) {
+    const std::vector<std::pair<std::string, std::string>> cases{
+        {"attempt=2; max=12", "127.0.0.1"},
+        {"ttl=x; attempt=10; max=12", "127.0.0.1"},
+        {"attempt=999999999999999999999999999", "localhost"},
+        {"attempt=0", "localhost"},
+        {"attempt=2junk", "localhost"},
+        {"", "localhost"},
+        {"attempt=-1", "localhost"},
+        {"attempt=1", "localhost"},
+        {"xattempt=2", "localhost"},
+        {"notattempt=2", "localhost"},
+        {"other=value-attempt=2", "localhost"},
+        {"attempt=2; attempt=1", "localhost"},
+        {"attempt=1; attempt=2", "localhost"},
+        {"attempt=2; attempt=2", "localhost"},
+        {"attempt=2; attempt=", "localhost"},
+        {"attempt=", "localhost"},
+        {"xattempt=1; attempt=2", "127.0.0.1"},
+        {"attempt=2; xattempt=1", "127.0.0.1"},
+        {"ttl=x;\tattempt=2 ; max=12", "127.0.0.1"},
+    };
+    KeepAliveSequenceHttpServer server(std::vector<SequencedHttpResponse>(cases.size() + 2), false);
+    auto cfg = DiscoveryTestConfig(server.Port());
+    cfg.routing_scope = NewRackScope("A", "r1");
+    cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
+    cfg.node_health.disabled = true;
+    auto prepared = std::make_unique<aws::DynamoDBHelper>(
+        std::vector<std::string>{"127.0.0.1"}, cfg, std::make_shared<AffinityRetryDiscovery>());
+    prepared->UpdateLiveNodes();
+    Aws::SDKOptions options;
+    prepared->ApplyToSDKOptions(options);
+    AwsApiGuard api(options);
+    auto helper = std::move(prepared);
+    auto put = NewPutItemRequest();
+    const auto key = PartitionKeyForHost(*helper, "orders", "localhost");
+    ASSERT_FALSE(key.empty());
+    put.AddItem("id", AwsStringValue(key));
+    std::atomic<int> continue_calls{0};
+    std::atomic<bool> allow{true};
+    put.SetContinueRequestHandler([&](const Aws::Http::HttpRequest*) {
+        ++continue_calls;
+        return allow.load();
+    });
+    Aws::Http::ContinueRequestHandler captured;
+    put.SetRequestSignedHandler([&](const Aws::Http::HttpRequest& request) {
+        captured = request.GetContinueRequestHandler();
+    });
+    EXPECT_TRUE(helper->PutItem(put).IsSuccess());
+    ASSERT_TRUE(static_cast<bool>(captured));
+    auto factory = helper->NewHttpClientFactory();
+    auto transport = factory->CreateHttpClient(helper->NewClientConfiguration());
+    auto fixed_request = factory->CreateHttpRequest(
+        Aws::String(Url("http", "localhost", server.Port()).ToString().c_str()),
+        Aws::Http::HttpMethod::HTTP_GET,
+        Aws::Utils::Stream::DefaultResponseStreamFactoryMethod);
+    fixed_request->SetHeaderValue(Aws::Http::SDK_REQUEST_HEADER, "attempt=2");
+    EXPECT_EQ(transport->MakeRequest(fixed_request)->GetResponseCode(), Aws::Http::HttpResponseCode::OK);
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.first);
+        auto request = factory->CreateHttpRequest(
+            Aws::String(Url("http", "rack.invalid", server.Port()).ToString().c_str()),
+            Aws::Http::HttpMethod::HTTP_GET,
+            Aws::Utils::Stream::DefaultResponseStreamFactoryMethod);
+        if (!test_case.first.empty()) {
+            request->SetHeaderValue(Aws::Http::SDK_REQUEST_HEADER, test_case.first.c_str());
+        }
+        request->SetContinueRequestHandle(captured);
+        EXPECT_EQ(transport->MakeRequest(request)->GetResponseCode(), Aws::Http::HttpResponseCode::OK);
+    }
+    server.Wait();
+    ASSERT_EQ(server.Requests().size(), cases.size() + 2);
+    EXPECT_EQ(HostHeader(server.Requests()[1]), Url("http", "localhost", server.Port()).Authority());
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        EXPECT_EQ(HostHeader(server.Requests()[i + 2]), Url("http", cases[i].second, server.Port()).Authority());
+    }
+    EXPECT_GT(continue_calls.load(), 0);
+    allow = false;
+    EXPECT_FALSE(captured(nullptr));
+    EXPECT_FALSE(put.GetContinueRequestHandler()(nullptr));
+    EXPECT_FALSE(helper->PutItem(put).IsSuccess());
+    EXPECT_EQ(server.Requests().size(), cases.size() + 2);
 }
 
 TEST(AwsDynamoDBHelper, TypedWriteMethodsSendRequestsThroughHelper) {
