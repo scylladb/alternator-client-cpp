@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -1272,7 +1273,7 @@ TEST(AlternatorLiveNodes, HealthyTopologyReplacementKeepsProjectedViewsUsable) {
     nodes.UpdateLiveNodes();
     std::atomic<bool> start{false};
     std::atomic<int> empty_views{0};
-    std::thread reader([&] {
+    auto reader = std::async(std::launch::async, [&] {
         while (!start.load()) {
             std::this_thread::yield();
         }
@@ -1286,7 +1287,7 @@ TEST(AlternatorLiveNodes, HealthyTopologyReplacementKeepsProjectedViewsUsable) {
     for (int i = 0; i < 2000; ++i) {
         nodes.UpdateLiveNodes();
     }
-    reader.join();
+    reader.get();
     EXPECT_EQ(empty_views.load(), 0);
 }
 
@@ -1325,7 +1326,7 @@ TEST(AlternatorLiveNodes, RefreshStressObservesMembershipDuringBlockedDiscovery)
     });
 
     AlternatorLiveNodes nodes({"seed.local"}, cfg, http);
-    std::thread first_refresh([&] { nodes.UpdateLiveNodes(); });
+    auto first_refresh = std::async(std::launch::async, [&] { nodes.UpdateLiveNodes(); });
     bool first_request_started = false;
     {
         std::unique_lock<std::mutex> lock(request_mutex);
@@ -1333,7 +1334,7 @@ TEST(AlternatorLiveNodes, RefreshStressObservesMembershipDuringBlockedDiscovery)
             lock, std::chrono::seconds{5}, [&] { return request_count == 1; });
     }
 
-    std::thread second_refresh([&] {
+    auto second_refresh = std::async(std::launch::async, [&] {
         {
             std::lock_guard<std::mutex> lock(request_mutex);
             second_refresh_started = true;
@@ -1362,8 +1363,8 @@ TEST(AlternatorLiveNodes, RefreshStressObservesMembershipDuringBlockedDiscovery)
         release_first_request = true;
     }
     request_cv.notify_all();
-    first_refresh.join();
-    second_refresh.join();
+    first_refresh.get();
+    second_refresh.get();
 
     EXPECT_TRUE(first_request_started);
     EXPECT_TRUE(first_request_released_before_timeout)

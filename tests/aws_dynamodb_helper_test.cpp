@@ -50,6 +50,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cstring>
+#include <future>
 #if SCYLLADB_ALTERNATOR_CLIENT_CPP_HAS_ZLIB
 #include <limits>
 #endif
@@ -985,7 +986,9 @@ TEST(AwsDynamoDBHelper, AffinitySdkRetriesKeepCapturedNodesAcrossRefreshForSingl
     put.AddItem("id", AwsStringValue(key));
     put.SetRequestRetryHandler(refresh);
     EXPECT_TRUE(helper->PutItem(put).IsSuccess());
-    EXPECT_EQ(helper->Nodes()->GetActiveKeyRouteAffinityNodes().front().host, "replacement.invalid");
+    const auto refreshed = helper->Nodes()->GetActiveKeyRouteAffinityNodes();
+    ASSERT_EQ(refreshed.size(), 1U);
+    EXPECT_EQ(refreshed.front().host, "replacement.invalid");
 
     discovery->replaced = false;
     helper->UpdateLiveNodes();
@@ -1195,10 +1198,10 @@ TEST(AwsDynamoDBHelper, ConcurrentAffinityCallsHaveIndependentSdkRetryPlans) {
     });
     std::atomic<int> successes{0};
     auto call = [&] { if (helper->PutItem(put).IsSuccess()) { ++successes; } };
-    std::thread first(call);
-    std::thread second(call);
-    first.join();
-    second.join();
+    auto first = std::async(std::launch::async, call);
+    auto second = std::async(std::launch::async, call);
+    first.get();
+    second.get();
     server.Wait();
     EXPECT_EQ(successes.load(), 2);
     ASSERT_EQ(server.Requests().size(), 4U);
@@ -1264,7 +1267,7 @@ TEST(AwsDynamoDBHelper, AffinityTransportHandlesAttemptHeadersAndPreservesCaller
         {"attempt=2; xattempt=1", "127.0.0.1"},
         {"ttl=x;\tattempt=2 ; max=12", "127.0.0.1"},
     };
-    KeepAliveSequenceHttpServer server(std::vector<SequencedHttpResponse>(cases.size() + 2), false);
+    KeepAliveSequenceHttpServer server(std::vector<SequencedHttpResponse>(cases.size() + 3), false);
     auto cfg = DiscoveryTestConfig(server.Port());
     cfg.routing_scope = NewRackScope("A", "r1");
     cfg.key_route_affinity.partition_key_by_table = {{"orders", "id"}};
@@ -1312,18 +1315,21 @@ TEST(AwsDynamoDBHelper, AffinityTransportHandlesAttemptHeadersAndPreservesCaller
         request->SetContinueRequestHandle(captured);
         EXPECT_EQ(transport->MakeRequest(request)->GetResponseCode(), Aws::Http::HttpResponseCode::OK);
     }
-    server.Wait();
-    ASSERT_EQ(server.Requests().size(), cases.size() + 2);
-    EXPECT_EQ(HostHeader(server.Requests()[1]), Url("http", "localhost", server.Port()).Authority());
-    for (std::size_t i = 0; i < cases.size(); ++i) {
-        EXPECT_EQ(HostHeader(server.Requests()[i + 2]), Url("http", cases[i].second, server.Port()).Authority());
-    }
     EXPECT_GT(continue_calls.load(), 0);
     allow = false;
     EXPECT_FALSE(captured(nullptr));
     EXPECT_FALSE(put.GetContinueRequestHandler()(nullptr));
     EXPECT_FALSE(helper->PutItem(put).IsSuccess());
-    EXPECT_EQ(server.Requests().size(), cases.size() + 2);
+    // Keep the observer alive until a successful request follows the denied call.
+    // An escaped denied request consumes this response and makes the check fail.
+    allow = true;
+    EXPECT_TRUE(helper->PutItem(put).IsSuccess());
+    server.Wait();
+    ASSERT_EQ(server.Requests().size(), cases.size() + 3);
+    EXPECT_EQ(HostHeader(server.Requests()[1]), Url("http", "localhost", server.Port()).Authority());
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        EXPECT_EQ(HostHeader(server.Requests()[i + 2]), Url("http", cases[i].second, server.Port()).Authority());
+    }
 }
 
 TEST(AwsDynamoDBHelper, TypedWriteMethodsSendRequestsThroughHelper) {
