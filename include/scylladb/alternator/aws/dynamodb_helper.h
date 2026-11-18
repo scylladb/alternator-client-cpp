@@ -22,6 +22,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <aws/core/AmazonWebServiceRequest.h>
@@ -168,8 +169,11 @@ private:
     void WaitForPartitionKeyDiscovery() const;
     [[nodiscard]] std::string DiscoverPartitionKeyName(const std::string& table_name) const;
     [[nodiscard]] QueryPlan DefaultQueryPlan() const;
+    [[nodiscard]] std::pair<QueryPlan, bool> NewBatchWriteRoutingPlan(
+        const std::vector<BatchWriteOperation>& operations) const;
     [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBForNode(const Url& node) const;
-    [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBForQueryPlan(QueryPlan plan) const;
+    [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBForQueryPlan(
+        QueryPlan plan, Aws::AmazonWebServiceRequest* affinity_request = nullptr) const;
     [[nodiscard]] std::shared_ptr<Aws::DynamoDB::DynamoDBClient> NewDynamoDBWithEndpointProvider(
         std::shared_ptr<Aws::DynamoDB::Endpoint::DynamoDBEndpointProviderBase> endpoint_provider) const;
 

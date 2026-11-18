@@ -135,11 +135,14 @@ void NodeHealthStore::ReportNodeResult(const Url& node, NodeHealthObservation ob
 }
 
 std::vector<Url> NodeHealthStore::ProbeDownNodes(const DownProbe& probe) {
+    return ProbeDownCandidates(probe, GetDownNodes());
+}
+
+std::vector<Url> NodeHealthStore::ProbeDownCandidates(const DownProbe& probe, const std::vector<Url>& candidates) {
     if (config_.disabled || !probe) {
         return {};
     }
 
-    auto candidates = GetDownNodes();
     std::vector<Url> responsive;
     for (const auto& node : candidates) {
         auto status = GetNodeStatus(node);

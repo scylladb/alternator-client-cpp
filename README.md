@@ -118,9 +118,9 @@ int main() {
 ```
 
 `Config::aws_region` is required by the AWS SDK for C++ client configuration,
-including request signing and diagnostic metadata. Alternator does not support
-SigV4 request validation, and this client does not try to preserve a valid
-SigV4 signature after Alternator-specific request rewriting. Alternator does
+including request signing and diagnostic metadata. Alternator validates SigV4
+signatures when authorization is enforced. This client does not preserve a
+valid SigV4 signature after Alternator-specific request rewriting. Alternator does
 not use the region value to choose endpoints; `DynamoDBHelper` discovers nodes
 through `/localnodes` and installs the endpoint provider or HTTP wrapper that
 routes requests to live Alternator nodes. The default value is
@@ -136,10 +136,12 @@ The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by
 
 The HTTP client factory runs after request signing. This is the closest public
 AWS SDK for C++ hook for retry-aware endpoint rewriting, header optimization,
-and request or response compression, and it matches Alternator's SigV4 behavior:
-Alternator does not validate SigV4 signatures. Do not use the factory through
-a proxy, gateway, or deployment policy that requires valid SigV4 signatures
-after the request leaves the SDK. Automatic request-content-based endpoint
+and request or response compression. Captured affinity retries also use this
+factory to rewrite the endpoint and signed `Host` header for each selected
+coordinator. These retries share the factory's signing limitation. Do not use
+the factory with `alternator_enforce_authorization` enabled, or through a proxy,
+gateway, or deployment policy that requires valid SigV4 signatures after the
+request leaves the SDK. Automatic request-content-based endpoint
 rewriting is not available in the same form. The core library does provide
 deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them
 for applications that integrate request-specific routing in their own AWS SDK
@@ -209,9 +211,9 @@ Alternator nodes and sets the matching `Content-Encoding` and `Content-Length`
 headers before sending the request.
 
 Request compression is applied by the Alternator HTTP client factory after the
-AWS SDK signs the request. That is compatible with Alternator because Alternator
-does not support SigV4 validation. It is not compatible with any proxy, gateway,
-or DynamoDB-compatible service that validates SigV4 signatures.
+AWS SDK signs the request. It shares the factory's signing limitation: do not use
+it with `alternator_enforce_authorization` enabled or with any proxy, gateway,
+or DynamoDB-compatible service that requires valid SigV4 signatures.
 
 ```cpp
 scylladb::alternator::Config cfg;
@@ -355,6 +357,11 @@ cfg.idle_nodes_list_update_period = std::chrono::minutes(1);
 The AWS helper starts and stops this background refresh automatically. The core `AlternatorLiveNodes`
 type leaves lifecycle control to the caller.
 
+Manual and background refreshes execute serially, including topology and health reconciliation.
+`Stop()` waits for the background thread. If that thread is waiting for a manual refresh,
+the manual refresh must finish before `Stop()` can complete. Stopping does not cancel discovery
+requests, including calls to an injected `HttpClient`.
+
 When libcurl is available, the default discovery client reuses HTTP connections by default. It keeps
 a libcurl connection cache bounded by `max_connections` and can be disabled for debugging or
 compatibility:
@@ -407,6 +414,51 @@ auto plan = helper.NewPartitionKeyQueryPlan(
 auto preferred = plan.Next();
 ```
 
+When affinity is enabled and the configured scope chain contains a rack restriction, eligible writes use a separate
+membership view. Each rack restriction becomes its datacenter, preserving the complete explicit fallback chain and order.
+For example, `rack(A,r1) -> rack(B,r2) -> cluster` becomes `DC(A) -> DC(B) -> cluster`. No implicit fallback is added.
+Named datacenters are discovered through `/localnodes?dc=<configured-dc>`; other datacenters stay excluded while the
+preferred datacenter is usable. The built-in affinity prefix is resolved at initialization. A custom fallback is resolved
+only when affinity discovery needs that occurrence, then newly reached built-ins are widened in order. Resolved links
+are reused, while repeated occurrences of the same custom object remain separate. A nonterminating custom tail can
+still fail to terminate when discovery needs it. Equivalent built-in queries with the same seed aggregation are
+deduplicated in first-occurrence order. Matching ordinary discovery results, including empty responses,
+are reused within each refresh attempt; later refreshes retry discovery.
+Configurations whose reached scope chain has no rack restriction retain their existing routing behavior, as does
+disabled affinity. A successful ordinary refresh that reaches a built-in rack through custom fallbacks activates
+the derived affinity view.
+
+After successful DC discovery, clients in different racks choose the same single-key affinity and batch-voting
+coordinators when their usable candidate membership, including local health observations, matches.
+Non-affinity requests continue to use ordinary scoped routing. Startup and discovery
+failures retain seed/rack fallback before the first usable affinity discovery. After successful discovery, affinity-only
+failures retain the exact previous affinity snapshot while explicit affinity fallbacks remain available. Ordinary
+membership is never merged into that snapshot. Requests do not wait for affinity readiness.
+
+Custom `NodesSource` implementations that provide a separate affinity domain supply both
+`GetActiveKeyRouteAffinityNodes()` for active hashing and voting membership and
+`GetQueryPlanNodesForHash()` for that hash's affinity candidates. For example, a custom source
+without quarantine sampling can implement the pair as follows:
+
+```cpp
+std::vector<Url> MyNodesSource::GetActiveKeyRouteAffinityNodes() const {
+    return affinity_nodes_;
+}
+
+std::vector<Url> MyNodesSource::GetQueryPlanNodesForHash(std::int64_t hash) const {
+    (void)hash;
+    return affinity_nodes_;
+}
+```
+
+Keep ordinary `GetActiveNodes()` and `GetQueryPlanNodes()` in the ordinary routing domain.
+The per-hash getter may also include eligible quarantined affinity candidates; candidates outside
+the active affinity set are tried before its hashed order. Ordinary fallback applies only when
+both active affinity and hash-specific candidates are empty. Existing sources retain their
+defaults: the active-affinity getter calls `GetActiveNodes()`, while the per-hash getter calls
+`GetQueryPlanNodes()`. Overriding only the active-affinity getter does not replace inherited
+per-hash candidates. `AlternatorLiveNodes` already supplies both affinity getters.
+
 The AWS helper can discover missing table partition-key names automatically. When an affinity plan needs metadata that is
 not cached yet, the helper starts one background `DescribeTable` lookup for that table and returns a normal non-affinity
 query plan for the current request. Later requests use the discovered HASH key name once the lookup completes. Configure
@@ -435,6 +487,13 @@ The AWS helper also exposes typed write methods that inspect SDK request objects
 `PutItem`, `UpdateItem`, and `DeleteItem` according to `KeyRouteAffinityMode::ReadBeforeWrite` or `AnyWrite`, and route
 `BatchWriteItem` in `AnyWrite` mode using batch-write voting. If metadata is missing or the partition key cannot be
 hashed, the current request uses the normal query plan and discovery is triggered for later requests:
+
+With the HTTP client factory installed, eligible typed writes retain their complete affinity
+plan for SDK retries. Each attempt uses the next captured coordinator, even if discovery changes
+between attempts. After exhausting the captured list, remaining SDK attempts keep its last
+coordinator; the SDK's retry limit still applies. A missing or malformed SDK attempt header uses
+the first captured coordinator. The request's cancellation callback remains active. Ordinary
+requests and clients constructed for a fixed endpoint keep their existing retry behavior.
 
 ```cpp
 Aws::DynamoDB::Model::PutItemRequest put;
