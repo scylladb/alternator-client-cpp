@@ -164,9 +164,9 @@ Alternator nodes and sets the matching `Content-Encoding` and `Content-Length`
 headers before sending the request.
 
 Request compression is applied by the Alternator HTTP client factory after the
-AWS SDK signs the request. That is compatible with Alternator because Alternator
-does not support SigV4 validation. It is not compatible with any proxy, gateway,
-or DynamoDB-compatible service that validates SigV4 signatures.
+AWS SDK signs the request. It shares the factory's signing limitation: do not use
+it with `alternator_enforce_authorization` enabled or with any proxy, gateway,
+or DynamoDB-compatible service that requires valid SigV4 signatures.
 
 ```cpp
 scylladb::alternator::Config cfg;
