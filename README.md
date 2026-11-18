@@ -71,9 +71,9 @@ int main() {
 ```
 
 `Config::aws_region` is required by the AWS SDK for C++ client configuration,
-including request signing and diagnostic metadata. Alternator does not support
-SigV4 request validation, and this client does not try to preserve a valid
-SigV4 signature after Alternator-specific request rewriting. Alternator does
+including request signing and diagnostic metadata. Alternator validates SigV4
+signatures when authorization is enforced. This client does not preserve a
+valid SigV4 signature after Alternator-specific request rewriting. Alternator does
 not use the region value to choose endpoints; `DynamoDBHelper` discovers nodes
 through `/localnodes` and installs the endpoint provider or HTTP wrapper that
 routes requests to live Alternator nodes. The default value is
@@ -89,10 +89,12 @@ The AWS adapter uses the SDK's per-client `DynamoDBEndpointProviderBase` hook by
 
 The HTTP client factory runs after request signing. This is the closest public
 AWS SDK for C++ hook for retry-aware endpoint rewriting, header optimization,
-and request or response compression, and it matches Alternator's SigV4 behavior:
-Alternator does not validate SigV4 signatures. Do not use the factory through
-a proxy, gateway, or deployment policy that requires valid SigV4 signatures
-after the request leaves the SDK. Automatic request-content-based endpoint
+and request or response compression. Captured affinity retries also use this
+factory to rewrite the endpoint and signed `Host` header for each selected
+coordinator. These retries share the factory's signing limitation. Do not use
+the factory with `alternator_enforce_authorization` enabled, or through a proxy,
+gateway, or deployment policy that requires valid SigV4 signatures after the
+request leaves the SDK. Automatic request-content-based endpoint
 rewriting is not available in the same form. The core library does provide
 deterministic key-route affinity primitives, and `DynamoDBHelper` exposes them
 for applications that integrate request-specific routing in their own AWS SDK
