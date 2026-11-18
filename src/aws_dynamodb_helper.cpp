@@ -290,6 +290,9 @@ struct CapturedAffinityPlan {
     }
 
     Url NodeForAttempt(const Aws::Http::HttpRequest& request) const {
+        if (!request.HasHeader(Aws::Http::SDK_REQUEST_HEADER)) {
+            return nodes->front();
+        }
         const auto header = request.GetHeaderValue(Aws::Http::SDK_REQUEST_HEADER);
         std::string_view remaining(header.data(), header.size());
         std::size_t attempt = 1;
